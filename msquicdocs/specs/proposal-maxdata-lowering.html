@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+      <title>Lowering QUIC Flow Control Limits: Decreasing MAX_DATA and MAX_STREAM_DATA Announcements </title>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <meta name="title" content="Lowering QUIC Flow Control Limits: Decreasing MAX_DATA and MAX_STREAM_DATA Announcements ">
+      
+      
+      <link rel="icon" href="../favicon.ico">
+      <link rel="stylesheet" href="../public/docfx.min.css">
+      <link rel="stylesheet" href="../public/main.css">
+      <meta name="docfx:navrel" content="../toc.html">
+      <meta name="docfx:tocrel" content="../toc.html">
+      
+      <meta name="docfx:rel" content="../">
+      
+      
+      <meta name="docfx:docurl" content="https://github.com/yurial/msquic/blob/main/specs/proposal-maxdata-lowering.md/#L1">
+      <meta name="loc:inThisArticle" content="In this article">
+      <meta name="loc:searchResultsCount" content="{count} results for &quot;{query}&quot;">
+      <meta name="loc:searchNoResults" content="No results for &quot;{query}&quot;">
+      <meta name="loc:tocFilter" content="Filter by title">
+      <meta name="loc:nextArticle" content="Next">
+      <meta name="loc:prevArticle" content="Previous">
+      <meta name="loc:themeLight" content="Light">
+      <meta name="loc:themeDark" content="Dark">
+      <meta name="loc:themeAuto" content="Auto">
+      <meta name="loc:changeTheme" content="Change theme">
+      <meta name="loc:copy" content="Copy">
+      <meta name="loc:downloadPdf" content="Download PDF">
+
+      <script type="module" src="./../public/docfx.min.js"></script>
+
+      <script>
+        const theme = localStorage.getItem('theme') || 'auto'
+        document.documentElement.setAttribute('data-bs-theme', theme === 'auto' ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : theme)
+      </script>
+
+  </head>
+
+  <body class="tex2jax_ignore" data-layout="" data-yaml-mime="">
+    <header class="bg-body border-bottom">
+      <nav id="autocollapse" class="navbar navbar-expand-md" role="navigation">
+        <div class="container-xxl flex-nowrap">
+          <a class="navbar-brand" href="../index.html">
+            <img id="logo" class="svg" src="../logo.svg" alt="">
+            
+          </a>
+          <button class="btn btn-lg d-md-none border-0" type="button" data-bs-toggle="collapse" data-bs-target="#navpanel" aria-controls="navpanel" aria-expanded="false" aria-label="Toggle navigation">
+            <i class="bi bi-three-dots"></i>
+          </button>
+          <div class="collapse navbar-collapse" id="navpanel">
+            <div id="navbar">
+              <form class="search" role="search" id="search">
+                <i class="bi bi-search"></i>
+                <input class="form-control" id="search-query" type="search" disabled placeholder="Search" autocomplete="off" aria-label="Search">
+              </form>
+            </div>
+          </div>
+        </div>
+      </nav>
+    </header>
+
+    <main class="container-xxl">
+
+      <div class="content">
+        <div class="actionbar">
+
+          <nav id="breadcrumb"></nav>
+        </div>
+
+        <article data-uid="">
+<h1 id="lowering-quic-flow-control-limits-decreasing-max_data-and-max_stream_data-announcements">Lowering QUIC Flow Control Limits: Decreasing MAX_DATA and MAX_STREAM_DATA Announcements</h1>
+
+<pre><code>Document:  draft-&lt;author&gt;-quic-lower-flow-control-limits-00
+Author:    &lt;Author Name&gt; &lt;author@example.org&gt;
+Date:      &lt;Month DD, YYYY&gt;
+Expires:   &lt;Month DD, YYYY&gt; (+6 months from the Date above)
+Intended status: Standards Track
+</code></pre>
+<h2 id="abstract">Abstract</h2>
+<p>RFC 9000 defines QUIC flow control limits that can only be raised: a
+MAX_DATA or MAX_STREAM_DATA frame carrying a value that does not increase
+the corresponding limit has no effect and MUST be ignored by its receiver.
+This document proposes a change to RFC 9000 under which a receiver MAY
+advertise a smaller limit, the new limit takes effect for data not yet
+sent, and violation of the limit is assessed against the largest limit
+advertised during the connection.  Data already sent within a previously
+advertised limit never becomes a violation, so no new spurious
+FLOW_CONTROL_ERROR can be induced.  The change is backwards compatible
+with RFC 9000 implementations in both directions and enables immediate
+application-level backpressure (receive pause) at the connection and
+stream level.</p>
+<h2 id="1-introduction">1. Introduction</h2>
+<p>QUIC's connection-level and stream-level flow control (Section 4 of
+[RFC9000]) lets a receiver bound how much stream data its peer may send.
+The limits, however, are one-directional: Section 4.1 of [RFC9000] states
+that &quot;it is not an error to advertise a smaller limit, but the smaller
+limit has no effect&quot;, and that a sender &quot;MUST ignore any MAX_STREAM_DATA
+or MAX_DATA frames that do not increase flow control limits&quot;.  Once a
+receiver has advertised a limit, every byte of that credit can -- and,
+for an application that keeps producing data, eventually will -- arrive
+at the receiver and have to be buffered.</p>
+<p>This creates a structural problem for receivers whose applications need
+to stop consuming data on short notice.  The typical scenario is
+application-level backpressure (&quot;receive pause&quot;): the receiving
+application suspends draining the receive buffer, and the transport
+wants to stop committing memory to new data immediately.  The only tools
+RFC 9000 provides are:</p>
+<ul>
+<li><p>Stop sending MAX_DATA/MAX_STREAM_DATA updates.  This does not stop a
+sender that still holds un-consumed credit: a sender with a large
+advertised window continues to send -- and the receiver continues to
+buffer -- until the full window is exhausted.  A multi-megabyte
+connection-level window can therefore impose multi-megabyte buffering
+on a receiver that needs to pause <em>now</em>.</p>
+</li>
+<li><p>RESET_STREAM or connection close.  Both discard application data that
+the receiver in fact wants eventually to consume; they are aborts, not
+backpressure.</p>
+</li>
+</ul>
+<p>This document proposes that RFC 9000 be amended so that a receiver MAY
+lower its advertised limits and that the lowered limit takes effect for
+data not yet sent.  To keep the change safe, the rule for detecting flow
+control violations is changed to compare received data against the
+<em>largest</em> limit the receiver has advertised during the connection, not
+against the most recently advertised (possibly lowered) value.  Data sent
+before a lowering was received therefore never becomes a violation.</p>
+<p>The amended semantics have been formalized as protocol models and checked
+with a model checker; under both the RFC 9000 semantics and the semantics
+proposed here, a protocol-compliant sender can neither trigger a flow
+control error nor lose data.  The change applies symmetrically to the
+connection-level limit (MAX_DATA) and the stream-level limit
+(MAX_STREAM_DATA), and both frame types are amended by this document.</p>
+<h2 id="2-conventions-and-terminology">2. Conventions and Terminology</h2>
+<p>The key words &quot;MUST&quot;, &quot;MUST NOT&quot;, &quot;REQUIRED&quot;, &quot;SHALL&quot;, &quot;SHALL NOT&quot;,
+&quot;SHOULD&quot;, &quot;SHOULD NOT&quot;, &quot;RECOMMENDED&quot;, &quot;NOT RECOMMENDED&quot;, &quot;MAY&quot;, and
+&quot;OPTIONAL&quot; in this document are to be interpreted as described in
+BCP 14 [RFC2119] [RFC8174] when, and only when, they appear in all
+capitals, as shown here.</p>
+<p>This document uses the terminology of [RFC9000].  In addition:</p>
+<p>Limit:  The absolute cumulative amount of data that an endpoint is
+permitted to send, at connection level (bounded by MAX_DATA) or on a
+single stream (bounded by MAX_STREAM_DATA).</p>
+<p>Advertised limit:  A limit value that an endpoint has communicated to
+its peer in an initial_max_data or initial_max_stream_data_*
+transport parameter (Section 18.2 of [RFC9000]) or in a MAX_DATA or
+MAX_STREAM_DATA frame (Sections 19.9 and 19.10 of [RFC9000]).</p>
+<p>Largest advertised limit:  The maximum of all advertised limits for the
+connection or for a given stream, from the beginning of the
+connection up to the point of evaluation.  For a connection that
+never lowers its limits, this equals the current limit.</p>
+<p>Lowering:  Sending a MAX_DATA or MAX_STREAM_DATA frame whose value is
+smaller than the limit currently in effect.</p>
+<h2 id="3-motivation">3. Motivation</h2>
+<h3 id="31-receive-pause-needs-a-stop-button">3.1. Receive Pause Needs a Stop Button</h3>
+<p>Consider a receiver whose connection-level window has been advertised as
+N bytes.  The receiving application consumes data steadily, and the
+receiver grants credit as buffer space is freed.  At some point the
+application stops consuming -- it is blocked on a slow disk, a busy
+upstream, or an interactive user.  The transport wants the flow of new
+STREAM data to stop as soon as possible, without losing anything already
+received or in flight.</p>
+<p>Under RFC 9000 the receiver has no way to express this.  It can only stop
+<em>increasing</em> the limit.  Everything already advertised remains usable
+credit; the sender keeps sending up to N cumulative bytes, and the
+receiver must keep buffering whatever arrives.  The pause therefore takes
+effect only after the outstanding window is drained -- exactly the
+opposite of what backpressure needs.</p>
+<h3 id="32-the-blocked-sender-cycle-does-not-help">3.2. The Blocked-Sender Cycle Does Not Help</h3>
+<p>A receiver that stops granting credit does not stop a sender; it only
+guarantees that the sender eventually becomes blocked (Section 4.1 of
+[RFC9000]).  At that point the sender enters the blocked-sender cycle: it
+holds data it cannot send and, per the guidance in Section 4.1 of
+[RFC9000], SHOULD periodically send DATA_BLOCKED or STREAM_DATA_BLOCKED
+frames with no ack-eliciting packets in flight, partly to keep the
+connection from being closed by the idle timeout (Section 10.1 of
+[RFC9000]).  This cycle is a symptom, not a remedy: by the time it
+begins, the receiver has already buffered the whole window.  It also
+leaves the receiver unable to distinguish &quot;sender is politely waiting&quot;
+from &quot;sender is dead&quot; any better than today.</p>
+<h3 id="33-the-remaining-tools-lose-data">3.3. The Remaining Tools Lose Data</h3>
+<p>RESET_STREAM abruptly terminates the sending part of a stream, and its
+receiver is permitted to discard data already received on that stream
+(Sections 19.4 and 4.4 of [RFC9000]); closing the connection discards
+more.  Neither is backpressure: an application that wants to
+pause -- not cancel -- has no protocol support.  The gap is
+protocol-level: the sender is behaving correctly, the receiver is
+behaving correctly, and yet the receiver cannot stop the flow without
+risking buffering it cannot afford or data loss it cannot accept.</p>
+<h3 id="34-stream-level-and-connection-level-limits-have-the-same-shape">3.4. Stream-Level and Connection-Level Limits Have the Same Shape</h3>
+<p>The scenario above is usually described at connection level, but a
+single misbehaving or backpressured stream has the same problem with its
+MAX_STREAM_DATA limit.  Any fix that only covers MAX_DATA leaves
+implementations to handle per-stream pause with per-connection tools.
+The change proposed here therefore covers both MAX_DATA (connection
+level) and MAX_STREAM_DATA (stream level), with identical semantics.</p>
+<h2 id="4-protocol-changes">4. Protocol Changes</h2>
+<p>This section specifies normative amendments to [RFC9000].  All section
+references below are to [RFC9000] unless marked &quot;(as amended)&quot;.</p>
+<h3 id="41-amendment-to-section-41-data-flow-control">4.1. Amendment to Section 4.1 (Data Flow Control)</h3>
+<h4 id="411-applying-updated-limits">4.1.1. Applying Updated Limits</h4>
+<p>The following paragraph of Section 4.1 of [RFC9000]:</p>
+<blockquote>
+<p>&quot;Once a receiver advertises a limit for the connection or a stream, it
+is not an error to advertise a smaller limit, but the smaller limit has
+no effect.&quot;</p>
+</blockquote>
+<p>is replaced with:</p>
+<blockquote>
+<p>A receiver MAY advertise a smaller limit than the limit currently in
+effect for the connection (MAX_DATA) or for a stream (MAX_STREAM_DATA).
+A smaller limit takes effect for data not yet sent.</p>
+</blockquote>
+<p>The following paragraph of Section 4.1 of [RFC9000]:</p>
+<blockquote>
+<p>&quot;A sender MUST ignore any MAX_STREAM_DATA or MAX_DATA frames that do
+not increase flow control limits.&quot;</p>
+</blockquote>
+<p>is replaced with:</p>
+<blockquote>
+<p>On receiving a MAX_DATA or MAX_STREAM_DATA frame, an endpoint MUST set
+the corresponding flow control limit to the value carried in the frame,
+whether that value is larger or smaller than the limit currently in
+effect.  A sender MUST NOT send new data in excess of the limit
+currently in effect.</p>
+</blockquote>
+<h4 id="412-enforcement-against-the-largest-advertised-limit">4.1.2. Enforcement Against the Largest Advertised Limit</h4>
+<p>The following paragraph of Section 4.1 of [RFC9000]:</p>
+<blockquote>
+<p>&quot;A receiver MUST close the connection with an error of type
+FLOW_CONTROL_ERROR if the sender violates the advertised connection or
+stream data limits; see Section 11 for details on error handling.&quot;</p>
+</blockquote>
+<p>is replaced with:</p>
+<blockquote>
+<p>A receiver MUST NOT treat received data as a violation of its flow
+control limits if the data does not exceed the largest advertised
+limit: specifically, if the sum of the final sizes of all streams (for
+MAX_DATA) or the largest offset received on the affected stream (for
+MAX_STREAM_DATA) does not exceed the largest limit that the receiver
+has advertised for the connection or for that stream, respectively, at
+any point during the connection.  Advertised limits include the initial
+values carried in the initial_max_data and initial_max_stream_data_*
+transport parameters (Section 18.2 of [RFC9000]) and the values
+remembered for Early Data (Section 7.4.1 of [RFC9000]).  A receiver
+MUST close the connection with an error of type FLOW_CONTROL_ERROR
+only if received data exceeds the largest advertised limit; see
+Section 11 for details on error handling.</p>
+</blockquote>
+<p>Correspondingly, a sender whose cumulative sent data (or whose sent data
+on an affected stream) is within the largest advertised limit commits no
+violation, even if that amount exceeds a limit lowered after the data was
+sent.  Advertising a smaller limit does not retroactively withdraw flow
+control credit: data in flight at the time a lowered limit is sent can be
+up to the previously advertised limit, its receipt is not a flow control
+violation, and a receiver MUST accept it.  A lowering bounds
+new sends; it does not recall outstanding data.</p>
+<h4 id="413-reordering-of-flow-control-updates">4.1.3. Reordering of Flow Control Updates</h4>
+<p>MAX_DATA and MAX_STREAM_DATA frames, like all QUIC frames, can be
+reordered.  An endpoint can therefore apply a stale frame whose value is
+larger than a value it has already applied.  This is not an error: the
+limit in effect is always the value of the most recently applied frame,
+and the largest advertised limit -- the bound used for violation
+detection (Section 4.1.2) -- does not depend on the order in which
+frames are applied.  A sender that receives a stale frame raising the
+limit in effect MAY resume sending accordingly; this cannot create a
+violation, because any value it can apply was advertised by the receiver
+and hence is within the largest advertised limit.</p>
+<h4 id="414-what-does-not-change">4.1.4. What Does Not Change</h4>
+<p>Flow control accounting is unchanged.  Connection-level accounting still
+agrees on consumed credit across cancelled streams (Section 4.4 of
+[RFC9000]), and stream final sizes are defined, communicated, and
+enforced exactly as before (Section 4.5 of [RFC9000]); a lowered limit
+does not alter final-size accounting and MUST NOT be treated as
+affecting any final size.  The definition of FLOW_CONTROL_ERROR
+(Section 20.1 of [RFC9000]) is unchanged: &quot;advertised data limits&quot; is
+read as the largest advertised limits per Section 4.1.2.</p>
+<h3 id="42-conforming-amendments-to-sections-199-and-1910-frame-definitions">4.2. Conforming Amendments to Sections 19.9 and 19.10 (Frame Definitions)</h3>
+<p>In Section 19.9 (MAX_DATA Frames) of [RFC9000], the description of the
+Maximum Data field is extended with:</p>
+<blockquote>
+<p>The value in the frame is the new absolute limit for the connection,
+whether larger or smaller than any value previously advertised; see
+Section 4.1 (as amended).</p>
+</blockquote>
+<p>and the enforcement paragraph is replaced with:</p>
+<blockquote>
+<p>All data sent in STREAM frames counts toward this limit.  The sum of
+the final sizes on all streams -- including streams in terminal states
+-- MUST NOT exceed the largest value advertised by a receiver during
+the connection.  An endpoint MUST terminate a connection with an error
+of type FLOW_CONTROL_ERROR if it receives more data than the largest
+maximum data value that it has sent during the connection.  This
+includes violations of remembered limits in Early Data; see Section
+7.4.1.</p>
+</blockquote>
+<p>In Section 19.10 (MAX_STREAM_DATA Frames) of [RFC9000], the description
+of the Maximum Stream Data field is extended with:</p>
+<blockquote>
+<p>The value in the frame is the new absolute limit for the identified
+stream, whether larger or smaller than any value previously advertised
+for that stream; see Section 4.1 (as amended).</p>
+</blockquote>
+<p>and the sentence &quot;The data sent on a stream MUST NOT exceed the largest
+maximum stream data value advertised by the receiver.&quot; is retained, with
+&quot;advertised by the receiver&quot; read as &quot;advertised by the receiver during
+the connection, including the initial value from the corresponding
+initial_max_stream_data_* transport parameter&quot; (Section 4.1.2).  The
+existing enforcement sentence of Section 19.10 already refers to the
+&quot;largest maximum stream data&quot; sent for the affected stream and requires
+no change beyond this clarification.</p>
+<h3 id="43-conforming-amendments-to-section-42-and-blocked-sender-behavior">4.3. Conforming Amendments to Section 4.2 and Blocked-Sender Behavior</h3>
+<p>Section 4.2 of [RFC9000] (&quot;Increasing Flow Control Limits&quot;) is retitled
+&quot;Updating Flow Control Limits&quot; and extended to cover decreases.  The
+following is added:</p>
+<blockquote>
+<p>The same guidance applies to updates that lower a limit.  A receiver
+that lowers a limit SHOULD expect DATA_BLOCKED or STREAM_DATA_BLOCKED
+frames and, as when increasing a limit, MUST NOT wait for such frames
+before sending a MAX_DATA or MAX_STREAM_DATA frame: a sender blocked by
+a lowered limit is not required to report it.</p>
+<p>When an updated limit is equal to or lower than the amount of data
+already sent, the sender has no additional credit and is blocked
+immediately (Section 4.1).  The guidance for blocked senders in
+Section 4.1 of [RFC9000] applies unchanged, including for the entire
+duration of a pause: a sender that is flow control limited SHOULD send
+a DATA_BLOCKED or STREAM_DATA_BLOCKED frame and SHOULD continue to send
+it periodically when it has no ack-eliciting packets in flight, to keep
+the connection from being closed by the idle timeout (Section 10.1).</p>
+<p>DATA_BLOCKED and STREAM_DATA_BLOCKED frames are informational
+(Sections 19.12 and 19.13).  An endpoint MUST NOT treat a
+DATA_BLOCKED or STREAM_DATA_BLOCKED frame as an error, regardless of
+whether the limit it reports was reached by consuming a large window or
+by applying a lowered limit.  No change to the frame definitions in
+Sections 19.12 and 19.13 is required: the limit at which blocking
+occurred can legitimately be a lowered limit.</p>
+</blockquote>
+<h2 id="5-backwards-compatibility">5. Backwards Compatibility</h2>
+<p>This section analyzes the four combinations of an endpoint implementing
+this document (&quot;new&quot;) and an endpoint implementing [RFC9000] as-is
+(&quot;old&quot;), in both data directions of a connection.  The central asymmetry
+that makes the change safe is that, under the amended rules, violation
+detection on the receive side is performed against the largest advertised
+limit, while the limit in effect on the send side tracks the most recent
+update.  A lowering can constrain a peer only if the peer honors it.</p>
+<h3 id="51-old-sender-new-receiver">5.1. Old Sender, New Receiver</h3>
+<p>An old sender implements [RFC9000] Section 4.1: it MUST ignore
+MAX_STREAM_DATA or MAX_DATA frames that do not increase the flow control
+limits.  When a new receiver advertises a lowered limit, the old sender
+discards the frame and continues to treat the previous -- and therefore
+largest advertised -- limit as in effect.  Because an [RFC9000]-compliant
+sender never sends data in excess of the limit in effect, all data it
+sends is within the largest advertised limit.</p>
+<p>A new receiver enforces received data against the largest advertised
+limit (Section 4.1.2), which is exactly the bound an old sender never
+exceeds.  Traffic therefore flows without errors and without
+degradation; the receive-pause request is simply without effect on that
+sender, as it is under [RFC9000] today.  In particular, no
+FLOW_CONTROL_ERROR can be induced by advertising high and then lowering.</p>
+<h3 id="52-new-sender-old-receiver">5.2. New Sender, Old Receiver</h3>
+<p>Consider an endpoint implementing this document that, acting as a data
+receiver, advertises a lowered limit to a peer that implements only
+[RFC9000].  The old peer is REQUIRED by Section 4.1 of [RFC9000] to
+ignore the non-increasing frame and to continue counting against its
+existing (larger) limit.  It will not stop sending; it will not apply the
+lowered value; and it will not commit any violation, because everything
+it sends remains within the largest advertised limit.  The new receiver,
+in turn, MUST accept that data per Section 4.1.2 and will not raise
+FLOW_CONTROL_ERROR.</p>
+<p>The net effect is that a lowering sent to a non-implementing peer
+degrades to a no-op: the backpressure feature silently falls back to
+today's behavior -- the receiver keeps receiving until the previously
+advertised window is consumed -- rather than breaking the connection.
+The same holds in the reverse data direction of the same connection,
+where the roles are those of Section 5.1.</p>
+<h3 id="53-compatibility-summary">5.3. Compatibility Summary</h3>
+<ul>
+<li>Old sender with new receiver: no errors, no degradation; pause
+ineffective on that sender.</li>
+<li>New sender with old receiver: no errors, no degradation; pause
+ineffective (the lowered frame is ignored).</li>
+<li>New sender with new receiver: pause takes effect within one round
+trip; safety properties are unchanged, as confirmed by the formal
+models described in Section 1.</li>
+</ul>
+<p>The effect of the change is therefore achievable only between two
+endpoints that both implement the new behavior: when the peer implements
+only [RFC9000], a lowering is harmless but useless -- the frame is
+ignored and the pause request degrades to a no-op (Section 5.2).
+No handshake flag or explicit negotiation is provided or required:
+the change is a pure semantics amendment, and an endpoint can deploy
+it unilaterally without any risk to existing peers.  The error
+machinery never requires coordination, because no new error condition
+is introduced on either side.</p>
+<h2 id="6-security-considerations">6. Security Considerations</h2>
+<h3 id="61-lowering-as-a-denial-of-service-vector">6.1. Lowering as a Denial-of-Service Vector</h3>
+<p>A malicious or buggy receiver can lower a limit to zero, freezing a
+sender that honors lowered limits.  This power is not new:
+[RFC9000] already lets a receiver starve a sender by never sending
+MAX_DATA or MAX_STREAM_DATA updates, which freezes credit growth once
+the current window is consumed.  A lowering reaches the same state
+faster -- within one round trip instead of after the window drains --
+but does not otherwise expand the attacker's options.</p>
+<p>Senders have the same remedies as under [RFC9000], and one more:</p>
+<ul>
+<li><p>A sender that is flow control limited keeps the connection alive by
+periodically sending DATA_BLOCKED or STREAM_DATA_BLOCKED frames
+(Section 4.3) and is protected from indefinite stalls by the idle
+timeout (Section 10.1 of [RFC9000]).</p>
+</li>
+<li><p>Because violation detection is against the largest advertised limit
+(Section 4.1.2), a sender MAY treat a lowered limit as advisory for
+its own policy -- for example, refusing to reduce below a configured
+floor -- without any risk of a flow control error.  A compliant
+sender SHOULD honor lowered limits, since a receiver that must
+protect memory may otherwise have no option but to close the
+connection, but enforcement of the feature is left to the
+application, not the protocol error machinery.</p>
+</li>
+<li><p>An application that cannot tolerate stalls MAY close the connection
+with an application error code; the receiver's lowering never forces
+it to stay.</p>
+</li>
+</ul>
+<h3 id="62-flow_control_error-cannot-be-weaponized-by-a-lowering">6.2. FLOW_CONTROL_ERROR Cannot Be Weaponized by a Lowering</h3>
+<p>Under [RFC9000], a receiver that advertises a large limit and then stops
+updating cannot cause a violation in its peer.  Under the amended rules,
+the same holds a fortiori: a receiver that advertises a large limit and
+then lowers it also cannot cause a violation, because received data is
+checked against the largest advertised limit.  Reordering of stale
+frames in either direction likewise cannot produce a spurious error
+(Section 4.1.3).  There is no sequence of MAX_DATA or MAX_STREAM_DATA
+values, in any order, that causes a compliant sender's legitimate traffic
+to be classified as a violation.</p>
+<h3 id="63-other-considerations">6.3. Other Considerations</h3>
+<p>Flow control frames continue to be carried in encrypted packets and are
+invisible to on-path attackers, and the amendment introduces no new
+frame types, wire formats, or amplification vectors.  The memory
+commitment of a receiver is bounded, during a pause, by the largest
+advertised limit -- the same bound it accepted under [RFC9000] when it
+made the advertisement.  Remembered limits for Early Data
+(Section 7.4.1 of [RFC9000]) are treated as advertised limits
+(Section 4.1.2); no new replay or downgrade considerations arise.</p>
+<h2 id="7-iana-considerations">7. IANA Considerations</h2>
+<p>This document has no IANA actions.</p>
+<h2 id="8-references">8. References</h2>
+<h3 id="81-normative-references">8.1. Normative References</h3>
+<p>[RFC2119]  Bradner, S., &quot;Key words for use in RFCs to Indicate
+Requirement Levels&quot;, BCP 14, RFC 2119,
+DOI 10.17487/RFC2119, March 1997.</p>
+<p>[RFC8174]  Leiba, B., &quot;Ambiguity of Uppercase vs Lowercase in RFC 2119
+Key Words&quot;, BCP 14, RFC 8174, DOI 10.17487/RFC8174,
+May 2017.</p>
+<p>[RFC9000]  Iyengar, J., Ed., and M. Kucherawy, Ed., &quot;QUIC: A UDP-Based
+Multiplexed and Secure Transport&quot;, RFC 9000,
+DOI 10.17487/RFC9000, May 2021.</p>
+<h3 id="82-informative-references">8.2. Informative References</h3>
+<p>None.</p>
+<h2 id="appendix-a-summary-of-changes-relative-to-rfc-9000">Appendix A. Summary of Changes Relative to RFC 9000</h2>
+<table>
+<thead>
+<tr>
+<th>RFC 9000 location</th>
+<th>RFC 9000 (before)</th>
+<th>This document (after)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Section 4.1 (&quot;Once a receiver advertises a limit ...&quot;)</td>
+<td>&quot;it is not an error to advertise a smaller limit, but the smaller limit has no effect&quot;</td>
+<td>A receiver MAY advertise a smaller limit; it takes effect for data not yet sent (Section 4.1.1)</td>
+</tr>
+<tr>
+<td>Section 4.1 (&quot;A sender MUST ignore any MAX_STREAM_DATA or MAX_DATA frames ...&quot;)</td>
+<td>&quot;A sender MUST ignore any MAX_STREAM_DATA or MAX_DATA frames that do not increase flow control limits.&quot;</td>
+<td>An endpoint MUST set the limit in effect to the value carried in the frame, larger or smaller; a sender MUST NOT send new data beyond the limit in effect (Section 4.1.1)</td>
+</tr>
+<tr>
+<td>Section 4.1 (&quot;A receiver MUST close the connection ...&quot;)</td>
+<td>Receiver MUST close with FLOW_CONTROL_ERROR if the sender violates &quot;the advertised ... limits&quot;</td>
+<td>Violation is assessed against the largest advertised limit (including transport parameter values and remembered 0-RTT limits); data within it MUST be accepted (Section 4.1.2)</td>
+</tr>
+<tr>
+<td>Section 4.1 (&quot;If a sender has sent data up to the limit ...&quot;)</td>
+<td>Blocked sender SHOULD send DATA_BLOCKED/STREAM_DATA_BLOCKED; periodic resends to survive idle timeout</td>
+<td>Unchanged in substance; explicitly applies for the entire duration of a pause; blocked frames MUST NOT be treated as errors (Section 4.3)</td>
+</tr>
+<tr>
+<td>Section 4.2 (title)</td>
+<td>&quot;Increasing Flow Control Limits&quot;</td>
+<td>Retitled &quot;Updating Flow Control Limits&quot;; guidance extended to lowerings; receiver MUST NOT wait for blocked frames before any update (Section 4.3)</td>
+</tr>
+<tr>
+<td>Section 4.4, Section 4.5</td>
+<td>Stream-cancellation accounting and stream final size rules</td>
+<td>Unchanged; final-size accounting is unaffected by a lowered limit (Section 4.1.4)</td>
+</tr>
+<tr>
+<td>Section 7.4.1</td>
+<td>Remembered transport parameters bound Early Data usage</td>
+<td>Unchanged; remembered limits count as advertised limits for the largest-advertised computation (Sections 4.1.2, 6.3)</td>
+</tr>
+<tr>
+<td>Section 19.9, Maximum Data field</td>
+<td>&quot;indicating the maximum amount of data that can be sent on the entire connection&quot;</td>
+<td>Extended: the value is the new absolute limit, larger or smaller than any previously advertised (Section 4.2)</td>
+</tr>
+<tr>
+<td>Section 19.9, enforcement para.</td>
+<td>&quot;...MUST NOT exceed the value advertised by a receiver... if it receives more data than the maximum data value that it has sent&quot;</td>
+<td>&quot;...MUST NOT exceed the largest value advertised by a receiver during the connection... if it receives more data than the largest maximum data value that it has sent during the connection&quot; (Section 4.2)</td>
+</tr>
+<tr>
+<td>Section 19.10, Maximum Stream Data field</td>
+<td>&quot;indicating the maximum amount of data that can be sent on the identified stream&quot;</td>
+<td>Extended: the value is the new absolute limit, larger or smaller than any previously advertised for that stream (Section 4.2)</td>
+</tr>
+<tr>
+<td>Section 19.10, enforcement para.</td>
+<td>&quot;The data sent on a stream MUST NOT exceed the largest maximum stream data value advertised by the receiver.&quot;</td>
+<td>Retained; &quot;advertised&quot; is read as &quot;advertised during the connection, including the initial transport parameter value&quot; (Section 4.2)</td>
+</tr>
+<tr>
+<td>Sections 19.12, 19.13</td>
+<td>DATA_BLOCKED / STREAM_DATA_BLOCKED frame definitions</td>
+<td>Unchanged; the reported limit can legitimately be a lowered limit (Section 4.3)</td>
+</tr>
+<tr>
+<td>Section 20.1, FLOW_CONTROL_ERROR</td>
+<td>&quot;An endpoint received more data than it permitted in its advertised data limits&quot;</td>
+<td>Unchanged; &quot;advertised data limits&quot; is read per the largest-advertised rule (Section 4.1.4)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="appendix-b-formal-verification">Appendix B. Formal Verification</h2>
+<p>This appendix is non-normative.  It summarizes the formal models and
+model-checking results that serve as supporting evidence for the safety
+claims of Sections 4 and 5 -- specifically, that lowering a MAX_DATA
+announcement does not create new flow control errors and preserves
+backwards compatibility.  The verification was performed with TLC, a
+model checker for TLA+ specifications.  This is bounded model checking
+over small, finite instances of the protocol: it is evidence about the
+explored state space, not a mathematical proof for connections and
+limits of arbitrary size.</p>
+<p>Two TLA+ models of connection-level flow control between a Sender and a
+Receiver were developed.  The reference model follows Section 4.1 of
+[RFC9000] exactly: a MAX_DATA frame that does not increase the limit has
+no effect and is ignored.  The modified model implements this document:
+the Receiver MAY lower its limit, the Sender applies every received
+value to the limit in effect, and the Receiver validates received data
+against the largest limit it has ever advertised rather than against the
+most recently advertised value.  In both models, the network layer holds
+in-flight MAX_DATA frames that can be lost and, being a set of frames,
+covers reordering; application data is abstracted as discrete chunks;
+and the receiving endpoint can pause and later resume consumption.  All
+model bounds are deliberately small -- limits range over 0..3 and at
+most 2 data chunks can exist -- which keeps the state space exhaustive
+for the explored configurations.</p>
+<p>The checked properties include: TypeOK (well-formedness of all state
+variables); NoFlowControlError, asserting that the connection never
+reaches the FLOW_CONTROL_ERROR state; ReceivedWithinLimit, asserting
+that the Receiver never accepts data exceeding the largest limit it has
+advertised; absence of data loss; and a liveness property stating that
+after the Receiver resumes consumption and a MAX_DATA frame is
+delivered, the Sender eventually regains the ability to send.  TLC found
+no violations of the safety properties in either model (safety checking
+with full state-space coverage; liveness checking on the modified
+model).  No behavior of the modified model violates any invariant that
+holds in the reference model.  The single observable difference is the
+intentional weakening of the invariant &quot;sent data does not exceed the
+currently advertised limit&quot; after a lowering -- which is precisely the
+point of this proposal -- and that weakening is compensated on the
+receive side by the largest-advertised-limit rule of Section 4.1.2, so
+no spurious FLOW_CONTROL_ERROR can result.</p>
+<p>The scope of the verification is limited.  Only connection-level MAX_DATA
+is modeled; MAX_STREAM_DATA is covered by the structural symmetry of the
+argument (Section 3.4) and was not given a separate model.  Network
+conditions are abstracted: loss and reordering of flow control frames
+are covered by the set-based network model, but congestion, packet
+retransmission timing, cryptography, and the handshake are out of scope.
+Accordingly, the results below constitute evidence in favor of the
+design, not a proof of its correctness under all circumstances.</p>
+<p>The TLA+ modules and TLC models are available in the msquic repository
+at <a href="https://github.com/yurial/msquic/blob/main/specs/TLA/">https://github.com/yurial/msquic/blob/main/specs/TLA/</a> :
+QuicConnFlowControlRfc.tla (the reference model) and
+QuicConnFlowControlMsquic.tla (the modified model), together with the
+corresponding *.tlc.cfg files used to check them.</p>
+
+</article>
+
+        <div class="contribution d-print-none">
+          <a href="https://github.com/yurial/msquic/blob/main/specs/proposal-maxdata-lowering.md/#L1" class="edit-link">Edit this page</a>
+        </div>
+
+        <div class="next-article d-print-none border-top" id="nextArticle"></div>
+
+      </div>
+
+      <div class="affix">
+        <nav id="affix"></nav>
+      </div>
+    </main>
+
+    <div class="container-xxl search-results" id="search-results"></div>
+
+    <footer class="border-top text-secondary">
+      <div class="container-xxl">
+        <div class="flex-fill">
+          <span>Made with <a href="https://dotnet.github.io/docfx">docfx</a></span>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>

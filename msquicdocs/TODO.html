@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+      <title>TODO </title>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <meta name="title" content="TODO ">
+      
+      
+      <link rel="icon" href="favicon.ico">
+      <link rel="stylesheet" href="public/docfx.min.css">
+      <link rel="stylesheet" href="public/main.css">
+      <meta name="docfx:navrel" content="toc.html">
+      <meta name="docfx:tocrel" content="toc.html">
+      
+      <meta name="docfx:rel" content="">
+      
+      
+      <meta name="docfx:docurl" content="https://github.com/yurial/msquic/blob/main/TODO.md/#L1">
+      <meta name="loc:inThisArticle" content="In this article">
+      <meta name="loc:searchResultsCount" content="{count} results for &quot;{query}&quot;">
+      <meta name="loc:searchNoResults" content="No results for &quot;{query}&quot;">
+      <meta name="loc:tocFilter" content="Filter by title">
+      <meta name="loc:nextArticle" content="Next">
+      <meta name="loc:prevArticle" content="Previous">
+      <meta name="loc:themeLight" content="Light">
+      <meta name="loc:themeDark" content="Dark">
+      <meta name="loc:themeAuto" content="Auto">
+      <meta name="loc:changeTheme" content="Change theme">
+      <meta name="loc:copy" content="Copy">
+      <meta name="loc:downloadPdf" content="Download PDF">
+
+      <script type="module" src="./public/docfx.min.js"></script>
+
+      <script>
+        const theme = localStorage.getItem('theme') || 'auto'
+        document.documentElement.setAttribute('data-bs-theme', theme === 'auto' ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : theme)
+      </script>
+
+  </head>
+
+  <body class="tex2jax_ignore" data-layout="" data-yaml-mime="">
+    <header class="bg-body border-bottom">
+      <nav id="autocollapse" class="navbar navbar-expand-md" role="navigation">
+        <div class="container-xxl flex-nowrap">
+          <a class="navbar-brand" href="index.html">
+            <img id="logo" class="svg" src="logo.svg" alt="">
+            
+          </a>
+          <button class="btn btn-lg d-md-none border-0" type="button" data-bs-toggle="collapse" data-bs-target="#navpanel" aria-controls="navpanel" aria-expanded="false" aria-label="Toggle navigation">
+            <i class="bi bi-three-dots"></i>
+          </button>
+          <div class="collapse navbar-collapse" id="navpanel">
+            <div id="navbar">
+              <form class="search" role="search" id="search">
+                <i class="bi bi-search"></i>
+                <input class="form-control" id="search-query" type="search" disabled placeholder="Search" autocomplete="off" aria-label="Search">
+              </form>
+            </div>
+          </div>
+        </div>
+      </nav>
+    </header>
+
+    <main class="container-xxl">
+
+      <div class="content">
+        <div class="actionbar">
+
+          <nav id="breadcrumb"></nav>
+        </div>
+
+        <article data-uid="">
+<h1 id="todo">TODO</h1>
+
+<h2 id="известные-проблемы--отклонения">Известные проблемы / отклонения</h2>
+<ul>
+<li>[ ] RFC 9000 §4.1 отклонение (осознанное): входящий MAX_DATA всегда устанавливает лимит,
+даже понижая его (receive-pause шлёт MAX_DATA = уже принятому объёму) —
+ветка issue-maxdata-zero / recv-pause-resume.
+Не распространять на другие ветки без решения о протокольном отклонении.
+Верифицировано TLA+/TLC (specs/TLA/QuicConnFlowControlRfc.tla vs
+QuicConnFlowControlMsquic.tla, 2026-08-28): обе модели safety-зелёные
+(NoFlowControlError, ReceivedWithinLimit, DataNotLostOrOverAccepted,
+NoWraparound, PeerMaxDataSanity), liveness msquic-модели зелёный;
+единственное observable отличие — ослабление SenderWithinAdvertisedLimit
+(SentBytes может превышать пониженный PeerMaxData до resume), что и есть
+суть отклонения; FLOW_CONTROL_ERROR и потеря/переприём данных недостижимы.</li>
+<li>[ ] Телеметрия <code>ConnOutFlowStatsV2</code> (cubic.c:841, bbr.c:372): при понижении лимита ниже
+уже отправленных байт в статистику уйдёт мусорное (завёрнутое) значение
+<code>PeerMaxData - OrderedStreamBytesSent</code>. Косметика; правка требует регенерации
+CLOG-сайдкаров (src/generated/linux/<em>clog.h</em>), инструмента clog в окружении нет.</li>
+</ul>
+<h2 id="предсуществующее-не-связано-с-max_data">Предсуществующее (не связано с MAX_DATA)</h2>
+<ul>
+<li>[ ] <code>SpinFrame.SpinFrame1000000</code> зависает в msquiccoretest (и до изменений MAX_DATA).</li>
+</ul>
+
+</article>
+
+        <div class="contribution d-print-none">
+          <a href="https://github.com/yurial/msquic/blob/main/TODO.md/#L1" class="edit-link">Edit this page</a>
+        </div>
+
+        <div class="next-article d-print-none border-top" id="nextArticle"></div>
+
+      </div>
+
+      <div class="affix">
+        <nav id="affix"></nav>
+      </div>
+    </main>
+
+    <div class="container-xxl search-results" id="search-results"></div>
+
+    <footer class="border-top text-secondary">
+      <div class="container-xxl">
+        <div class="flex-fill">
+          <span>Made with <a href="https://dotnet.github.io/docfx">docfx</a></span>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>
