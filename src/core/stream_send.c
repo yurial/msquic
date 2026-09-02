@@ -973,8 +973,17 @@ QuicStreamWriteStreamFrames(
         //
         // Connection flow control
         //
+        // NB: PeerMaxData is not monotonic; the peer is allowed to lower it
+        // (see the QUIC_FRAME_MAX_DATA handling in connection.c). The clamp
+        // applied there guarantees PeerMaxData >= OrderedStreamBytesSent, so
+        // the subtraction below cannot wrap. The saturation is kept purely
+        // as defense in depth; it is unreachable under the clamp invariant.
+        //
         const uint64_t MaxConnFlowControlOffset =
-             Stream->MaxSentLength + (Send->PeerMaxData - Send->OrderedStreamBytesSent);
+             Stream->MaxSentLength +
+             (Send->PeerMaxData > Send->OrderedStreamBytesSent
+                ? Send->PeerMaxData - Send->OrderedStreamBytesSent
+                : 0);
         if (Right > MaxConnFlowControlOffset) {
             Right = MaxConnFlowControlOffset;
         }
@@ -1068,6 +1077,12 @@ QuicStreamWriteStreamFrames(
 
         if (Stream->MaxSentLength < Right) {
             Send->OrderedStreamBytesSent += Right - Stream->MaxSentLength;
+            //
+            // This assert is guaranteed unconditionally by the clamp
+            // invariant: PeerMaxData never goes below OrderedStreamBytesSent
+            // (see QUIC_FRAME_MAX_DATA handling in connection.c). It bounds
+            // the increment above by the remaining connection window.
+            //
             CXPLAT_DBG_ASSERT(Send->OrderedStreamBytesSent <= Send->PeerMaxData);
             Stream->MaxSentLength = Right;
         }
@@ -1115,7 +1130,20 @@ QuicStreamSendWrite(
 
     if (Stream->SendFlags & QUIC_STREAM_SEND_FLAG_MAX_DATA) {
 
-        QUIC_MAX_STREAM_DATA_EX Frame = { Stream->ID, Stream->MaxAllowedRecvOffset };
+        //
+        // When receive is paused, advertise BaseOffset so the peer
+        // stops sending new data on this stream. The local
+        // MaxAllowedRecvOffset is left untouched: any STREAM frames
+        // already in flight from before MAX_STREAM_DATA reaches the
+        // peer are still within our original window and will be accepted
+        // normally.
+        //
+        QUIC_MAX_STREAM_DATA_EX Frame = {
+            Stream->ID,
+            Stream->Flags.ReceivePaused
+                ? Stream->RecvBuffer.BaseOffset
+                : Stream->MaxAllowedRecvOffset
+        };
 
         if (QuicMaxStreamDataFrameEncode(
                 &Frame,

@@ -5479,4 +5479,859 @@ QuicTestStreamAppProvidedBuffersOutOfSpace_ServerSend_ProvideMoreBuffer(
     TEST_EQUAL(0, memcmp(Buffers.SendDataBuffer.get(), Buffers.ReceiveDataBuffer.get(), Buffers.SendDataSize));
 }
 
+//
+// Tests the Connection.ReceivePause / Connection.ReceiveResume APIs.
+//
+// Pause stops the advertisement of NEW connection-level flow control credit:
+// while paused, MAX_DATA is advertised at the already-received byte count,
+// so the peer has no additional credit. The local Send.MaxData limit is
+// never lowered, so STREAM frames already in flight stay within the
+// previously advertised window and are never rejected with
+// FLOW_CONTROL_ERROR (and the peer may simply ignore a lowered value, per
+// RFC 9000 sec 4.1).
+//
+// This test exercises the ordering and idempotency contract of the API: the
+// paused/unpaused state transition is applied on the connection's worker
+// thread, so consecutive calls are applied in FIFO order and calls that are
+// already in the target state are no-ops. The final payload delivery check
+// verifies the whole sequence leaves the connection un-paused (a regression
+// where a Resume op was dropped or mis-ordered would pin the advertised
+// limit at the already-received byte count, leaving the peer no credit).
+//
+struct ConnReceivePauseResumeContext {
+    CxPlatEvent ServerDataReceived;
+
+    static
+    QUIC_STATUS
+    ServerStreamCallback(
+        _In_ MsQuicStream* /* Stream */,
+        _In_opt_ void* Context,
+        _Inout_ QUIC_STREAM_EVENT* Event
+        ) {
+        if (Event->Type == QUIC_STREAM_EVENT_RECEIVE) {
+            ((ConnReceivePauseResumeContext*)Context)->ServerDataReceived.Set();
+        }
+        return QUIC_STATUS_SUCCESS;
+    }
+
+    static QUIC_STATUS QUIC_API ServerConnCallback(
+        _In_ MsQuicConnection* /* Connection */,
+        _In_opt_ void* Context,
+        _Inout_ QUIC_CONNECTION_EVENT* Event) {
+        if (Event->Type == QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED) {
+            MsQuicStream* Stream = new(std::nothrow) MsQuicStream(
+                Event->PEER_STREAM_STARTED.Stream,
+                CleanUpAutoDelete,
+                ServerStreamCallback,
+                Context);
+            (void)Stream;
+        }
+        return QUIC_STATUS_SUCCESS;
+    }
+};
+
+void
+QuicTestConnReceivePauseResume(
+    )
+{
+    ConnReceivePauseResumeContext Context;
+
+    MsQuicRegistration Registration(true);
+    TEST_QUIC_SUCCEEDED(Registration.GetInitStatus());
+
+    MsQuicConfiguration ServerConfiguration(
+        Registration, "MsQuicTest",
+        MsQuicSettings().SetPeerUnidiStreamCount(1),
+        ServerSelfSignedCredConfig);
+    TEST_QUIC_SUCCEEDED(ServerConfiguration.GetInitStatus());
+
+    MsQuicConfiguration ClientConfiguration(
+        Registration, "MsQuicTest", MsQuicCredentialConfig());
+    TEST_QUIC_SUCCEEDED(ClientConfiguration.GetInitStatus());
+
+    MsQuicAutoAcceptListener Listener(
+        Registration, ServerConfiguration,
+        ConnReceivePauseResumeContext::ServerConnCallback, &Context);
+    TEST_QUIC_SUCCEEDED(Listener.GetInitStatus());
+    TEST_QUIC_SUCCEEDED(Listener.Start("MsQuicTest"));
+    QuicAddr ServerLocalAddr;
+    TEST_QUIC_SUCCEEDED(Listener.GetLocalAddr(ServerLocalAddr));
+
+    MsQuicConnection Connection(Registration);
+    TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
+    TEST_QUIC_SUCCEEDED(Connection.Start(
+        ClientConfiguration,
+        ServerLocalAddr.GetFamily(),
+        QUIC_TEST_LOOPBACK_FOR_AF(ServerLocalAddr.GetFamily()),
+        ServerLocalAddr.GetPort()));
+    TEST_TRUE(Connection.HandshakeCompleteEvent.WaitTimeout(TestWaitTimeout));
+    TEST_TRUE(Connection.HandshakeComplete);
+
+    //
+    // resume-without-pause: must be a no-op (returns SUCCESS).
+    //
+    TEST_QUIC_SUCCEEDED(Connection.ResumeReceive());
+
+    //
+    // pause is idempotent: a second pause while already paused returns
+    // SUCCESS (per the API contract, see MsQuicConnectionReceivePause
+    // in src/core/api.c).
+    //
+    TEST_QUIC_SUCCEEDED(Connection.PauseReceive());
+    TEST_QUIC_SUCCEEDED(Connection.PauseReceive());
+
+    //
+    // resume: takes us back out of the paused state.
+    //
+    TEST_QUIC_SUCCEEDED(Connection.ResumeReceive());
+    // A second resume while not paused is a no-op.
+    TEST_QUIC_SUCCEEDED(Connection.ResumeReceive());
+
+    //
+    // Final-state check: the sequence above must leave the connection
+    // un-paused. If the final Resume op were dropped or mis-ordered, the
+    // server would still be advertising MAX_DATA at the already-received
+    // byte count (zero credit) and this payload would never be delivered.
+    //
+    // Static so the buffer outlives the send without lifetime management.
+    //
+    static uint8_t PayloadBuffer[16];
+    QUIC_BUFFER Payload { sizeof(PayloadBuffer), PayloadBuffer };
+    MsQuicStream Stream(
+        Connection, QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL, CleanUpManual,
+        MsQuicStream::NoOpCallback, nullptr);
+    TEST_QUIC_SUCCEEDED(Stream.GetInitStatus());
+    TEST_QUIC_SUCCEEDED(
+        Stream.Send(
+            &Payload, 1,
+            QUIC_SEND_FLAG_START | QUIC_SEND_FLAG_FIN));
+    TEST_TRUE(Context.ServerDataReceived.WaitTimeout(TestWaitTimeout));
+
+    // Clean shutdown.
+    Connection.Shutdown(0, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE);
+}
+
+//
+// Verifies the sender side of the receive-pause feature: when the peer
+// advertises a lowered connection-level MAX_DATA limit (equal to the bytes
+// already received in the paused case), the local endpoint must stop
+// sending new STREAM data, and when the limit is raised again, sending
+// must resume.
+//
+// Applying a lowered MAX_DATA value is an intentional deviation from
+// RFC 9000 Section 4.1; see the QUIC_FRAME_MAX_DATA handling in
+// QuicConnRecvFrames (connection.c).
+//
+// The test is fully event driven; there are no timing assumptions other than
+// the standard completion timeouts:
+// 1. The client sends chunk A (fits in the server's small connection flow
+//    control window) and the server consumes it.
+// 2. The server pauses receive (which advertises MAX_DATA equal to the
+//    bytes already received) and only then sends a one byte marker on the
+//    same stream. Because the marker is queued after the MAX_DATA frame,
+//    its arrival at the client proves the client is safe to queue more
+//    data (it has already processed the lowered MAX_DATA; on loopback UDP
+//    delivery is FIFO and the marker follows the MAX_DATA packet).
+// 3. The client queues chunk B (would fit in the original window) and sends
+//    a zero-length FIN-only stream as an echo to tell the server the data
+//    is queued. (The echo must not be STREAM payload, because the lowered
+//    connection flow control limit leaves no room for new payload and
+//    would block it; opening a new stream with a FIN-only frame is exempt
+//    from flow control.)
+// 4. The client verifies its stream-bytes-sent counter stays below
+//    A+B while the limit is lowered. Under the previous (RFC-conformant)
+//    behavior chunk B would have been sent immediately, so this assertion
+//    fails if the deviation is ever reverted.
+// 5. The server resumes receive (raises the limit back) and both the queued
+//    chunk B is delivered, proving sending resumed.
+//
+struct ConnMaxDataLoweredTestContext {
+    static constexpr uint64_t WindowSize = 2048;  // Server conn FC window.
+    static constexpr uint64_t ChunkASize = 100;   // Sent before the pause.
+    static constexpr uint64_t ChunkBSize = 1900;  // Queued while paused; fits the original window.
+
+    // Server side.
+    MsQuicConnection* ServerConnection {nullptr};
+    MsQuicStream* ServerStream {nullptr};
+    uint64_t ServerBytesReceived {0};
+    CxPlatEvent ServerChunkAReceived;
+    CxPlatEvent ServerEchoReceived;
+    CxPlatEvent ServerChunkBReceived;
+
+    // Client side.
+    CxPlatEvent ClientMarkerReceived;
+
+    static
+    QUIC_STATUS
+    ServerStreamCallback(
+        _In_ MsQuicStream* Stream,
+        _In_opt_ void* Context,
+        _Inout_ QUIC_STREAM_EVENT* Event
+        ) {
+        auto Ctx = (ConnMaxDataLoweredTestContext*)Context;
+        if (Event->Type == QUIC_STREAM_EVENT_RECEIVE) {
+            //
+            // Consume all received data and fire threshold events.
+            //
+            Ctx->ServerBytesReceived += Event->RECEIVE.TotalBufferLength;
+            if (Ctx->ServerBytesReceived >= ChunkASize) {
+                Ctx->ServerChunkAReceived.Set();
+            }
+            if (Ctx->ServerBytesReceived >= ChunkASize + ChunkBSize) {
+                Ctx->ServerChunkBReceived.Set();
+            }
+        }
+        UNREFERENCED_PARAMETER(Stream);
+        return QUIC_STATUS_SUCCESS;
+    }
+
+    static
+    QUIC_STATUS
+    ServerEchoStreamCallback(
+        _In_ MsQuicStream* /* Stream */,
+        _In_opt_ void* Context,
+        _Inout_ QUIC_STREAM_EVENT* Event
+        ) {
+        auto Ctx = (ConnMaxDataLoweredTestContext*)Context;
+        if (Event->Type == QUIC_STREAM_EVENT_RECEIVE ||
+            Event->Type == QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN) {
+            Ctx->ServerEchoReceived.Set();
+        }
+        return QUIC_STATUS_SUCCESS;
+    }
+
+    static
+    QUIC_STATUS
+    ClientStreamCallback(
+        _In_ MsQuicStream* /* Stream */,
+        _In_opt_ void* Context,
+        _Inout_ QUIC_STREAM_EVENT* Event
+        ) {
+        auto Ctx = (ConnMaxDataLoweredTestContext*)Context;
+        if (Event->Type == QUIC_STREAM_EVENT_RECEIVE) {
+            //
+            // The pause marker sent by the server (after the lowered
+            // MAX_DATA).
+            //
+            Ctx->ClientMarkerReceived.Set();
+        }
+        return QUIC_STATUS_SUCCESS;
+    }
+
+    static
+    QUIC_STATUS
+    ServerConnCallback(
+        _In_ MsQuicConnection* Connection,
+        _In_opt_ void* Context,
+        _Inout_ QUIC_CONNECTION_EVENT* Event
+        ) {
+        auto Ctx = (ConnMaxDataLoweredTestContext*)Context;
+        if (Event->Type == QUIC_CONNECTION_EVENT_CONNECTED) {
+            Ctx->ServerConnection = Connection;
+        } else if (Event->Type == QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED) {
+            auto Stream = new(std::nothrow) MsQuicStream(
+                Event->PEER_STREAM_STARTED.Stream,
+                CleanUpAutoDelete,
+                Ctx->ServerStream == nullptr ?
+                    ServerStreamCallback : ServerEchoStreamCallback,
+                Context);
+            if (Ctx->ServerStream == nullptr) {
+                Ctx->ServerStream = Stream;
+            }
+        }
+        return QUIC_STATUS_SUCCESS;
+    }
+};
+
+void
+QuicTestConnMaxDataLoweredBlocksSend(
+    )
+{
+    ConnMaxDataLoweredTestContext Context;
+
+    MsQuicRegistration Registration(true);
+    TEST_QUIC_SUCCEEDED(Registration.GetInitStatus());
+
+    MsQuicConfiguration ServerConfiguration(
+        Registration, "MsQuicTest",
+        MsQuicSettings()
+            .SetPeerBidiStreamCount(1)
+            .SetPeerUnidiStreamCount(1)
+            .SetConnFlowControlWindow(
+                (uint32_t)ConnMaxDataLoweredTestContext::WindowSize),
+        ServerSelfSignedCredConfig);
+    TEST_QUIC_SUCCEEDED(ServerConfiguration.GetInitStatus());
+
+    MsQuicConfiguration ClientConfiguration(
+        Registration, "MsQuicTest", MsQuicCredentialConfig());
+    TEST_QUIC_SUCCEEDED(ClientConfiguration.GetInitStatus());
+
+    MsQuicAutoAcceptListener Listener(
+        Registration, ServerConfiguration,
+        ConnMaxDataLoweredTestContext::ServerConnCallback, &Context);
+    TEST_QUIC_SUCCEEDED(Listener.GetInitStatus());
+    TEST_QUIC_SUCCEEDED(Listener.Start("MsQuicTest"));
+    QuicAddr ServerLocalAddr;
+    TEST_QUIC_SUCCEEDED(Listener.GetLocalAddr(ServerLocalAddr));
+
+    MsQuicConnection Connection(Registration);
+    TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
+    TEST_QUIC_SUCCEEDED(Connection.Start(
+        ClientConfiguration,
+        ServerLocalAddr.GetFamily(),
+        QUIC_TEST_LOOPBACK_FOR_AF(ServerLocalAddr.GetFamily()),
+        ServerLocalAddr.GetPort()));
+    TEST_TRUE(Connection.HandshakeCompleteEvent.WaitTimeout(TestWaitTimeout));
+    TEST_TRUE(Connection.HandshakeComplete);
+
+    //
+    // Static so the buffers outlive the sends without lifetime management.
+    //
+    static uint8_t RawBufferA[ConnMaxDataLoweredTestContext::ChunkASize];
+    static uint8_t RawBufferB[ConnMaxDataLoweredTestContext::ChunkBSize];
+    static uint8_t RawBufferMarker[1];
+    QUIC_BUFFER BufferA { sizeof(RawBufferA), RawBufferA };
+    QUIC_BUFFER BufferB { sizeof(RawBufferB), RawBufferB };
+    QUIC_BUFFER BufferMarker { sizeof(RawBufferMarker), RawBufferMarker };
+
+    //
+    // Client: open the stream and send chunk A.
+    //
+    MsQuicStream Stream(
+        Connection, QUIC_STREAM_OPEN_FLAG_NONE, CleanUpManual,
+        ConnMaxDataLoweredTestContext::ClientStreamCallback, &Context);
+    TEST_QUIC_SUCCEEDED(Stream.GetInitStatus());
+    TEST_QUIC_SUCCEEDED(Stream.Send(&BufferA, 1, QUIC_SEND_FLAG_START));
+
+    //
+    // Server: once chunk A arrives, pause receive (which advertises
+    // MAX_DATA equal to the bytes already received) and only then send the
+    // marker. The send API queues both operations on the connection worker,
+    // so the marker always follows the MAX_DATA frame.
+    //
+    TEST_TRUE(Context.ServerChunkAReceived.WaitTimeout(TestWaitTimeout));
+    TEST_TRUE(Context.ServerConnection != nullptr);
+    TEST_TRUE(Context.ServerStream != nullptr);
+    TEST_QUIC_SUCCEEDED(Context.ServerConnection->PauseReceive());
+    TEST_QUIC_SUCCEEDED(Context.ServerStream->Send(&BufferMarker, 1, QUIC_SEND_FLAG_NONE));
+
+    //
+    // Client: when the marker arrives, the lowered MAX_DATA has been
+    // processed, so it is safe to queue chunk B. It must not go on the wire
+    // while the limit stays lowered. Then send the FIN-only echo stream to
+    // tell the server that chunk B has been queued.
+    //
+    TEST_TRUE(Context.ClientMarkerReceived.WaitTimeout(TestWaitTimeout));
+    TEST_QUIC_SUCCEEDED(Stream.Send(&BufferB, 1, QUIC_SEND_FLAG_NONE));
+
+    //
+    // Verify the sender stays blocked while the limit is lowered: no new
+    // stream bytes (beyond retransmissions of chunk A) may be sent. With
+    // the RFC-conformant "increase-only" behavior this would fail because
+    // chunk B would be sent immediately.
+    //
+    for (unsigned i = 0; i < 5; i++) {
+        CxPlatSleep(100);
+        QUIC_STATISTICS_V2 Stats{};
+        TEST_QUIC_SUCCEEDED(Connection.GetStatistics(&Stats));
+        TEST_TRUE(Stats.SendTotalStreamBytes <
+                  ConnMaxDataLoweredTestContext::ChunkASize +
+                  ConnMaxDataLoweredTestContext::ChunkBSize);
+    }
+
+    //
+    // Open the FIN-only echo stream: a zero-payload STREAM frame with FIN.
+    // It is exempt from connection flow control, so it reaches the server
+    // even though the lowered connection flow control limit leaves no room
+    // for new payload. Declared at function scope so the stream isn't
+    // closed before its FIN gets flushed.
+    //
+    QUIC_BUFFER NoBuffer { 0, nullptr };
+    MsQuicStream EchoStream(
+        Connection, QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL, CleanUpManual,
+        MsQuicStream::NoOpCallback, nullptr);
+    TEST_QUIC_SUCCEEDED(EchoStream.GetInitStatus());
+    TEST_QUIC_SUCCEEDED(
+        EchoStream.Send(
+            &NoBuffer, 1,
+            QUIC_SEND_FLAG_START | QUIC_SEND_FLAG_FIN));
+
+    //
+    // Server: the echo proves chunk B is queued. Resume receive (raising
+    // the limit back) and the queued data must now be delivered.
+    //
+    TEST_TRUE(Context.ServerEchoReceived.WaitTimeout(TestWaitTimeout));
+    TEST_QUIC_SUCCEEDED(Context.ServerConnection->ResumeReceive());
+    TEST_TRUE(Context.ServerChunkBReceived.WaitTimeout(TestWaitTimeout));
+
+    //
+    // Final check: all stream payload (A and B) eventually got sent.
+    //
+    QUIC_STATISTICS_V2 Stats{};
+    for (unsigned i = 0; i < 50; i++) {
+        TEST_QUIC_SUCCEEDED(Connection.GetStatistics(&Stats));
+        if (Stats.SendTotalStreamBytes >=
+            ConnMaxDataLoweredTestContext::ChunkASize +
+            ConnMaxDataLoweredTestContext::ChunkBSize) {
+            break;
+        }
+        CxPlatSleep(100);
+    }
+    TEST_TRUE(Stats.SendTotalStreamBytes >=
+              ConnMaxDataLoweredTestContext::ChunkASize +
+              ConnMaxDataLoweredTestContext::ChunkBSize);
+
+    Connection.Shutdown(0, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE);
+}
+
+//
+// Verifies the sender side of the stream-level receive-pause feature: when
+// the peer advertises a lowered stream-level MAX_STREAM_DATA limit (equal to
+// the bytes already delivered in the paused case), the local endpoint must
+// stop sending new STREAM data on that stream, and when the limit is raised
+// again, sending must resume.
+//
+// Applying a lowered MAX_STREAM_DATA value is an intentional deviation from
+// RFC 9000 Section 4.1; see the QUIC_FRAME_MAX_STREAM_DATA handling in
+// QuicStreamRecv (stream_recv.c).
+//
+// Structured like QuicTestConnMaxDataLoweredBlocksSend; fully event driven
+// (the only polling is the negative "sender stays blocked" assertion):
+// 1. The client sends chunk A and the server consumes it.
+// 2. The server pauses receive on the stream (which advertises
+//    MAX_STREAM_DATA equal to the already-delivered offset) and only then
+//    sends a one byte marker on the same stream. Because the marker is
+//    queued after the MAX_STREAM_DATA frame, its arrival at the client
+//    proves the client is safe to queue more data (it has already processed
+//    the lowered MAX_STREAM_DATA; on loopback UDP delivery is FIFO and the
+//    marker follows the MAX_STREAM_DATA packet).
+// 3. The client queues chunk B (fits in the original stream window) and the
+//    test verifies the stream-bytes-sent counter stays below A+B while the
+//    limit is lowered. Under the previous (increase-only) behavior chunk B
+//    would have been sent immediately, so this assertion fails if the
+//    stream-level deviation is ever reverted.
+// 4. The server resumes receive on the stream (raising the limit back) and
+//    the queued chunk B is delivered, proving sending resumed.
+//
+struct StreamRecvPauseBlocksSendTestContext {
+    static constexpr uint64_t ChunkASize = 100;   // Sent before the pause.
+    static constexpr uint64_t ChunkBSize = 1900;  // Queued while paused; fits the original window.
+
+    // Server side.
+    MsQuicStream* ServerStream {nullptr};
+    uint64_t ServerBytesReceived {0};
+    CxPlatEvent ServerChunkAReceived;
+    CxPlatEvent ServerChunkBReceived;
+
+    // Client side.
+    CxPlatEvent ClientMarkerReceived;
+
+    static
+    QUIC_STATUS
+    ServerStreamCallback(
+        _In_ MsQuicStream* Stream,
+        _In_opt_ void* Context,
+        _Inout_ QUIC_STREAM_EVENT* Event
+        ) {
+        auto Ctx = (StreamRecvPauseBlocksSendTestContext*)Context;
+        if (Event->Type == QUIC_STREAM_EVENT_RECEIVE) {
+            //
+            // Consume all received data and fire threshold events.
+            //
+            Ctx->ServerBytesReceived += Event->RECEIVE.TotalBufferLength;
+            if (Ctx->ServerBytesReceived >= ChunkASize) {
+                Ctx->ServerChunkAReceived.Set();
+            }
+            if (Ctx->ServerBytesReceived >= ChunkASize + ChunkBSize) {
+                Ctx->ServerChunkBReceived.Set();
+            }
+        }
+        UNREFERENCED_PARAMETER(Stream);
+        return QUIC_STATUS_SUCCESS;
+    }
+
+    static
+    QUIC_STATUS
+    ClientStreamCallback(
+        _In_ MsQuicStream* /* Stream */,
+        _In_opt_ void* Context,
+        _Inout_ QUIC_STREAM_EVENT* Event
+        ) {
+        auto Ctx = (StreamRecvPauseBlocksSendTestContext*)Context;
+        if (Event->Type == QUIC_STREAM_EVENT_RECEIVE) {
+            //
+            // The pause marker sent by the server (after the lowered
+            // MAX_STREAM_DATA).
+            //
+            Ctx->ClientMarkerReceived.Set();
+        }
+        return QUIC_STATUS_SUCCESS;
+    }
+
+    static
+    QUIC_STATUS
+    ServerConnCallback(
+        _In_ MsQuicConnection* /* Connection */,
+        _In_opt_ void* Context,
+        _Inout_ QUIC_CONNECTION_EVENT* Event
+        ) {
+        auto Ctx = (StreamRecvPauseBlocksSendTestContext*)Context;
+        if (Event->Type == QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED) {
+            auto Stream = new(std::nothrow) MsQuicStream(
+                Event->PEER_STREAM_STARTED.Stream,
+                CleanUpAutoDelete,
+                ServerStreamCallback,
+                Context);
+            if (Ctx->ServerStream == nullptr) {
+                Ctx->ServerStream = Stream;
+            }
+        }
+        return QUIC_STATUS_SUCCESS;
+    }
+};
+
+void
+QuicTestStreamRecvPauseBlocksSend(
+    )
+{
+    StreamRecvPauseBlocksSendTestContext Context;
+
+    MsQuicRegistration Registration(true);
+    TEST_QUIC_SUCCEEDED(Registration.GetInitStatus());
+
+    MsQuicConfiguration ServerConfiguration(
+        Registration, "MsQuicTest",
+        MsQuicSettings().SetPeerBidiStreamCount(1),
+        ServerSelfSignedCredConfig);
+    TEST_QUIC_SUCCEEDED(ServerConfiguration.GetInitStatus());
+
+    MsQuicConfiguration ClientConfiguration(
+        Registration, "MsQuicTest", MsQuicCredentialConfig());
+    TEST_QUIC_SUCCEEDED(ClientConfiguration.GetInitStatus());
+
+    MsQuicAutoAcceptListener Listener(
+        Registration, ServerConfiguration,
+        StreamRecvPauseBlocksSendTestContext::ServerConnCallback, &Context);
+    TEST_QUIC_SUCCEEDED(Listener.GetInitStatus());
+    TEST_QUIC_SUCCEEDED(Listener.Start("MsQuicTest"));
+    QuicAddr ServerLocalAddr;
+    TEST_QUIC_SUCCEEDED(Listener.GetLocalAddr(ServerLocalAddr));
+
+    MsQuicConnection Connection(Registration);
+    TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
+    TEST_QUIC_SUCCEEDED(Connection.Start(
+        ClientConfiguration,
+        ServerLocalAddr.GetFamily(),
+        QUIC_TEST_LOOPBACK_FOR_AF(ServerLocalAddr.GetFamily()),
+        ServerLocalAddr.GetPort()));
+    TEST_TRUE(Connection.HandshakeCompleteEvent.WaitTimeout(TestWaitTimeout));
+    TEST_TRUE(Connection.HandshakeComplete);
+
+    //
+    // Static so the buffers outlive the sends without lifetime management.
+    //
+    static uint8_t RawBufferA[StreamRecvPauseBlocksSendTestContext::ChunkASize];
+    static uint8_t RawBufferB[StreamRecvPauseBlocksSendTestContext::ChunkBSize];
+    static uint8_t RawBufferMarker[1];
+    QUIC_BUFFER BufferA { sizeof(RawBufferA), RawBufferA };
+    QUIC_BUFFER BufferB { sizeof(RawBufferB), RawBufferB };
+    QUIC_BUFFER BufferMarker { sizeof(RawBufferMarker), RawBufferMarker };
+
+    //
+    // Client: open the stream and send chunk A.
+    //
+    MsQuicStream Stream(
+        Connection, QUIC_STREAM_OPEN_FLAG_NONE, CleanUpManual,
+        StreamRecvPauseBlocksSendTestContext::ClientStreamCallback, &Context);
+    TEST_QUIC_SUCCEEDED(Stream.GetInitStatus());
+    TEST_QUIC_SUCCEEDED(Stream.Send(&BufferA, 1, QUIC_SEND_FLAG_START));
+
+    //
+    // Server: once chunk A arrives, pause receive on the stream (which
+    // advertises MAX_STREAM_DATA equal to the already-delivered offset) and
+    // only then send the marker. The send API queues both operations on the
+    // connection worker, so the marker always follows the MAX_STREAM_DATA
+    // frame.
+    //
+    TEST_TRUE(Context.ServerChunkAReceived.WaitTimeout(TestWaitTimeout));
+    TEST_TRUE(Context.ServerStream != nullptr);
+    TEST_QUIC_SUCCEEDED(Context.ServerStream->PauseReceive());
+    TEST_QUIC_SUCCEEDED(Context.ServerStream->Send(&BufferMarker, 1, QUIC_SEND_FLAG_NONE));
+
+    //
+    // Client: when the marker arrives, the lowered MAX_STREAM_DATA has been
+    // processed, so it is safe to queue chunk B. It must not go on the wire
+    // while the limit stays lowered.
+    //
+    TEST_TRUE(Context.ClientMarkerReceived.WaitTimeout(TestWaitTimeout));
+    TEST_QUIC_SUCCEEDED(Stream.Send(&BufferB, 1, QUIC_SEND_FLAG_NONE));
+
+    //
+    // Verify the sender stays blocked while the limit is lowered: no new
+    // stream bytes (beyond retransmissions of chunk A) may be sent. With
+    // the previous increase-only behavior this would fail because chunk B
+    // would be sent immediately.
+    //
+    for (unsigned i = 0; i < 5; i++) {
+        CxPlatSleep(100);
+        QUIC_STATISTICS_V2 Stats{};
+        TEST_QUIC_SUCCEEDED(Connection.GetStatistics(&Stats));
+        TEST_TRUE(Stats.SendTotalStreamBytes <
+                  StreamRecvPauseBlocksSendTestContext::ChunkASize +
+                  StreamRecvPauseBlocksSendTestContext::ChunkBSize);
+    }
+
+    //
+    // Server: resume receive on the stream (raising the limit back) and the
+    // queued data must now be delivered.
+    //
+    TEST_QUIC_SUCCEEDED(Context.ServerStream->ResumeReceive());
+    TEST_TRUE(Context.ServerChunkBReceived.WaitTimeout(TestWaitTimeout));
+
+    Connection.Shutdown(0, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE);
+}
+
+//
+// Verifies the deferred-credit behavior of the connection-level
+// receive-pause feature: data within the previously advertised window keeps
+// being received and delivered while receive is paused (deliveries are never
+// lost), the flow control credit earned by such deliveries is parked in
+// Send.DeferredMaxData instead of being granted (or lost) while paused, and
+// it is handed to the sender when receive is resumed.
+//
+// The parked credit is observed by its effect: after ResumeReceive the
+// client can send more total bytes than the window that remained at pause
+// time (more than the original window in total), which is impossible unless
+// the credit delivered during the pause was applied on resume.
+//
+// The test is fully event driven and deterministic; it exploits the fact
+// that all PauseReceive/ReceiveComplete/ResumeReceive/Send calls queue
+// FIFO-ordered operations on the same connection worker thread:
+// 1. The client sends chunk A (fits the small connection flow control
+//    window) and the server's stream callback holds it by returning
+//    QUIC_STATUS_PENDING (received by the transport, not yet delivered).
+// 2. The server pauses receive (advertises MAX_DATA equal to the bytes
+//    already received, so the client's remaining credit drops to zero) and
+//    only then completes the pending receive, delivering chunk A *during*
+//    the pause. The credit earned is parked (no new MAX_DATA for the peer).
+// 3. The server resumes receive: the parked credit is added to the
+//    advertised limit (window > original window) and a one byte marker is
+//    sent on the same stream. Because the marker is queued after the resume
+//    operation, its arrival at the client proves the raised MAX_DATA has
+//    been processed (on loopback UDP delivery is FIFO and frames are
+//    ordered within a packet).
+// 4. The client sends chunk C, which is larger than the window that
+//    remained at pause time (WindowSize - ChunkASize). With the parked
+//    credit applied this fits; without it the data would stall and the
+//    delivery would never complete.
+// 5. The server verifies the full volume (A + C, which exceeds the original
+//    window) is delivered, i.e. nothing was lost while paused, and the
+//    client's SendTotalStreamBytes statistic confirms everything was sent.
+//
+struct RecvPauseDeferredCreditTestContext {
+    static constexpr uint64_t WindowSize = 2048;  // Server conn FC window.
+    static constexpr uint64_t ChunkASize = 100;   // Received before/during the pause.
+    static constexpr uint64_t ChunkCSize = 2000;  // Needs the credit parked during the pause.
+
+    // Server side.
+    MsQuicConnection* ServerConnection {nullptr};
+    MsQuicStream* ServerStream {nullptr};
+    uint64_t ServerBytesReceived {0};
+    uint64_t ServerPendingLength {0};   // Bytes held (pending) by the callback.
+    BOOLEAN ServerFirstReceiveHeld {FALSE};
+    CxPlatEvent ServerChunkAReceived;
+    CxPlatEvent ServerAllDataReceived;
+
+    // Client side.
+    CxPlatEvent ClientMarkerReceived;
+
+    static
+    QUIC_STATUS
+    ServerStreamCallback(
+        _In_ MsQuicStream* /* Stream */,
+        _In_opt_ void* Context,
+        _Inout_ QUIC_STREAM_EVENT* Event
+        ) {
+        auto Ctx = (RecvPauseDeferredCreditTestContext*)Context;
+        if (Event->Type == QUIC_STREAM_EVENT_RECEIVE) {
+            Ctx->ServerBytesReceived += Event->RECEIVE.TotalBufferLength;
+            if (!Ctx->ServerFirstReceiveHeld) {
+                //
+                // Hold chunk A: return PENDING so it is only delivered
+                // (flow control credit granted) when the test completes
+                // the receive -- which happens while receive is paused.
+                //
+                Ctx->ServerFirstReceiveHeld = TRUE;
+                Ctx->ServerPendingLength = Event->RECEIVE.TotalBufferLength;
+                Ctx->ServerChunkAReceived.Set();
+                return QUIC_STATUS_PENDING;
+            }
+            if (Ctx->ServerBytesReceived >= ChunkASize + ChunkCSize) {
+                Ctx->ServerAllDataReceived.Set();
+            }
+        }
+        return QUIC_STATUS_SUCCESS;
+    }
+
+    static
+    QUIC_STATUS
+    ClientStreamCallback(
+        _In_ MsQuicStream* /* Stream */,
+        _In_opt_ void* Context,
+        _Inout_ QUIC_STREAM_EVENT* Event
+        ) {
+        auto Ctx = (RecvPauseDeferredCreditTestContext*)Context;
+        if (Event->Type == QUIC_STREAM_EVENT_RECEIVE) {
+            //
+            // The resume marker sent by the server (after the raised
+            // MAX_DATA).
+            //
+            Ctx->ClientMarkerReceived.Set();
+        }
+        return QUIC_STATUS_SUCCESS;
+    }
+
+    static
+    QUIC_STATUS
+    ServerConnCallback(
+        _In_ MsQuicConnection* Connection,
+        _In_opt_ void* Context,
+        _Inout_ QUIC_CONNECTION_EVENT* Event
+        ) {
+        auto Ctx = (RecvPauseDeferredCreditTestContext*)Context;
+        if (Event->Type == QUIC_CONNECTION_EVENT_CONNECTED) {
+            Ctx->ServerConnection = Connection;
+        } else if (Event->Type == QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED) {
+            auto Stream = new(std::nothrow) MsQuicStream(
+                Event->PEER_STREAM_STARTED.Stream,
+                CleanUpAutoDelete,
+                ServerStreamCallback,
+                Context);
+            if (Ctx->ServerStream == nullptr) {
+                Ctx->ServerStream = Stream;
+            }
+        }
+        return QUIC_STATUS_SUCCESS;
+    }
+};
+
+void
+QuicTestRecvPauseDeferredCredit(
+    )
+{
+    RecvPauseDeferredCreditTestContext Context;
+
+    MsQuicRegistration Registration(true);
+    TEST_QUIC_SUCCEEDED(Registration.GetInitStatus());
+
+    MsQuicConfiguration ServerConfiguration(
+        Registration, "MsQuicTest",
+        MsQuicSettings()
+            .SetPeerBidiStreamCount(1)
+            .SetConnFlowControlWindow(
+                (uint32_t)RecvPauseDeferredCreditTestContext::WindowSize),
+        ServerSelfSignedCredConfig);
+    TEST_QUIC_SUCCEEDED(ServerConfiguration.GetInitStatus());
+
+    MsQuicConfiguration ClientConfiguration(
+        Registration, "MsQuicTest", MsQuicCredentialConfig());
+    TEST_QUIC_SUCCEEDED(ClientConfiguration.GetInitStatus());
+
+    MsQuicAutoAcceptListener Listener(
+        Registration, ServerConfiguration,
+        RecvPauseDeferredCreditTestContext::ServerConnCallback, &Context);
+    TEST_QUIC_SUCCEEDED(Listener.GetInitStatus());
+    TEST_QUIC_SUCCEEDED(Listener.Start("MsQuicTest"));
+    QuicAddr ServerLocalAddr;
+    TEST_QUIC_SUCCEEDED(Listener.GetLocalAddr(ServerLocalAddr));
+
+    MsQuicConnection Connection(Registration);
+    TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
+    TEST_QUIC_SUCCEEDED(Connection.Start(
+        ClientConfiguration,
+        ServerLocalAddr.GetFamily(),
+        QUIC_TEST_LOOPBACK_FOR_AF(ServerLocalAddr.GetFamily()),
+        ServerLocalAddr.GetPort()));
+    TEST_TRUE(Connection.HandshakeCompleteEvent.WaitTimeout(TestWaitTimeout));
+    TEST_TRUE(Connection.HandshakeComplete);
+
+    //
+    // Static so the buffers outlive the sends without lifetime management.
+    //
+    static uint8_t RawBufferA[RecvPauseDeferredCreditTestContext::ChunkASize];
+    static uint8_t RawBufferC[RecvPauseDeferredCreditTestContext::ChunkCSize];
+    static uint8_t RawBufferMarker[1];
+    QUIC_BUFFER BufferA { sizeof(RawBufferA), RawBufferA };
+    QUIC_BUFFER BufferC { sizeof(RawBufferC), RawBufferC };
+    QUIC_BUFFER BufferMarker { sizeof(RawBufferMarker), RawBufferMarker };
+
+    //
+    // Client: open the stream and send chunk A.
+    //
+    MsQuicStream Stream(
+        Connection, QUIC_STREAM_OPEN_FLAG_NONE, CleanUpManual,
+        RecvPauseDeferredCreditTestContext::ClientStreamCallback, &Context);
+    TEST_QUIC_SUCCEEDED(Stream.GetInitStatus());
+    TEST_QUIC_SUCCEEDED(Stream.Send(&BufferA, 1, QUIC_SEND_FLAG_START));
+
+    //
+    // Server: the callback holds chunk A as pending. Pause receive (the
+    // client's remaining credit drops to the already-sent byte count, i.e.
+    // zero), and only then deliver chunk A by completing the pending
+    // receive. The delivery happens *during* the pause: the data is not
+    // lost, and the credit it earns is parked until resume.
+    //
+    TEST_TRUE(Context.ServerChunkAReceived.WaitTimeout(TestWaitTimeout));
+    TEST_TRUE(Context.ServerConnection != nullptr);
+    TEST_TRUE(Context.ServerStream != nullptr);
+    TEST_QUIC_SUCCEEDED(Context.ServerConnection->PauseReceive());
+    Context.ServerStream->ReceiveComplete(Context.ServerPendingLength);
+    Context.ServerPendingLength = 0;
+
+    //
+    // Server: resume receive (the parked credit is applied to the
+    // advertised limit) and then send the marker. Both are FIFO-ordered on
+    // the connection worker, so the marker always follows the raised
+    // MAX_DATA frame.
+    //
+    TEST_QUIC_SUCCEEDED(Context.ServerConnection->ResumeReceive());
+    TEST_QUIC_SUCCEEDED(Context.ServerStream->Send(&BufferMarker, 1, QUIC_SEND_FLAG_NONE));
+
+    //
+    // Client: when the marker arrives, the raised limit is in effect, so it
+    // is safe to queue chunk C -- which is larger than the window that
+    // remained at pause time (WindowSize - ChunkASize); it only fits
+    // because the credit earned while paused was applied on resume.
+    //
+    TEST_TRUE(Context.ClientMarkerReceived.WaitTimeout(TestWaitTimeout));
+    TEST_QUIC_SUCCEEDED(
+        Stream.Send(&BufferC, 1, QUIC_SEND_FLAG_FIN));
+
+    //
+    // Server: the full volume (A + C) must be delivered; it exceeds the
+    // original flow control window, proving the deferred credit was applied
+    // and nothing was lost during the pause.
+    //
+    TEST_TRUE(Context.ServerAllDataReceived.WaitTimeout(TestWaitTimeout));
+
+    //
+    // Final check: the client's byte counter confirms everything was sent.
+    //
+    QUIC_STATISTICS_V2 Stats{};
+    for (unsigned i = 0; i < 50; i++) {
+        TEST_QUIC_SUCCEEDED(Connection.GetStatistics(&Stats));
+        if (Stats.SendTotalStreamBytes >=
+            RecvPauseDeferredCreditTestContext::ChunkASize +
+            RecvPauseDeferredCreditTestContext::ChunkCSize) {
+            break;
+        }
+        CxPlatSleep(100);
+    }
+    TEST_TRUE(Stats.SendTotalStreamBytes >=
+              RecvPauseDeferredCreditTestContext::ChunkASize +
+              RecvPauseDeferredCreditTestContext::ChunkCSize);
+
+    Connection.Shutdown(0, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE);
+}
+
 #endif // QUIC_API_ENABLE_PREVIEW_FEATURES

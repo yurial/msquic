@@ -196,6 +196,7 @@ typedef union QUIC_CONNECTION_STATE {
         // later packets in case they contain CONNECTION_CLOSE frame with application-layer error.
         //
         BOOLEAN DelayedApplicationError : 1;
+        BOOLEAN ReceivePaused : 1;
 
 #ifdef CxPlatVerifierEnabledByAddr
         //
@@ -1780,3 +1781,30 @@ QuicMtuDiscoveryCheckSearchCompleteTimeout(
         }
     }
 }
+
+//
+// Pauses receive callbacks on a connection by stopping the advertisement of
+// new connection-level flow control credit: the next MAX_DATA frame carries
+// the already-received byte count (Send.OrderedStreamBytesReceived), so the
+// peer learns there is no receive capacity. The local Send.MaxData limit is
+// left untouched, so data still within the previously advertised window
+// keeps being accepted (the peer may also ignore the lowered value per
+// RFC 9000 sec 4.1).
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicConnRecvPause(
+    _In_ QUIC_CONNECTION* Connection
+    );
+
+//
+// Resumes receive callbacks on a connection: the current connection-level
+// flow control limit (Send.MaxData, including any credit accumulated while
+// paused) is advertised again via MAX_DATA, restoring the peer's ability to
+// send new data.
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicConnRecvResume(
+    _In_ QUIC_CONNECTION* Connection
+    );

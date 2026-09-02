@@ -690,7 +690,29 @@ QuicSendWriteFrames(
 
         if ((Send->SendFlags & QUIC_CONN_SEND_FLAG_MAX_DATA)) {
 
-            QUIC_MAX_DATA_EX Frame = { Send->MaxData };
+            //
+            // When receive is paused, advertise the amount of data already
+            // received (OrderedStreamBytesReceived) as the new limit. This
+            // grants the peer zero additional credit, so it stops sending
+            // new data, while the advertised boundary stays realistic (it
+            // matches the bytes actually received rather than collapsing
+            // to zero).
+            // The local Send.MaxData limit is left untouched: it keeps
+            // covering the previously advertised window, so any STREAM
+            // frames already in flight (or sent by a peer that ignores the
+            // lowered value, which RFC 9000 sec 4.1 permits) are accepted
+            // normally instead of being rejected with FLOW_CONTROL_ERROR.
+            //
+            // Note this relies on the peer applying a lowered MAX_DATA
+            // value, which is an intentional deviation from RFC 9000
+            // Section 4.1 (where a MAX_DATA smaller than the current limit
+            // has no effect); see the QUIC_FRAME_MAX_DATA handling in
+            // QuicConnRecvFrames (connection.c).
+            //
+            QUIC_MAX_DATA_EX Frame = {
+                Connection->State.ReceivePaused ?
+                    Connection->Send.OrderedStreamBytesReceived : Send->MaxData
+            };
 
             if (QuicMaxDataFrameEncode(
                     &Frame,

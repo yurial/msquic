@@ -1,0 +1,193 @@
+diff --git a/specs/rfc9000.txt b/specs/rfc9000-lowering.txt
+index 3ceabcf53..e4ec55908 100644
+--- a/specs/rfc9000.txt
++++ b/specs/rfc9000-lowering.txt
+@@ -2,6 +2,12 @@
+ 
+ 
+ 
++[] DRAFT AMENDMENT - WORK IN PROGRESS
++[] This file is RFC 9000 with the amendments proposed in
++[] draft-dyachenko-quic-lower-flow-control-limits-00
++[] (see specs/proposal-maxdata-lowering.md in the repository).
++[] It is NOT the published RFC text.
++
+ Internet Engineering Task Force (IETF)                   J. Iyengar, Ed.
+ Request for Comments: 9000                                        Fastly
+ Category: Standards Track                                M. Thomson, Ed.
+@@ -70,7 +76,7 @@ Table of Contents
+      3.5.  Solicited State Transitions
+    4.  Flow Control
+      4.1.  Data Flow Control
+-     4.2.  Increasing Flow Control Limits
++     4.2.  Updating Flow Control Limits
+      4.3.  Flow Control Performance
+      4.4.  Handling Stream Cancellation
+      4.5.  Stream Final Size
+@@ -1069,16 +1075,60 @@ Table of Contents
+    limits.  A receiver could determine the maximum data limit to be
+    advertised based on the sum of bytes consumed on all streams.
+ 
+-   Once a receiver advertises a limit for the connection or a stream, it
+-   is not an error to advertise a smaller limit, but the smaller limit
+-   has no effect.
+-
+-   A receiver MUST close the connection with an error of type
+-   FLOW_CONTROL_ERROR if the sender violates the advertised connection
+-   or stream data limits; see Section 11 for details on error handling.
+-
+-   A sender MUST ignore any MAX_STREAM_DATA or MAX_DATA frames that do
+-   not increase flow control limits.
++   A receiver MAY advertise a smaller limit than the limit currently in
++   effect for the connection (MAX_DATA) or for a stream
++   (MAX_STREAM_DATA).  A smaller limit takes effect for data not yet
++   sent.
++
++   A receiver MUST NOT treat received data as a violation of its flow
++   control limits if the data does not exceed the largest advertised
++   limit: specifically, if the sum of the final sizes of all streams
++   (for MAX_DATA) or the largest offset received on the affected stream
++   (for MAX_STREAM_DATA) does not exceed the largest limit that the
++   receiver has advertised for the connection or for that stream,
++   respectively, at any point during the connection.  Advertised limits
++   include the initial values carried in the initial_max_data and
++   initial_max_stream_data_* transport parameters (Section 18.2 of
++   [RFC9000]) and the values remembered for Early Data (Section 7.4.1
++   of [RFC9000]).  A receiver MUST close the connection with an error
++   of type FLOW_CONTROL_ERROR only if received data exceeds the largest
++   advertised limit; see Section 11 for details on error handling.
++
++   On receiving a MAX_DATA or MAX_STREAM_DATA frame, an endpoint MUST
++   set the corresponding flow control limit to the value carried in the
++   frame, whether that value is larger or smaller than the limit
++   currently in effect.  A sender MUST NOT send new data in excess of
++   the limit currently in effect.  In its internal flow control
++   accounting, a sender MAY clamp an applied limit to the largest byte
++   offset it has already sent; the sender's remaining credit is the
++   same quantity under either representation, so this accounting choice
++   is observably equivalent and does not weaken the requirement that a
++   sender MUST NOT send new data in excess of the limit currently in
++   effect.
++
++   Correspondingly, a sender whose cumulative sent data (or whose sent
++   data on an affected stream) is within the largest advertised limit
++   commits no violation, even if that amount exceeds a limit lowered
++   after the data was sent.  Advertising a smaller limit does not
++   retroactively withdraw flow control credit: data in flight at the
++   time a lowered limit is sent can be up to the previously advertised
++   limit, its receipt is not a flow control violation, and a receiver
++   MUST accept it.  A lowering bounds new sends; it does not recall
++   outstanding data.
++
++   MAX_DATA and MAX_STREAM_DATA frames, like all QUIC frames, can be
++   reordered.  An endpoint can therefore apply a stale frame whose
++   value is larger than a value it has already applied.  This is not an
++   error: the limit in effect is always the value of the most recently
++   applied frame, and the largest advertised limit -- the largest
++   value the receiver has advertised for the connection or for that
++   stream at any point during the connection, which is the bound
++   against which violations are assessed -- does not depend on the
++   order in which frames are applied.  A sender that receives a stale
++   frame raising the limit in effect MAY resume sending accordingly;
++   this cannot create a violation, because any value it can apply was
++   advertised by the receiver and hence is within the largest
++   advertised limit.
+ 
+    If a sender has sent data up to the limit, it will be unable to send
+    new data and is considered blocked.  A sender SHOULD send a
+@@ -1091,7 +1141,7 @@ Table of Contents
+    periodically send a STREAM_DATA_BLOCKED or DATA_BLOCKED frame when it
+    has no ack-eliciting packets in flight.
+ 
+-4.2.  Increasing Flow Control Limits
++4.2.  Updating Flow Control Limits
+ 
+    Implementations decide when and how much credit to advertise in
+    MAX_STREAM_DATA and MAX_DATA frames, but this section offers a few
+@@ -1130,6 +1180,30 @@ Table of Contents
+    congestion; see Section 7.7 of [QUIC-RECOVERY] for a discussion of
+    how a sender can avoid this congestion.
+ 
++   The same guidance applies to updates that lower a limit.  A receiver
++   that lowers a limit SHOULD expect DATA_BLOCKED or STREAM_DATA_BLOCKED
++   frames and, as when increasing a limit, MUST NOT wait for such frames
++   before sending a MAX_DATA or MAX_STREAM_DATA frame: a sender blocked
++   by a lowered limit is not required to report it.
++
++   When an updated limit is equal to or lower than the amount of data
++   already sent, the sender has no additional credit and is blocked
++   immediately (Section 4.1).  The guidance for blocked senders in
++   Section 4.1 of [RFC9000] applies unchanged, including for the entire
++   duration of a pause: a sender that is flow control limited SHOULD
++   send a DATA_BLOCKED or STREAM_DATA_BLOCKED frame and SHOULD continue
++   to send it periodically when it has no ack-eliciting packets in
++   flight, to keep the connection from being closed by the idle timeout
++   (Section 10.1).
++
++   DATA_BLOCKED and STREAM_DATA_BLOCKED frames are informational
++   (Sections 19.12 and 19.13).  An endpoint MUST NOT treat a
++   DATA_BLOCKED or STREAM_DATA_BLOCKED frame as an error, regardless of
++   whether the limit it reports was reached by consuming a large window
++   or by applying a lowered limit.  No change to the frame definitions
++   in Sections 19.12 and 19.13 is required: the limit at which blocking
++   occurred can legitimately be a lowered limit.
++
+ 4.3.  Flow Control Performance
+ 
+    If an endpoint cannot ensure that its peer always has available flow
+@@ -6296,15 +6370,18 @@ Table of Contents
+ 
+    Maximum Data:  A variable-length integer indicating the maximum
+       amount of data that can be sent on the entire connection, in units
+-      of bytes.
++      of bytes.  The value in the frame is the new absolute limit for
++      the connection, whether larger or smaller than any value
++      previously advertised; see Section 4.1 (as amended).
+ 
+    All data sent in STREAM frames counts toward this limit.  The sum of
+    the final sizes on all streams -- including streams in terminal
+-   states -- MUST NOT exceed the value advertised by a receiver.  An
+-   endpoint MUST terminate a connection with an error of type
+-   FLOW_CONTROL_ERROR if it receives more data than the maximum data
+-   value that it has sent.  This includes violations of remembered
+-   limits in Early Data; see Section 7.4.1.
++   states -- MUST NOT exceed the largest value advertised by a receiver
++   during the connection.  An endpoint MUST terminate a connection with
++   an error of type FLOW_CONTROL_ERROR if it receives more data than
++   the largest maximum data value that it has sent during the
++   connection.  This includes violations of remembered limits in Early
++   Data; see Section 7.4.1.
+ 
+ 19.10.  MAX_STREAM_DATA Frames
+ 
+@@ -6335,7 +6412,10 @@ Table of Contents
+ 
+    Maximum Stream Data:  A variable-length integer indicating the
+       maximum amount of data that can be sent on the identified stream,
+-      in units of bytes.
++      in units of bytes.  The value in the frame is the new absolute
++      limit for the identified stream, whether larger or smaller than
++      any value previously advertised for that stream; see Section 4.1
++      (as amended).
+ 
+    When counting data toward this limit, an endpoint accounts for the
+    largest received offset of data that is sent or received on the
+@@ -6345,11 +6425,13 @@ Table of Contents
+    received offset.
+ 
+    The data sent on a stream MUST NOT exceed the largest maximum stream
+-   data value advertised by the receiver.  An endpoint MUST terminate a
+-   connection with an error of type FLOW_CONTROL_ERROR if it receives
+-   more data than the largest maximum stream data that it has sent for
+-   the affected stream.  This includes violations of remembered limits
+-   in Early Data; see Section 7.4.1.
++   data value advertised by the receiver during the connection,
++   including the initial value from the corresponding
++   initial_max_stream_data_* transport parameter.  An endpoint MUST
++   terminate a connection with an error of type FLOW_CONTROL_ERROR if
++   it receives more data than the largest maximum stream data that it
++   has sent for the affected stream.  This includes violations of
++   remembered limits in Early Data; see Section 7.4.1.
+ 
+ 19.11.  MAX_STREAMS Frames
+ 

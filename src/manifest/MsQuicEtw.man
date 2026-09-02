@@ -550,6 +550,22 @@
                 message="$(string.Enum.QUIC_TRACE_API_TYPE.EXECUTION_POLL)"
                 value="32"
                 />
+            <map
+                message="$(string.Enum.QUIC_TRACE_API_TYPE.CONNECTION_RECEIVE_PAUSE)"
+                value="35"
+                />
+            <map
+                message="$(string.Enum.QUIC_TRACE_API_TYPE.CONNECTION_RECEIVE_RESUME)"
+                value="36"
+                />
+            <map
+                message="$(string.Enum.QUIC_TRACE_API_TYPE.STREAM_RECEIVE_PAUSE)"
+                value="37"
+                />
+            <map
+                message="$(string.Enum.QUIC_TRACE_API_TYPE.STREAM_RECEIVE_RESUME)"
+                value="38"
+                />
           </valueMap>
           <valueMap name="map_QUIC_SEND_FLUSH_REASON">
             <map
@@ -5065,6 +5081,22 @@
         <string
             id="Enum.QUIC_TRACE_API_TYPE.EXECUTION_POLL"
             value="EXECUTION_POLL"
+            />
+        <string
+            id="Enum.QUIC_TRACE_API_TYPE.CONNECTION_RECEIVE_PAUSE"
+            value="CONNECTION_RECEIVE_PAUSE"
+            />
+        <string
+            id="Enum.QUIC_TRACE_API_TYPE.CONNECTION_RECEIVE_RESUME"
+            value="CONNECTION_RECEIVE_RESUME"
+            />
+        <string
+            id="Enum.QUIC_TRACE_API_TYPE.STREAM_RECEIVE_PAUSE"
+            value="STREAM_RECEIVE_PAUSE"
+            />
+        <string
+            id="Enum.QUIC_TRACE_API_TYPE.STREAM_RECEIVE_RESUME"
+            value="STREAM_RECEIVE_RESUME"
             />
         <string
             id="Enum.QUIC_SEND_FLUSH_REASON.CONNECTION_FLAGS"

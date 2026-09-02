@@ -1876,6 +1876,80 @@ QUIC_STATUS
         HQUIC* ConnectionPool
     );
 
+//
+// Soft-pauses receive callbacks on a connection by stopping the endpoint
+// from granting new connection-level flow control credit: while paused, the
+// local endpoint advertises MAX_DATA (RFC 9000 sec 19.9) equal to the amount
+// of data already received, i.e. zero additional credit. This is a soft
+// pause: data already within the previously advertised window is still
+// received, delivered, and receive callbacks continue to fire for it. Note
+// the peer MAY ignore the lowered limit per RFC 9000 sec 4.1; receiving data
+// from a peer that does never causes FLOW_CONTROL_ERROR. The call returns
+// SUCCESS once the request is queued; the transition is applied
+// asynchronously on the connection's worker thread and has no effect if the
+// connection is no longer active.
+//
+typedef
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+(QUIC_API * QUIC_CONNECTION_RECEIVE_PAUSE_FN)(
+    _In_ HQUIC Connection
+    );
+
+//
+// Resumes receive callbacks on a connection by advertising the current
+// connection-level flow control limit again (via MAX_DATA), restoring the
+// peer's ability to send new data. Any flow control credit earned from
+// deliveries while paused is applied before the limit is advertised. The
+// call returns SUCCESS once the request is queued; the transition is
+// applied asynchronously on the connection's worker thread and has no
+// effect if the connection is no longer active.
+//
+typedef
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+(QUIC_API * QUIC_CONNECTION_RECEIVE_RESUME_FN)(
+    _In_ HQUIC Connection
+    );
+
+//
+// Soft-pauses receive callbacks on a stream by stopping the endpoint from
+// granting new stream-level flow control credit: while paused, the local
+// endpoint advertises MAX_STREAM_DATA (RFC 9000 sec 19.10) equal to the
+// amount of data already delivered to the application on the stream, i.e.
+// zero additional credit. Note this may be less than the amount of data
+// received but not yet delivered to the application. This is a soft pause:
+// data already within the previously advertised window is still received,
+// delivered, and receive callbacks continue to fire for it; a peer clamping
+// to the offsets it has already sent observes no difference. The peer MAY
+// ignore the lowered limit per RFC 9000 sec 4.1; receiving data from a peer
+// that does never causes FLOW_CONTROL_ERROR. The call returns SUCCESS once
+// the request is queued; the transition is applied asynchronously on the
+// connection's worker thread and has no effect if the connection is no
+// longer active.
+//
+typedef
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+(QUIC_API * QUIC_STREAM_RECEIVE_PAUSE_FN)(
+    _In_ HQUIC Stream
+    );
+
+//
+// Resumes receive callbacks on a stream by advertising the current
+// stream-level flow control limit again (via MAX_STREAM_DATA), restoring
+// the peer's ability to send new data on the stream. The call returns
+// SUCCESS once the request is queued; the transition is applied
+// asynchronously on the connection's worker thread and has no effect if
+// the connection is no longer active.
+//
+typedef
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+(QUIC_API * QUIC_STREAM_RECEIVE_RESUME_FN)(
+    _In_ HQUIC Stream
+    );
+
 #endif // QUIC_API_ENABLE_PREVIEW_FEATURES
 
 //
@@ -1945,6 +2019,56 @@ typedef struct QUIC_API_TABLE {
 
     QUIC_CONNECTION_EXPORT_KEYING_MATERIAL_FN
                                         ConnectionExportKeyingMaterial; // Available from v2.6
+
+    //
+    // Soft-pauses receive callbacks on a connection: the endpoint stops
+    // granting new connection-level flow control credit (MAX_DATA per RFC
+    // 9000 sec 19.9 is advertised at the already-received byte count). This
+    // is a soft pause: data already within the previously advertised window
+    // is still received, delivered, and receive callbacks continue to fire
+    // for it. The peer MAY ignore the lowered limit per RFC 9000 sec 4.1;
+    // receiving such data never causes FLOW_CONTROL_ERROR. Returns SUCCESS
+    // once the request is queued; the transition is applied asynchronously
+    // on the connection's worker thread.
+    //
+    QUIC_CONNECTION_RECEIVE_PAUSE_FN
+                                        ConnectionReceivePause;      // Available from v2.7
+
+    //
+    // Resumes receive callbacks on a connection by advertising the current
+    // connection-level flow control limit again (via MAX_DATA). Any credit
+    // earned from deliveries while paused is applied first. Returns SUCCESS
+    // once the request is queued; the transition is applied asynchronously
+    // on the connection's worker thread.
+    //
+    QUIC_CONNECTION_RECEIVE_RESUME_FN
+                                        ConnectionReceiveResume;      // Available from v2.7
+
+    //
+    // Soft-pauses receive callbacks on a stream: the endpoint stops granting
+    // new stream-level flow control credit (MAX_STREAM_DATA per RFC 9000 sec
+    // 19.10 is advertised at the already-delivered byte offset, which may be
+    // less than the amount received but not yet delivered to the
+    // application). This is a soft pause: data already within the previously
+    // advertised window is still received, delivered, and receive callbacks
+    // continue to fire for it; a peer clamping to the offsets it has already
+    // sent observes no difference. The peer MAY ignore the lowered limit per
+    // RFC 9000 sec 4.1; receiving such data never causes
+    // FLOW_CONTROL_ERROR. Returns SUCCESS once the request is queued; the
+    // transition is applied asynchronously on the connection's worker
+    // thread.
+    //
+    QUIC_STREAM_RECEIVE_PAUSE_FN
+                                        StreamReceivePause;           // Available from v2.7
+
+    //
+    // Resumes receive callbacks on a stream by advertising the current
+    // stream-level flow control limit again (via MAX_STREAM_DATA). Returns
+    // SUCCESS once the request is queued; the transition is applied
+    // asynchronously on the connection's worker thread.
+    //
+    QUIC_STREAM_RECEIVE_RESUME_FN
+                                        StreamReceiveResume;          // Available from v2.7
 #endif // QUIC_API_ENABLE_PREVIEW_FEATURES
 
 } QUIC_API_TABLE;

@@ -1019,16 +1019,21 @@ QuicStreamProvideRecvBuffers(
         // Update the maximum allowed received offset if the new chunks caused an update of the
         // virtual buffer size.
         //
-        uint64_t NewMaxAllowedRecvOffset =
-            Stream->RecvBuffer.BaseOffset + Stream->RecvBuffer.VirtualBufferLength;
-        if (Stream->MaxAllowedRecvOffset < NewMaxAllowedRecvOffset) {
-            Stream->MaxAllowedRecvOffset =
+        // Skip the update while the stream is receive-paused so the peer
+        // doesn't see a larger window than what we advertised at pause time.
+        //
+        if (!Stream->Flags.ReceivePaused) {
+            uint64_t NewMaxAllowedRecvOffset =
                 Stream->RecvBuffer.BaseOffset + Stream->RecvBuffer.VirtualBufferLength;
-            QuicSendSetStreamSendFlag(
-                &Stream->Connection->Send,
-                Stream,
-                QUIC_STREAM_SEND_FLAG_MAX_DATA,
-                FALSE);
+            if (Stream->MaxAllowedRecvOffset < NewMaxAllowedRecvOffset) {
+                Stream->MaxAllowedRecvOffset =
+                    Stream->RecvBuffer.BaseOffset + Stream->RecvBuffer.VirtualBufferLength;
+                QuicSendSetStreamSendFlag(
+                    &Stream->Connection->Send,
+                    Stream,
+                    QUIC_STREAM_SEND_FLAG_MAX_DATA,
+                    FALSE);
+            }
         }
     }
     return Status;
@@ -1054,4 +1059,95 @@ QuicStreamNotifyReceiveBufferNeeded(
         Event.RECEIVE_BUFFER_NEEDED.BufferLengthNeeded);
 
     (void)QuicStreamIndicateEvent(Stream, &Event);
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicStreamRecvPause(
+    _In_ QUIC_STREAM* Stream
+    )
+{
+    //
+    // Be defensive about double-pause calls (e.g., two pause ops queued).
+    //
+    if (Stream->Flags.ReceivePaused) {
+        return;
+    }
+
+    Stream->Flags.ReceivePaused = TRUE;
+
+    //
+    // Trigger sending of a MAX_STREAM_DATA frame with the value BaseOffset
+    // so the peer learns that we have no receive capacity on this stream.
+    // The local MaxAllowedRecvOffset limit is deliberately left untouched:
+    // it keeps covering the previously advertised window, so any STREAM
+    // frames already in flight (or sent by a peer that ignores the lowered
+    // value, which RFC 9000 sec 4.1 permits) remain within our advertised
+    // limit and are accepted normally instead of being rejected with
+    // FLOW_CONTROL_ERROR. No connection-level MAX_DATA is scheduled: the
+    // connection limit doesn't change here, so the frame would be a no-op.
+    //
+    QuicSendSetStreamSendFlag(
+        &Stream->Connection->Send,
+        Stream,
+        QUIC_STREAM_SEND_FLAG_MAX_DATA,
+        FALSE);
+    QuicSendQueueFlush(
+        &Stream->Connection->Send,
+        REASON_STREAM_FLOW_CONTROL);
+
+    QuicTraceLogStreamInfo(
+        StreamReceivePause,
+        Stream,
+        "Pausing receive on stream");
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicStreamRecvResume(
+    _In_ QUIC_STREAM* Stream
+    )
+{
+    //
+    // Be defensive about resume-without-pause.
+    //
+    if (!Stream->Flags.ReceivePaused) {
+        return;
+    }
+
+    Stream->Flags.ReceivePaused = FALSE;
+
+    //
+    // The advertised window may have gone stale while paused: deliveries
+    // during the pause (data within the previously advertised window is
+    // still accepted) don't advance MaxAllowedRecvOffset, so immediately
+    // re-announce the up-to-date limit the same way the delivery path does
+    // (monotonically; the limit never decreases), and refresh
+    // RecvWindowLastUpdate so the auto-tuning algorithm doesn't treat the
+    // paused interval as a long silent gap. Then trigger sending of a
+    // MAX_STREAM_DATA frame so the peer promptly regains the ability to
+    // send new data on this stream. No connection-level MAX_DATA is
+    // scheduled here: the connection limit doesn't change on resume, so
+    // the frame would be a no-op.
+    //
+    uint64_t NewMaxAllowedRecvOffset =
+        Stream->RecvBuffer.BaseOffset + Stream->RecvBuffer.VirtualBufferLength;
+    if (NewMaxAllowedRecvOffset > Stream->MaxAllowedRecvOffset) {
+        Stream->MaxAllowedRecvOffset = NewMaxAllowedRecvOffset;
+    }
+    Stream->RecvWindowLastUpdate = CxPlatTimeUs64();
+
+    QuicSendSetStreamSendFlag(
+        &Stream->Connection->Send,
+        Stream,
+        QUIC_STREAM_SEND_FLAG_MAX_DATA,
+        FALSE);
+    QuicSendQueueFlush(
+        &Stream->Connection->Send,
+        REASON_STREAM_FLOW_CONTROL);
+
+    QuicTraceLogStreamInfo(
+        StreamReceiveResume,
+        Stream,
+        "Resuming receive on stream");
 }

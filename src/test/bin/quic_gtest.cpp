@@ -2829,6 +2829,44 @@ TEST(Misc, StreamDifferentAbortErrors) {
     }
 }
 
+#ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
+TEST(Misc, ConnReceivePauseResume) {
+    TestLogger Logger("ConnReceivePauseResume");
+    if (TestingKernelMode) {
+        ASSERT_TRUE(InvokeKernelTest(FUNC(QuicTestConnReceivePauseResume)));
+    } else {
+        QuicTestConnReceivePauseResume();
+    }
+}
+
+TEST(Misc, ConnMaxDataLoweredBlocksSend) {
+    TestLogger Logger("ConnMaxDataLoweredBlocksSend");
+    if (TestingKernelMode) {
+        ASSERT_TRUE(InvokeKernelTest(FUNC(QuicTestConnMaxDataLoweredBlocksSend)));
+    } else {
+        QuicTestConnMaxDataLoweredBlocksSend();
+    }
+}
+
+TEST(Misc, StreamRecvPauseBlocksSend) {
+    TestLogger Logger("StreamRecvPauseBlocksSend");
+    if (TestingKernelMode) {
+        ASSERT_TRUE(InvokeKernelTest(FUNC(QuicTestStreamRecvPauseBlocksSend)));
+    } else {
+        QuicTestStreamRecvPauseBlocksSend();
+    }
+}
+
+TEST(Misc, RecvPauseDeferredCredit) {
+    TestLogger Logger("RecvPauseDeferredCredit");
+    if (TestingKernelMode) {
+        ASSERT_TRUE(InvokeKernelTest(FUNC(QuicTestRecvPauseDeferredCredit)));
+    } else {
+        QuicTestRecvPauseDeferredCredit();
+    }
+}
+#endif // QUIC_API_ENABLE_PREVIEW_FEATURES
+
 TEST(Misc, StreamAbortRecvFinRace) {
     TestLogger Logger("StreamAbortRecvFinRace");
     if (TestingKernelMode) {

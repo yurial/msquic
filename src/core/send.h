@@ -290,12 +290,19 @@ typedef struct QUIC_SEND {
     uint64_t NumPacketsSentWithEct;
 
     //
-    // The value we send in MAX_DATA frames.
+    // The connection-level receive limit we advertise to the peer in
+    // MAX_DATA frames. While receive is paused, MAX_DATA frames instead
+    // carry OrderedStreamBytesReceived (zero additional credit); this
+    // field is left untouched and updated again on resume (together with
+    // DeferredMaxData, the credit earned while paused).
     //
     uint64_t MaxData;
 
     //
-    // The max value received in MAX_DATA frames.
+    // The most recent value received in a MAX_DATA frame, clamped so that it
+    // never goes below OrderedStreamBytesSent. Not monotonic: the peer may
+    // lower it (even to zero) to pause our sending (see the
+    // QUIC_FRAME_MAX_DATA handling in connection.c).
     //
     uint64_t PeerMaxData;
 
@@ -307,7 +314,10 @@ typedef struct QUIC_SEND {
 
     //
     // Sum of in-order sent bytes across all streams.
-    // At all times, OrderedStreamBytesSent <= PeerMaxData.
+    // Invariant: OrderedStreamBytesSent <= PeerMaxData at all times. The
+    // QUIC_FRAME_MAX_DATA handler clamps PeerMaxData so that a lowered
+    // limit never drops below the already-sent amount (receive-pause stops
+    // new data, but the invariant is never broken).
     //
     uint64_t OrderedStreamBytesSent;
 
@@ -317,6 +327,17 @@ typedef struct QUIC_SEND {
     // is reset and a MAX_DATA frame is sent.
     //
     uint64_t OrderedStreamBytesDeliveredAccumulator;
+
+    //
+    // Flow control credit accumulated while receive was paused. While
+    // ReceivePaused is set, the advertised limit is pinned to
+    // OrderedStreamBytesReceived, so credit earned from deliveries (and
+    // RESET_STREAM) can't be added to MaxData directly; it is parked here and
+    // applied to MaxData when receive is resumed (see QuicConnRecvResume).
+    // Without this, every pause/resume cycle would permanently shrink the
+    // advertised window.
+    //
+    uint64_t DeferredMaxData;
 
     //
     // Set of flags indicating what data is ready to be sent out.

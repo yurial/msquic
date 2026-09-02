@@ -2144,3 +2144,283 @@ Error:
 
     return Status;
 }
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+QUIC_API
+MsQuicConnectionReceivePause(
+    _In_ _Pre_defensive_ HQUIC Handle
+    )
+{
+    QUIC_STATUS Status;
+    QUIC_CONNECTION* Connection;
+    QUIC_OPERATION* Oper;
+
+    QuicTraceEvent(
+        ApiEnter,
+        "[ api] Enter %u (%p).",
+        QUIC_TRACE_API_CONNECTION_RECEIVE_PAUSE,
+        Handle);
+
+    if (!IS_CONN_HANDLE(Handle)) {
+        Status = QUIC_STATUS_INVALID_PARAMETER;
+        goto Error;
+    }
+
+#pragma prefast(suppress: __WARNING_25024, "Pointer cast already validated.")
+    Connection = (QUIC_CONNECTION*)Handle;
+
+    CXPLAT_TEL_ASSERT(!Connection->State.HandleClosed);
+    CXPLAT_TEL_ASSERT(!Connection->State.Freed);
+
+    QUIC_CONN_VERIFY(Connection, !Connection->State.Freed);
+    QUIC_CONN_VERIFY(Connection,
+        (Connection->WorkerThreadID == CxPlatCurThreadID()) ||
+        !Connection->State.HandleClosed);
+
+    Oper = QuicConnAllocOperation(Connection, QUIC_OPER_TYPE_API_CALL);
+    if (Oper == NULL) {
+        Status = QUIC_STATUS_OUT_OF_MEMORY;
+        QuicTraceEvent(
+            AllocFailure,
+            "Allocation of '%s' failed. (%llu bytes)",
+            "CONN_RECV_PAUSE operation",
+            0);
+        goto Error;
+    }
+    Oper->API_CALL.Context->Type = QUIC_API_TYPE_CONN_RECV_PAUSE;
+
+    //
+    // Queue the operation; the paused-state transition is applied on the
+    // connection's worker thread (see QuicConnRecvPause), which keeps
+    // consecutive Pause/Resume calls ordered and makes this API free of
+    // state races. Repeated calls are no-ops on the worker. This is
+    // fire-and-forget: SUCCESS only means the operation was queued; if the
+    // connection is closed before the operation runs, the operation is
+    // drained with no effect.
+    //
+    QuicConnQueueOper(Connection, Oper);
+    Status = QUIC_STATUS_SUCCESS;
+
+Error:
+
+    QuicTraceEvent(
+        ApiExitStatus,
+        "[ api] Exit %u",
+        Status);
+
+    return Status;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+QUIC_API
+MsQuicConnectionReceiveResume(
+    _In_ _Pre_defensive_ HQUIC Handle
+    )
+{
+    QUIC_STATUS Status;
+    QUIC_CONNECTION* Connection;
+    QUIC_OPERATION* Oper;
+
+    QuicTraceEvent(
+        ApiEnter,
+        "[ api] Enter %u (%p).",
+        QUIC_TRACE_API_CONNECTION_RECEIVE_RESUME,
+        Handle);
+
+    if (!IS_CONN_HANDLE(Handle)) {
+        Status = QUIC_STATUS_INVALID_PARAMETER;
+        goto Error;
+    }
+
+#pragma prefast(suppress: __WARNING_25024, "Pointer cast already validated.")
+    Connection = (QUIC_CONNECTION*)Handle;
+
+    CXPLAT_TEL_ASSERT(!Connection->State.HandleClosed);
+    CXPLAT_TEL_ASSERT(!Connection->State.Freed);
+
+    QUIC_CONN_VERIFY(Connection, !Connection->State.Freed);
+    QUIC_CONN_VERIFY(Connection,
+        (Connection->WorkerThreadID == CxPlatCurThreadID()) ||
+        !Connection->State.HandleClosed);
+
+    Oper = QuicConnAllocOperation(Connection, QUIC_OPER_TYPE_API_CALL);
+    if (Oper == NULL) {
+        Status = QUIC_STATUS_OUT_OF_MEMORY;
+        QuicTraceEvent(
+            AllocFailure,
+            "Allocation of '%s' failed. (%llu bytes)",
+            "CONN_RECV_RESUME operation",
+            0);
+        goto Error;
+    }
+    Oper->API_CALL.Context->Type = QUIC_API_TYPE_CONN_RECV_RESUME;
+
+    //
+    // Queue the operation; the paused-state transition is applied on the
+    // connection's worker thread (see QuicConnRecvResume), which keeps
+    // consecutive Pause/Resume calls ordered and makes this API free of
+    // state races. Repeated calls are no-ops on the worker. This is
+    // fire-and-forget: SUCCESS only means the operation was queued; if the
+    // connection is closed before the operation runs, the operation is
+    // drained with no effect.
+    //
+    QuicConnQueueOper(Connection, Oper);
+    Status = QUIC_STATUS_SUCCESS;
+
+Error:
+
+    QuicTraceEvent(
+        ApiExitStatus,
+        "[ api] Exit %u",
+        Status);
+
+    return Status;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+QUIC_API
+MsQuicStreamReceivePause(
+    _In_ _Pre_defensive_ HQUIC Handle
+    )
+{
+    QUIC_STATUS Status;
+    QUIC_STREAM* Stream;
+    QUIC_CONNECTION* Connection;
+    QUIC_OPERATION* Oper;
+
+    QuicTraceEvent(
+        ApiEnter,
+        "[ api] Enter %u (%p).",
+        QUIC_TRACE_API_STREAM_RECEIVE_PAUSE,
+        Handle);
+
+    if (!IS_STREAM_HANDLE(Handle)) {
+        Status = QUIC_STATUS_INVALID_PARAMETER;
+        goto Error;
+    }
+
+#pragma prefast(suppress: __WARNING_25024, "Pointer cast already validated.")
+    Stream = (QUIC_STREAM*)Handle;
+
+    CXPLAT_TEL_ASSERT(!Stream->Flags.HandleClosed);
+    CXPLAT_TEL_ASSERT(!Stream->Flags.Freed);
+
+    Connection = Stream->Connection;
+
+    Oper = QuicConnAllocOperation(Connection, QUIC_OPER_TYPE_API_CALL);
+    if (Oper == NULL) {
+        Status = QUIC_STATUS_OUT_OF_MEMORY;
+        QuicTraceEvent(
+            AllocFailure,
+            "Allocation of '%s' failed. (%llu bytes)",
+            "STRM_RECV_PAUSE operation",
+            0);
+        goto Error;
+    }
+    Oper->API_CALL.Context->Type = QUIC_API_TYPE_STRM_RECV_PAUSE;
+    Oper->API_CALL.Context->STRM_RECV_PAUSE.Stream = Stream;
+
+    //
+    // Async stream operations need to hold a ref on the stream so that the
+    // stream isn't freed before the operation can be processed. The ref is
+    // released when the operation is freed (see QuicOperationFree).
+    //
+    QuicStreamAddRef(Stream, QUIC_STREAM_REF_OPERATION);
+
+    //
+    // Queue the operation; the paused-state transition is applied on the
+    // connection's worker thread (see QuicStreamRecvPause), which keeps
+    // consecutive Pause/Resume calls ordered and makes this API free of
+    // state races. Repeated calls are no-ops on the worker. This is
+    // fire-and-forget: SUCCESS only means the operation was queued; if the
+    // connection is closed before the operation runs, the operation is
+    // drained (and the stream reference released) with no effect.
+    //
+    QuicConnQueueOper(Connection, Oper);
+    Status = QUIC_STATUS_SUCCESS;
+
+Error:
+
+    QuicTraceEvent(
+        ApiExitStatus,
+        "[ api] Exit %u",
+        Status);
+
+    return Status;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+QUIC_STATUS
+QUIC_API
+MsQuicStreamReceiveResume(
+    _In_ _Pre_defensive_ HQUIC Handle
+    )
+{
+    QUIC_STATUS Status;
+    QUIC_STREAM* Stream;
+    QUIC_CONNECTION* Connection;
+    QUIC_OPERATION* Oper;
+
+    QuicTraceEvent(
+        ApiEnter,
+        "[ api] Enter %u (%p).",
+        QUIC_TRACE_API_STREAM_RECEIVE_RESUME,
+        Handle);
+
+    if (!IS_STREAM_HANDLE(Handle)) {
+        Status = QUIC_STATUS_INVALID_PARAMETER;
+        goto Error;
+    }
+
+#pragma prefast(suppress: __WARNING_25024, "Pointer cast already validated.")
+    Stream = (QUIC_STREAM*)Handle;
+
+    CXPLAT_TEL_ASSERT(!Stream->Flags.HandleClosed);
+    CXPLAT_TEL_ASSERT(!Stream->Flags.Freed);
+
+    Connection = Stream->Connection;
+
+    Oper = QuicConnAllocOperation(Connection, QUIC_OPER_TYPE_API_CALL);
+    if (Oper == NULL) {
+        Status = QUIC_STATUS_OUT_OF_MEMORY;
+        QuicTraceEvent(
+            AllocFailure,
+            "Allocation of '%s' failed. (%llu bytes)",
+            "STRM_RECV_RESUME operation",
+            0);
+        goto Error;
+    }
+    Oper->API_CALL.Context->Type = QUIC_API_TYPE_STRM_RECV_RESUME;
+    Oper->API_CALL.Context->STRM_RECV_RESUME.Stream = Stream;
+
+    //
+    // Async stream operations need to hold a ref on the stream so that the
+    // stream isn't freed before the operation can be processed. The ref is
+    // released when the operation is freed (see QuicOperationFree).
+    //
+    QuicStreamAddRef(Stream, QUIC_STREAM_REF_OPERATION);
+
+    //
+    // Queue the operation; the paused-state transition is applied on the
+    // connection's worker thread (see QuicStreamRecvResume), which keeps
+    // consecutive Pause/Resume calls ordered and makes this API free of
+    // state races. Repeated calls are no-ops on the worker. This is
+    // fire-and-forget: SUCCESS only means the operation was queued; if the
+    // connection is closed before the operation runs, the operation is
+    // drained (and the stream reference released) with no effect.
+    //
+    QuicConnQueueOper(Connection, Oper);
+    Status = QUIC_STATUS_SUCCESS;
+
+Error:
+
+    QuicTraceEvent(
+        ApiExitStatus,
+        "[ api] Exit %u",
+        Status);
+
+    return Status;
+}

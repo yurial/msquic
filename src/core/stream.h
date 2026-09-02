@@ -159,6 +159,7 @@ typedef union QUIC_STREAM_FLAGS {
         BOOLEAN InStreamTable           : 1;    // The stream is currently in the connection's table.
         BOOLEAN InWaitingList           : 1;    // The stream is currently in the waiting list for stream id FC.
         BOOLEAN DelayIdFcUpdate         : 1;    // Delay stream ID FC updates to StreamClose.
+        BOOLEAN ReceivePaused           : 1;
     };
 } QUIC_STREAM_FLAGS;
 
@@ -1076,4 +1077,31 @@ void
 QuicStreamNotifyReceiveBufferNeeded(
     _In_ QUIC_STREAM* Stream,
     _In_ uint64_t BufferLengthNeeded
+    );
+
+//
+// Pauses receive callbacks on a stream by stopping the advertisement of new
+// stream-level flow control credit: the next MAX_STREAM_DATA frame carries
+// the already-delivered offset (RecvBuffer.BaseOffset), so the peer learns
+// there is no receive capacity on this stream. The local MaxAllowedRecvOffset
+// limit is left untouched, so data still within the previously advertised
+// window keeps being accepted (the peer may also ignore the lowered value
+// per RFC 9000 sec 4.1).
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicStreamRecvPause(
+    _In_ QUIC_STREAM* Stream
+    );
+
+//
+// Resumes receive callbacks on a stream: the up-to-date stream-level flow
+// control limit is (re)computed (monotonically; never lower than what was
+// already advertised) and advertised via MAX_STREAM_DATA, restoring the
+// peer's ability to send new data.
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicStreamRecvResume(
+    _In_ QUIC_STREAM* Stream
     );

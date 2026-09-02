@@ -4886,8 +4886,34 @@ QuicConnRecvFrames(
                 break; // Ignore frame if we are closed.
             }
 
-            if (Connection->Send.PeerMaxData < Frame.MaximumData) {
-                Connection->Send.PeerMaxData = Frame.MaximumData;
+            //
+            // Deviation from RFC 9000 Section 4.1: there, a MAX_DATA frame
+            // whose value is less than or equal to the current connection
+            // flow control limit "has no effect". Here the new value is
+            // always applied, even when it lowers the limit (including to
+            // zero). This is required for the receive-pause feature: a
+            // paused endpoint advertises MAX_DATA equal to the amount of
+            // data already received (Send.OrderedStreamBytesReceived, zero
+            // additional credit) and expects the peer to stop sending new
+            // data until the limit is raised again. The peer MAY ignore the
+            // lowered value; data within the previously advertised window is
+            // accepted either way (Send.MaxData is never lowered), so
+            // FLOW_CONTROL_ERROR is unreachable on this path.
+            //
+            // Internal bookkeeping is clamped to the amount of data already
+            // sent, i.e. the stored limit is never lowered below
+            // OrderedStreamBytesSent. This is observably equivalent: no new
+            // data beyond the frame's value can be sent anyway, so the
+            // effective send window is unchanged, while the invariant
+            // OrderedStreamBytesSent <= PeerMaxData always holds (keeping
+            // window-remainder arithmetic and telemetry free of wrap-around).
+            //
+            const BOOLEAN PeerMaxDataIncreased =
+                Frame.MaximumData > Connection->Send.PeerMaxData;
+            Connection->Send.PeerMaxData =
+                CXPLAT_MAX(Frame.MaximumData, Connection->Send.OrderedStreamBytesSent);
+
+            if (PeerMaxDataIncreased) {
                 //
                 // The peer has given us more allowance. Send packets from
                 // any previously blocked streams.
@@ -7835,6 +7861,75 @@ QuicConnExportKeyingMaterial(
 
 _IRQL_requires_max_(PASSIVE_LEVEL)
 void
+QuicConnRecvPause(
+    _In_ QUIC_CONNECTION* Connection
+    )
+{
+    //
+    // Be defensive about double-pause calls (e.g., two pause ops queued).
+    // The flag is the source of truth; if already paused this is a no-op.
+    //
+    if (Connection->State.ReceivePaused) {
+        return;
+    }
+
+    Connection->State.ReceivePaused = TRUE;
+
+    //
+    // Trigger sending of a MAX_DATA frame advertising the amount of data
+    // already received (Send.OrderedStreamBytesReceived, zero additional
+    // credit) so the peer learns that we have no receive capacity. The local
+    // Send.MaxData limit is deliberately left untouched: it keeps covering
+    // the previously advertised window, so any STREAM frames already in
+    // flight (or sent by a peer that ignores the lowered value, which
+    // RFC 9000 sec 4.1 permits) remain within our advertised limit and are
+    // accepted normally instead of being rejected with FLOW_CONTROL_ERROR.
+    //
+    QuicSendSetSendFlag(&Connection->Send, QUIC_CONN_SEND_FLAG_MAX_DATA);
+    QuicSendQueueFlush(&Connection->Send, REASON_CONNECTION_FLOW_CONTROL);
+
+    QuicTraceLogConnInfo(
+        ConnReceivePause,
+        Connection,
+        "Pausing receive on connection");
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicConnRecvResume(
+    _In_ QUIC_CONNECTION* Connection
+    )
+{
+    //
+    // Be defensive about resume-without-pause.
+    //
+    if (!Connection->State.ReceivePaused) {
+        return;
+    }
+
+    Connection->State.ReceivePaused = FALSE;
+
+    //
+    // Apply any flow control credit that accumulated while receive was
+    // paused (see Send.DeferredMaxData), then trigger sending of a MAX_DATA
+    // frame. Send.MaxData was never lowered during the pause, so this
+    // (re)advertises the current real limit, restoring the peer's ability to
+    // send new data.
+    //
+    Connection->Send.MaxData += Connection->Send.DeferredMaxData;
+    Connection->Send.DeferredMaxData = 0;
+
+    QuicSendSetSendFlag(&Connection->Send, QUIC_CONN_SEND_FLAG_MAX_DATA);
+    QuicSendQueueFlush(&Connection->Send, REASON_CONNECTION_FLOW_CONTROL);
+
+    QuicTraceLogConnInfo(
+        ConnReceiveResume,
+        Connection,
+        "Resuming receive on connection");
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
 QuicConnProcessApiOperation(
     _In_ QUIC_CONNECTION* Connection,
     _In_ QUIC_API_CONTEXT* ApiCtx
@@ -7899,6 +7994,14 @@ QuicConnProcessApiOperation(
         }
         break;
 
+    case QUIC_API_TYPE_CONN_RECV_PAUSE:
+        QuicConnRecvPause(Connection);
+        break;
+
+    case QUIC_API_TYPE_CONN_RECV_RESUME:
+        QuicConnRecvResume(Connection);
+        break;
+
     case QUIC_API_TYPE_CONN_COMPLETE_RESUMPTION_TICKET_VALIDATION:
         CXPLAT_DBG_ASSERT(QuicConnIsServer(Connection));
         QuicCryptoCustomTicketValidationComplete(
@@ -7947,6 +8050,14 @@ QuicConnProcessApiOperation(
             QuicStreamRecvSetEnabledState(
                 ApiCtx->STRM_RECV_SET_ENABLED.Stream,
                 ApiCtx->STRM_RECV_SET_ENABLED.IsEnabled);
+        break;
+
+    case QUIC_API_TYPE_STRM_RECV_PAUSE:
+        QuicStreamRecvPause(ApiCtx->STRM_RECV_PAUSE.Stream);
+        break;
+
+    case QUIC_API_TYPE_STRM_RECV_RESUME:
+        QuicStreamRecvResume(ApiCtx->STRM_RECV_RESUME.Stream);
         break;
 
     case QUIC_API_TYPE_STRM_PROVIDE_RECV_BUFFERS:

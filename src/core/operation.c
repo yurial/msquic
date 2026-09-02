@@ -119,6 +119,10 @@ QuicOperationFree(
             }
         } else if (ApiCtx->Type == QUIC_API_TYPE_STRM_RECV_SET_ENABLED) {
             QuicStreamRelease(ApiCtx->STRM_RECV_SET_ENABLED.Stream, QUIC_STREAM_REF_OPERATION);
+        } else if (ApiCtx->Type == QUIC_API_TYPE_STRM_RECV_PAUSE) {
+            QuicStreamRelease(ApiCtx->STRM_RECV_PAUSE.Stream, QUIC_STREAM_REF_OPERATION);
+        } else if (ApiCtx->Type == QUIC_API_TYPE_STRM_RECV_RESUME) {
+            QuicStreamRelease(ApiCtx->STRM_RECV_RESUME.Stream, QUIC_STREAM_REF_OPERATION);
         } else if (ApiCtx->Type == QUIC_API_TYPE_STRM_PROVIDE_RECV_BUFFERS) {
             while (!CxPlatListIsEmpty(&ApiCtx->STRM_PROVIDE_RECV_BUFFERS.Chunks)) {
                 QuicRecvChunkFree(

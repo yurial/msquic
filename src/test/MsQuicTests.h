@@ -867,6 +867,22 @@ QuicTestStreamPriorityInfiniteLoop(
     );
 
 void
+QuicTestConnReceivePauseResume(
+    );
+
+void
+QuicTestConnMaxDataLoweredBlocksSend(
+    );
+
+void
+QuicTestStreamRecvPauseBlocksSend(
+    );
+
+void
+QuicTestRecvPauseDeferredCredit(
+    );
+
+void
 QuicTestStreamDifferentAbortErrors(
     );
 
