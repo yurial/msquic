@@ -41,4 +41,20 @@ QuicCongestionControlInitialize(
         BbrCongestionControlInitialize(Cc, Settings);
         break;
     }
+
+    //
+    // The embedded shaper starts unlimited with the default (0, 0) pair.
+    // Initialized after the plugin switch above, because plugin
+    // initialization assigns its state template over the whole structure.
+    // The (0, 0) pair is always valid, so this cannot fail
+    // (specs/bandwidth.md §17, §24). The shaper stores no MTU: the packet
+    // size is passed per math call (Path->Mtu at the call sites, §3.3).
+    //
+    QUIC_STATUS Status =
+        QuicBandwidthShaperInit(
+            &Cc->Pacer,
+            /*BandwidthBitsPerSecond =*/ (uint64_t)0,
+            /*BurstWindowUsec        =*/ (uint64_t)0);  // (0, 0) is always a valid unlimited pair
+    CXPLAT_FRE_ASSERT(QUIC_SUCCEEDED(Status));
+    UNREFERENCED_PARAMETER(Status);
 }

@@ -5,6 +5,10 @@
 
 --*/
 
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
 //
 // The different kinds of references on a Configuration.
 //
@@ -97,6 +101,18 @@ typedef struct QUIC_CONFIGURATION {
     // Configurable (app & registry) settings.
     //
     QUIC_SETTINGS_INTERNAL Settings;
+
+    //
+    // Application-level parent bandwidth shaper for this configuration
+    // (specs/bandwidth.md §16.1). Set via
+    // QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER; acts as a shared ceiling
+    // for connections bound to this configuration after installation
+    // (§15.4). Initialized with the (0, 0) pair ("not installed") in
+    // MsQuicConfigurationOpen; lives for the lifetime of the
+    // configuration, which connections extend via the
+    // QUIC_CONF_REF_CONNECTION reference (§16.1).
+    //
+    QUIC_BANDWIDTH_SHAPER_PARENT BandwidthShaper;
 
     uint16_t AlpnListLength;
     uint8_t AlpnList[0];
@@ -212,3 +228,7 @@ QuicConfigurationParamSet(
     _In_reads_bytes_(BufferLength)
         const void* Buffer
     );
+
+#if defined(__cplusplus)
+}
+#endif

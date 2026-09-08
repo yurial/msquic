@@ -1368,14 +1368,31 @@ QuicSendFlush(
                 if (QuicCongestionControlCanSend(&Connection->CongestionControl)) {
                     //
                     // The current pacing chunk is finished. We need to schedule a
-                    // new pacing send.
+                    // new pacing send. When the send allowance was limited by a
+                    // bandwidth shaper (specs/bandwidth.md §3.4), back off for
+                    // exactly the binding level's recharge delay (§9) instead
+                    // of the fixed pacing interval: the max of the per-path
+                    // shaper's own delay and the installed parents' delay for
+                    // the same MTU-sized want (§16.3; precomputed at the
+                    // allowance min in the packet builder). Without parents the
+                    // max is the child-only delay — behavior unchanged.
                     //
+                    uint32_t PacingDelayUs = QUIC_SEND_PACING_INTERVAL;
+                    if (Builder.PacingShaperLimited) {
+                        PacingDelayUs = QuicPathPacerGetDelayUsec(Path, CxPlatTimeUs64());
+                        if (Builder.PacingParentDelayUsec > PacingDelayUs) {
+                            PacingDelayUs = Builder.PacingParentDelayUsec;
+                        }
+                        if (PacingDelayUs == 0) {
+                            PacingDelayUs = 1;
+                        }
+                    }
                     QuicConnAddOutFlowBlockedReason(
                         Connection, QUIC_FLOW_BLOCKED_PACING);
                     QuicConnTimerSet(
                         Connection,
                         QUIC_CONN_TIMER_PACING,
-                        QUIC_SEND_PACING_INTERVAL);
+                        PacingDelayUs);
                     Result = QUIC_SEND_DELAYED_PACING;
                 } else {
                     //

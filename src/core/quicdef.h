@@ -416,6 +416,40 @@ CXPLAT_STATIC_ASSERT(
 #define QUIC_SEND_PACING_INTERVAL               1000
 
 //
+// The default burst window, in microseconds, applied when the congestion
+// control's embedded bandwidth shaper (Pacer) is first configured with a
+// non-zero rate (specs/bandwidth.md §17).
+//
+#define QUIC_DEFAULT_PACING_BURST_WINDOW_USEC   (2 * QUIC_SEND_PACING_INTERVAL)
+
+//
+// The number of bits in one byte. Used when converting
+// BandwidthBitsPerSecond <-> bytes per second.
+//
+#define BITS_PER_BYTE                           ((uint64_t)8)
+
+//
+// The number of microseconds in one second. Used when converting
+// BandwidthBitsPerSecond <-> bytes per microsecond.
+//
+#define QUIC_BANDWIDTH_SHAPER_USEC_PER_SEC      ((uint64_t)1000000)
+
+//
+// The number of nanoseconds in one microsecond. The shaper's public
+// interface is in microseconds, but its internal time representation is
+// nanoseconds (specs/bandwidth.md §2.1/§4): at B >= 9.6 Gbit/s a per-packet
+// debit floors to 0 usec, so sub-microsecond precision must be preserved
+// internally.
+//
+#define QUIC_BANDWIDTH_SHAPER_NSEC_PER_USEC     ((uint64_t)1000)
+
+//
+// The number of nanoseconds in one second. Used when converting
+// BandwidthBitsPerSecond <-> bytes per nanosecond.
+//
+#define QUIC_BANDWIDTH_SHAPER_NSEC_PER_SEC      ((uint64_t)1000000000)
+
+//
 // The maximum number of bytes to send in a given key phase
 // before performing a key phase update. Roughly, 274GB.
 //

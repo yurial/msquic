@@ -35,6 +35,22 @@ QuicPathInitialize(
     Path->EcnValidationState =
         Connection->Settings.EcnEnabled ? ECN_VALIDATION_TESTING : ECN_VALIDATION_FAILED;
 
+    //
+    // Per-path pacing shaper (specs/bandwidth.md §20/§21): inherits the
+    // connection-wide rate configured via QUIC_PARAM_CONN_BANDWIDTH_SHAPER
+    // ((0, 0) = unlimited by default). The shaper stores no MTU: the
+    // path's packet size (Path->Mtu, maintained at path init, DPLPMTUD and
+    // settings changes) is passed per math call (§3.3). The pair was
+    // validated at SET time (§3.6), and the Now-independent part of the
+    // validation is rechecked by Init, so the call cannot fail.
+    //
+    CXPLAT_FRE_ASSERT(
+        QUIC_SUCCEEDED(
+            QuicBandwidthShaperInit(
+                &Path->PacerShaper,
+                Connection->BandwidthShaperBitsPerSecond,
+                Connection->BandwidthShaperBurstWindowUsec)));
+
     if (Connection->Settings.QTIPEnabled) {
         CxPlatRandom(sizeof(Path->Route.TcpState.SequenceNumber), &Path->Route.TcpState.SequenceNumber);
     }

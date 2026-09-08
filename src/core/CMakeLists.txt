@@ -12,6 +12,7 @@ endif()
 set(SOURCES
     ack_tracker.c
     api.c
+    bandwidth_shaper.c
     binding.c
     configuration.c
     congestion_control.c

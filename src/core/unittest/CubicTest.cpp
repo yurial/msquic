@@ -1454,7 +1454,6 @@ TEST_F(CubicTest, ResetScenarios)
     ASSERT_EQ(Cubic->SlowStartThreshold, UINT32_MAX);
     ASSERT_FALSE(Cubic->IsInRecovery);
     ASSERT_FALSE(Cubic->HasHadCongestionEvent);
-    ASSERT_EQ(Cubic->LastSendAllowance, 0u);
     ASSERT_EQ(Cubic->BytesInFlight, BytesInFlightBefore); // Preserved
 
     // Window-related state re-initialized
@@ -1527,18 +1526,6 @@ TEST_F(CubicTest, OnDataSent_IncrementsBytesInFlight)
     CC->QuicCongestionControlSetExemption(CC, 5); // Set 5 exemptions
     CC->QuicCongestionControlOnDataSent(CC, 1500);
     ASSERT_EQ(CC->QuicCongestionControlGetExemptions(CC), 4u);
-
-    // Test LastSendAllowance decrement
-    // When NumRetransmittableBytes <= LastSendAllowance, allowance is reduced
-    Cubic->LastSendAllowance = 2000; // Set initial allowance
-    uint32_t TinySend = 500; // Send less than allowance
-    CC->QuicCongestionControlOnDataSent(CC, TinySend);
-    ASSERT_EQ(Cubic->LastSendAllowance, 2000u - TinySend); // Should be reduced
-
-    // When NumRetransmittableBytes > LastSendAllowance, allowance is zeroed
-    Cubic->LastSendAllowance = 1000;
-    CC->QuicCongestionControlOnDataSent(CC, 3000); // 3000 > 1000
-    ASSERT_EQ(Cubic->LastSendAllowance, 0u);
 }
 
 //
@@ -1562,125 +1549,236 @@ TEST_F(CubicTest, OnDataInvalidated_DecrementsBytesInFlight)
 
 //
 // Test: Pacing with Slow Start Window Estimation
-// Scenario: Tests pacing calculation during slow start phase. When in slow start,
-// the estimated window is 2x current window (exponential growth). This covers
-// the EstimatedWnd calculation branch in GetSendAllowance.
+// Scenario: Tests shaper-based pacing during slow start (specs/bandwidth.md
+// §27.1). The paced branch of GetSendAllowance configures the embedded
+// shaper's rate from the estimated window of the next round trip (2x current
+// window in slow start, clamped by SlowStartThreshold) and returns the
+// shaper credit (burst budget) clamped by the CC window room. All time is
+// injected: the mock connection keeps Send.LastFlushTime == 0, so the
+// TimeSinceLastSend argument doubles as the absolute NowUsec.
 //
 TEST_F(CubicTest, Pacing_SlowStartWindowEstimation)
 {
     InitializeDefaultWithRtt(/*WindowPackets = */ 10, /*HyStart = */ false);
     Connection.Settings.PacingEnabled = TRUE;
 
+    // Pre-configure a burst window above the strict/normal boundary for
+    // the (low) estimated rates: NORMAL mode (§3.6) evaluates the
+    // proportional budget on the configured window, and a sub-packet
+    // budget would select the strict mode and change the expected budgets
+    // below; at 10'000 us the proportional budget is the pre-configured
+    // window's. The plugin passes the window through unchanged (§7.6).
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        QuicBandwidthShaperSetConfig(&CC->Pacer, 8000000, 10000, 1000000));
+
     // Ensure in slow start (SlowStartThreshold is UINT32_MAX by default after init)
     // Send data to have bytes in flight
     CC->QuicCongestionControlOnDataSent(CC, Cubic->CongestionWindow / 2);
 
-    uint32_t Allowance = CC->QuicCongestionControlGetSendAllowance(CC, 10000, TRUE);
+    uint32_t CongestionWindow = Cubic->CongestionWindow; // 12320
+    uint64_t SmoothedRtt = Connection.Paths[0].SmoothedRtt; // 50000
+    // EstimatedWnd = min(2 * CW, SSThresh) = 24640
+    uint64_t EstimatedWnd = 2 * (uint64_t)CongestionWindow;
+    uint64_t ExpectedRate = EstimatedWnd * BITS_PER_BYTE *
+                            QUIC_BANDWIDTH_SHAPER_USEC_PER_SEC / SmoothedRtt; // 3'942'400 bits/s
 
-    // Pacing formula: (EstimatedWnd * TimeSinceLastSend) / SmoothedRtt
-    // In slow start: EstimatedWnd = min(2 * CongestionWindow, SlowStartThreshold) = 24640
-    // CongestionWindow = (1280 - 48) * 10 = 12320
-    uint32_t CongestionWindow = Cubic->CongestionWindow;
-    uint64_t SmoothedRtt = Connection.Paths[0].SmoothedRtt;
-    uint32_t TimeSinceLastSend = 10000;
-    uint32_t EstimatedWnd = 2 * CongestionWindow; // SSThresh == UINT32_MAX, so min(2*CW, SST) = 2*CW
-    uint32_t ExpectedAllowance = (uint32_t)(((uint64_t)EstimatedWnd * TimeSinceLastSend) / SmoothedRtt);
-    ASSERT_EQ(Allowance, ExpectedAllowance);
+    // First paced call: configures the shaper with the pre-configured
+    // window (10'000us) and returns the full burst budget
+    // (10'000us * rate / 8e6 = 4'928) since the CC window room (6'160) is
+    // larger.
+    uint32_t Allowance = CC->QuicCongestionControlGetSendAllowance(CC, 1000000, TRUE);
+    ASSERT_EQ(CC->Pacer.BandwidthBitsPerSecond, ExpectedRate);
+    ASSERT_EQ(CC->Pacer.BurstWindowUsec, 10000ull); // stored as configured
+    ASSERT_EQ(Allowance, (uint32_t)(10000 * ExpectedRate /
+        (BITS_PER_BYTE * QUIC_BANDWIDTH_SHAPER_USEC_PER_SEC)));
 
-    // Now test the case where estimated window (2x current) exceeds threshold
-    // Set threshold to be between current window and 2x current window
-    uint32_t CurrentWindow = Cubic->CongestionWindow;
-    Cubic->SlowStartThreshold = CurrentWindow + (CurrentWindow / 2); // 1.5x current window = 18480
+    // Now test the case where the estimated window (2x current) is clamped by
+    // the slow start threshold: EstimatedWnd = min(24640, 18480) = 18480, so
+    // the configured rate drops accordingly. The burst window is passed
+    // through unchanged (the plugin sets it only once).
+    Cubic->SlowStartThreshold = CongestionWindow + (CongestionWindow / 2); // 18480
+    uint64_t EstimatedWnd2 = (uint64_t)CongestionWindow << 1; // 24640
+    EstimatedWnd2 = (EstimatedWnd2 > Cubic->SlowStartThreshold) ? Cubic->SlowStartThreshold : EstimatedWnd2;
+    uint64_t ExpectedRate2 = EstimatedWnd2 * BITS_PER_BYTE *
+                             QUIC_BANDWIDTH_SHAPER_USEC_PER_SEC / SmoothedRtt; // 2'956'800 bits/s
 
-    // Call GetSendAllowance again
-    // EstimatedWnd = min(2 * 12320, 18480) = 18480
-    // Allowance = LastSendAllowance + (18480 * 10000) / 50000 = 4928 + 3696 = 8624
-    // BUT capped at available window = CongestionWindow - BytesInFlight = 12320 - 6160 = 6160
-    uint32_t Allowance2 = CC->QuicCongestionControlGetSendAllowance(CC, 10000, TRUE);
+    uint32_t Allowance2 = CC->QuicCongestionControlGetSendAllowance(CC, 1002000, TRUE);
 
-    // Verify exact calculated value (capped at available window)
-    uint32_t AvailableWindow = Cubic->CongestionWindow - Cubic->BytesInFlight;
-    uint32_t ExpectedAllowance2 = AvailableWindow;  // 6160 (capped)
-    ASSERT_EQ(Allowance2, ExpectedAllowance2);
+    ASSERT_EQ(CC->Pacer.BandwidthBitsPerSecond, ExpectedRate2);
+    ASSERT_EQ(CC->Pacer.BurstWindowUsec, 10000ull); // unchanged
+    // No send was registered, so the credit base is still untouched.
+    ASSERT_EQ(CC->Pacer.CreditBaseTimeNsec, 0ull);
+    ASSERT_EQ(Allowance2, (uint32_t)(10000 * ExpectedRate2 /
+        (BITS_PER_BYTE * QUIC_BANDWIDTH_SHAPER_USEC_PER_SEC)));
 }
 
 //
 // Test: Pacing with Congestion Avoidance Window Estimation
-// Scenario: Tests pacing calculation during congestion avoidance phase.
-// When past slow start, estimated window is 1.25x current window (linear growth).
+// Scenario: Tests shaper-based pacing during congestion avoidance
+// (specs/bandwidth.md §27.1). Past slow start the estimated window is 1.25x
+// the current window. Verifies the configured rate, the burst-budget-limited
+// allowance, the exact credit debit of a registered send, the zero allowance
+// at an exhausted credit, and credit accumulation over injected time.
 //
 TEST_F(CubicTest, Pacing_CongestionAvoidanceEstimation)
 {
     InitializeDefaultWithRtt(/*WindowPackets = */ 10, /*HyStart = */ false);
     Connection.Settings.PacingEnabled = TRUE;
 
-    // Enter congestion avoidance: loss reduces CW to 8624, SSThresh = 8624.
-    // Use custom setup (not EnterCongestionAvoidance) because we need specific
-    // BytesInFlight for the pacing derivation.
-    uint32_t InitialWindow = Cubic->CongestionWindow;
-    CC->QuicCongestionControlOnDataSent(CC, InitialWindow);
-    Connection.Send.NextPacketNumber = 10;
+    // Pre-configure a window above the strict/normal boundary at this
+    // rate (see Pacing_SlowStartWindowEstimation); the plugin passes it
+    // through.
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        QuicBandwidthShaperSetConfig(&CC->Pacer, 8000000, 10000, 1000000));
 
-    QUIC_LOSS_EVENT LossEvent = MakeLossEvent(1200, 5, 10);
-    CC->QuicCongestionControlOnDataLost(CC, &LossEvent);
+    // Force into congestion avoidance: CW >= SSThresh.
+    Cubic->SlowStartThreshold = 10000;
+    Cubic->CongestionWindow = 20000;
 
-    uint32_t WindowAfterLoss = InitialWindow * 7 / 10;
-    uint32_t BytesInFlightAfterLoss = InitialWindow - LossEvent.NumRetransmittableBytes;
+    // EstimatedWnd = CW * 1.25 = 25000; rate = 25000 * 8 * 1e6 / 50000 = 4'000'000 bits/s
+    // (0.5 bytes per microsecond; burst budget = 10'000us * 0.5 = 5000 bytes).
+    uint64_t EstimatedWnd = (uint64_t)Cubic->CongestionWindow + (Cubic->CongestionWindow >> 2);
+    uint64_t ExpectedRate = EstimatedWnd * BITS_PER_BYTE *
+                            QUIC_BANDWIDTH_SHAPER_USEC_PER_SEC / Connection.Paths[0].SmoothedRtt;
 
-    // Exit recovery with ACK that also reduces BytesInFlight to a known value
-    Connection.Send.NextPacketNumber = 15;
-    uint32_t BytesAcked = WindowAfterLoss / 2;
-    QUIC_ACK_EVENT AckEvent = MakeAckEvent(1100000, 15, 20, BytesAcked);
-    CC->QuicCongestionControlOnDataAcknowledged(CC, &AckEvent);
+    uint32_t Allowance = CC->QuicCongestionControlGetSendAllowance(CC, 1000000, TRUE);
+    ASSERT_EQ(CC->Pacer.BandwidthBitsPerSecond, ExpectedRate); // 4'000'000
+    ASSERT_EQ(Allowance, 5000u); // burst budget, below the CC window room
 
-    uint32_t BytesInFlightAfterAck = BytesInFlightAfterLoss - BytesAcked;
+    // Register the send through the wrapper (the production debit path):
+    // 5000 bytes at 4'000'000 bits/s take exactly 10000us, so the credit
+    // base moves to max(0, 1e9 - 1e7) + 1e7 = 1e9 ns == Now.
+    QuicCongestionControlOnDataSent(CC, Allowance, 1000000, Connection.Paths[0].Mtu);
+    ASSERT_EQ(CC->Pacer.CreditBaseTimeNsec, 1000000000ull);
 
-    // Now in congestion avoidance and out of recovery
-    // GetSendAllowance with TimeSinceLastSend=10000us, pacing enabled:
-    // - CongestionWindow >= SlowStartThreshold, so EstimatedWnd = CongestionWindow * 1.25
-    // - EstimatedWnd = 8624 + 8624/4 = 8624 + 2156 = 10780
-    // - SendAllowance = LastSendAllowance + (EstimatedWnd * TimeSinceLastSend) / SmoothedRtt
-    // - LastSendAllowance = 0 (first call after ACK)
-    // - SendAllowance = 0 + (10780 * 10000) / 50000 = 107800000 / 50000 = 2156
-    // - AvailableWindow = CongestionWindow - BytesInFlight = 8624 - 6808 = 1816
-    // - SendAllowance (2156) > AvailableWindow (1816), so capped to 1816
-    uint32_t Allowance = CC->QuicCongestionControlGetSendAllowance(CC, 10000, TRUE);
+    // Credit exhausted: zero allowance at the same injected moment.
+    ASSERT_EQ(CC->QuicCongestionControlGetSendAllowance(CC, 1000000, TRUE), 0u);
 
-    uint64_t EstimatedWnd = WindowAfterLoss + (WindowAfterLoss >> 2);
-    uint32_t AvailableWindow = WindowAfterLoss - BytesInFlightAfterAck;
-    uint32_t CalculatedAllowance = (uint32_t)((EstimatedWnd * 10000) / 50000);
-    uint32_t ExpectedAllowance = (CalculatedAllowance > AvailableWindow) ? AvailableWindow : CalculatedAllowance;
+    // After 1000us of accumulation: 500 bytes of credit.
+    ASSERT_EQ(CC->QuicCongestionControlGetSendAllowance(CC, 1001000, TRUE), 500u);
 
-    ASSERT_EQ(Allowance, ExpectedAllowance);
+    // After another 1000us: 1000 bytes (accruing, not yet clamped).
+    ASSERT_EQ(CC->QuicCongestionControlGetSendAllowance(CC, 1002000, TRUE), 1000u);
+
+    // After 10'000us the credit is clamped to the burst budget again.
+    ASSERT_EQ(CC->QuicCongestionControlGetSendAllowance(CC, 1010000, TRUE), 5000u);
 }
 
 //
-// Test: Pacing LastSendAllowance Carryover
-// Scenario: When pacing is enabled and GetSendAllowance is called multiple times
-// without sending data, the unused allowance (LastSendAllowance) carries over
-// and accumulates into the next call's result.
+// Test: Pacing Credit Is Consumed By Sends And Replenished Over Time
+// Scenario: The old LastSendAllowance carryover (unused allowance
+// accumulating across GetSendAllowance calls without sends) is replaced by
+// the shaper's credit model (specs/bandwidth.md §27.1): repeated reads
+// without sends return the same burst-budget-limited allowance; a registered
+// send consumes the credit; idle time replenishes it up to the burst budget.
 //
-TEST_F(CubicTest, Pacing_LastSendAllowanceCarryover)
+TEST_F(CubicTest, Pacing_CreditConsumedBySendAndReplenished)
 {
     InitializeDefaultWithRtt(/*WindowPackets = */ 10, /*HyStart = */ false);
     Connection.Settings.PacingEnabled = TRUE;
 
-    // Send some data so BytesInFlight > 0
-    CC->QuicCongestionControlOnDataSent(CC, 1000);
+    // Pre-configure a window above the strict/normal boundary at this
+    // rate (see
+    // Pacing_SlowStartWindowEstimation).
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        QuicBandwidthShaperSetConfig(&CC->Pacer, 8000000, 10000, 1000000));
 
-    // First pacing call: LastSendAllowance starts at 0
-    // EstimatedWnd = 2*12320 = 24640 (slow start), TimeSinceLastSend = 1ms
-    // Allowance = 0 + (24640 * 1000) / 50000 = 492
-    uint32_t Allowance1 = CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE);
-    ASSERT_EQ(Allowance1, (uint32_t)(((uint64_t)(2 * Cubic->CongestionWindow) * 1000) / 50000));
+    // Slow start: EstimatedWnd = 24640, rate = 3'942'400 bits/s, burst
+    // budget = 10'000us * 3942400 / 8e6 = 4928 bytes.
+    uint32_t Allowance1 = CC->QuicCongestionControlGetSendAllowance(CC, 1000000, TRUE);
+    ASSERT_EQ(Allowance1, 4928u);
 
-    // Don't send anything — LastSendAllowance stays at Allowance1
+    // Repeated reads without sends do not accumulate anything.
+    ASSERT_EQ(CC->QuicCongestionControlGetSendAllowance(CC, 1000000, TRUE), 4928u);
 
-    // Second pacing call: LastSendAllowance carries over
-    // Allowance = Allowance1 + (24640 * 1000) / 50000 = 2 * Allowance1
-    uint32_t Allowance2 = CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE);
-    ASSERT_EQ(Allowance2, 2 * Allowance1);
-    ASSERT_GT(Allowance2, Allowance1);
+    // Registering the send consumes the credit: 4928 bytes take exactly
+    // 10'000us (the burst budget at this rate), so the credit base moves to
+    // max(0, 1e9 - 1e7) + 1e7 = 1e9 ns == Now.
+    QuicCongestionControlOnDataSent(CC, Allowance1, 1000000, Connection.Paths[0].Mtu);
+    ASSERT_EQ(CC->Pacer.CreditBaseTimeNsec, 1000000000ull);
+    ASSERT_EQ(CC->QuicCongestionControlGetSendAllowance(CC, 1000000, TRUE), 0u);
+
+    // 2000us of idle time later: 985 bytes accrued (the sub-µs remainders
+    // of the ns base keep this read exact).
+    ASSERT_EQ(CC->QuicCongestionControlGetSendAllowance(CC, 1002000, TRUE), 985u);
+
+    // 10'000us of idle time later the full burst budget is available again
+    // (EffectiveLastSendNsec clamps to NowNsec - BurstWindowNsec).
+    ASSERT_EQ(CC->QuicCongestionControlGetSendAllowance(CC, 1010000, TRUE), 4928u);
+}
+
+//
+// Test: §35 case 30 — GetSendAllowance leaves the shaper credit untouched
+// Scenario: A paced GetSendAllowance call configures the shaper's rate but
+// must not modify Pacer.CreditBaseTimeNsec; only a registered send (through
+// the QuicCongestionControlOnDataSent wrapper) advances it.
+//
+TEST_F(CubicTest, Pacing_AllowanceLeavesPacerCreditUntouched)
+{
+    InitializeDefaultWithRtt(/*WindowPackets = */ 10, /*HyStart = */ false);
+    Connection.Settings.PacingEnabled = TRUE;
+
+    // Slow start: EstimatedWnd = 24640; rate = 24640 * 8e6 / 4000 = 49'280'000
+    // bits/s (6.16 bytes/us); burst budget = 2000us * 6.16 = 12320 bytes.
+    Connection.Paths[0].SmoothedRtt = 4000;
+    uint64_t ExpectedRate =
+        (uint64_t)2 * Cubic->CongestionWindow * BITS_PER_BYTE *
+        QUIC_BANDWIDTH_SHAPER_USEC_PER_SEC / Connection.Paths[0].SmoothedRtt;
+
+    ASSERT_EQ(CC->Pacer.CreditBaseTimeNsec, 0ull);
+    uint32_t Allowance = CC->QuicCongestionControlGetSendAllowance(CC, 1000000, TRUE);
+    ASSERT_EQ(Allowance, Cubic->CongestionWindow); // budget == window room == 12320
+
+    // The call configured the rate but did not touch the credit base.
+    ASSERT_EQ(CC->Pacer.BandwidthBitsPerSecond, ExpectedRate);
+    ASSERT_EQ(CC->Pacer.CreditBaseTimeNsec, 0ull);
+
+    // Only the registered send advances the timestamp: 1200 bytes take
+    // 1200 * 8e9 / 49280000 = 194'805 ns (the ns base keeps the sub-µs
+    // remainder; the µs base floored to 194), so CreditBaseTimeNsec =
+    // max(0, 1e9 - 2e6) + 194'805 = 998'194'805.
+    QuicCongestionControlOnDataSent(CC, 1200, 1000000, Connection.Paths[0].Mtu);
+    ASSERT_EQ(CC->Pacer.CreditBaseTimeNsec, 998194805ull);
+}
+
+//
+// Test: §35 case 31 — two GetSendAllowance + OnDataSent ticks spaced by
+// 8 * Cwnd * 1e6 / B microseconds give Cwnd/2 allowance without delay
+// Scenario: With rate B = 49'280'000 bits/s and Cwnd = 12320, the interval
+// from §35 is 8 * 12320 * 1e6 / 49280000 = 2000us. The first tick yields the
+// full burst budget (== Cwnd); half the window is sent, and at exactly the
+// second tick — with no extra waiting — the algorithm offers Cwnd/2.
+//
+TEST_F(CubicTest, Pacing_TwoTickRhythm_CwndHalfWithoutDelay)
+{
+    InitializeDefaultWithRtt(/*WindowPackets = */ 10, /*HyStart = */ false);
+    Connection.Settings.PacingEnabled = TRUE;
+
+    uint32_t CongestionWindow = Cubic->CongestionWindow; // 12320
+    Connection.Paths[0].SmoothedRtt = 4000; // → B = 49'280'000 bits/s (6.16 B/us)
+
+    const uint64_t Now1 = 1000000;
+    uint32_t Allowance1 = CC->QuicCongestionControlGetSendAllowance(CC, Now1, TRUE);
+    ASSERT_EQ(Allowance1, CongestionWindow); // full burst budget == window room
+
+    // Send half the window through the production debit path: 6160 bytes
+    // take exactly 1000us (6'160'000 ns), so the credit base moves to
+    // 998'000'000 + 1'000'000 = 999'000'000 ns.
+    QuicCongestionControlOnDataSent(CC, CongestionWindow / 2, Now1, Connection.Paths[0].Mtu);
+    ASSERT_EQ(CC->Pacer.CreditBaseTimeNsec, 999000000ull);
+
+    // Second tick at exactly Now1 + 8*Cwnd*1e6/B = Now1 + 2000us: the credit
+    // window has fully re-armed, so the allowance is the remaining CC room,
+    // Cwnd/2, with zero additional delay.
+    const uint64_t Now2 = Now1 + (uint64_t)CongestionWindow * BITS_PER_BYTE *
+                                  QUIC_BANDWIDTH_SHAPER_USEC_PER_SEC /
+                                  CC->Pacer.BandwidthBitsPerSecond;
+    ASSERT_EQ(Now2, 1002000ull);
+    uint32_t Allowance2 = CC->QuicCongestionControlGetSendAllowance(CC, Now2, TRUE);
+    ASSERT_EQ(Allowance2, CongestionWindow / 2);
 }
 
 //

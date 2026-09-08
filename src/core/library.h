@@ -295,6 +295,16 @@ typedef struct QUIC_LIBRARY {
     } StatelessRetry;
 
     //
+    // Application-level parent bandwidth shaper for the library level
+    // (specs/bandwidth.md §16.1). Set via
+    // QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER; acts as a shared ceiling for
+    // connections bound after installation (§15.4). Initialized with the
+    // (0, 0) pair ("not installed") in MsQuicLibraryInitialize and lives
+    // for the whole lifetime of the library.
+    //
+    QUIC_BANDWIDTH_SHAPER_PARENT BandwidthShaper;
+
+    //
     // The Toeplitz hash used for hashing received long header packets.
     //
     CXPLAT_TOEPLITZ_HASH ToeplitzHash;

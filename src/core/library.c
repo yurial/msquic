@@ -509,6 +509,13 @@ MsQuicLibraryInitialize(
 
     CxPlatDispatchRwLockInitialize(&MsQuicLib.StatelessRetry.Lock);
 
+    //
+    // Application-level parent shaper, library level (§16.1): default
+    // (0, 0) = "not installed"; lives for the whole lifetime of the
+    // library.
+    //
+    QuicBandwidthShaperParentInitialize(&MsQuicLib.BandwidthShaper);
+
     CxPlatZeroMemory(&MsQuicLib.Settings, sizeof(MsQuicLib.Settings));
     CxPlatLockInitialize(&MsQuicLib.RegistrationCloseCleanupLock);
     CxPlatEventInitialize(&MsQuicLib.RegistrationCloseCleanupEvent, FALSE, FALSE);
@@ -626,6 +633,7 @@ Error:
             CxPlatEventUninitialize(MsQuicLib.RegistrationCloseCleanupEvent);
             CxPlatLockUninitialize(&MsQuicLib.RegistrationCloseCleanupLock);
             CxPlatDispatchRwLockUninitialize(&MsQuicLib.StatelessRetry.Lock);
+            QuicBandwidthShaperParentUninitialize(&MsQuicLib.BandwidthShaper);
             CxPlatUninitialize();
         }
     }
@@ -743,6 +751,8 @@ MsQuicLibraryUninitialize(
     MsQuicLib.DefaultCompatibilityList = NULL;
 
     CxPlatDispatchRwLockUninitialize(&MsQuicLib.StatelessRetry.Lock);
+
+    QuicBandwidthShaperParentUninitialize(&MsQuicLib.BandwidthShaper);
 
     CxPlatRundownReleaseAndWait(&MsQuicLib.RegistrationCloseCleanupRundown);
     MsQuicLib.RegistrationCloseCleanupShutdown = TRUE;
@@ -1531,6 +1541,37 @@ QuicLibrarySetGlobalParam(
         break;
     }
 
+    case QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER: {
+        if (Buffer == NULL ||
+            BufferLength != sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG)) {
+            Status = QUIC_STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        const QUIC_BANDWIDTH_SHAPER_CONFIG* Config =
+            (const QUIC_BANDWIDTH_SHAPER_CONFIG*)Buffer;
+
+        //
+        // The pair is validated as a whole (specs/bandwidth.md §3.6 truth
+        // table) including the window invariant (BurstWindowUsec < now).
+        // Sanctioned exception to the "no clock reads" rule: the monotonic
+        // time is read here at the SetParam boundary and injected into the
+        // validation (§15.3).
+        //
+        if (QUIC_FAILED(
+                QuicBandwidthShaperParentSetConfig(
+                    &MsQuicLib.BandwidthShaper,
+                    Config->BandwidthBitsPerSecond,
+                    Config->BurstWindowUsec,
+                    CxPlatTimeUs64()))) {
+            Status = QUIC_STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        Status = QUIC_STATUS_SUCCESS;
+        break;
+    }
+
     default:
         Status = QUIC_STATUS_INVALID_PARAMETER;
         break;
@@ -1913,6 +1954,30 @@ QuicLibraryGetGlobalParam(
         Status = QUIC_STATUS_SUCCESS;
         break;
     }
+
+    case QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER:
+
+        //
+        // §15.2: the buffer must be exactly sizeof the config structure;
+        // any length mismatch is INVALID_PARAMETER (not BUFFER_TOO_SMALL).
+        // Default (no SET yet) is the all-zero (0, 0) pair.
+        //
+        if (*BufferLength != sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG)) {
+            Status = QUIC_STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        if (Buffer == NULL) {
+            Status = QUIC_STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        QuicBandwidthShaperParentGetConfig(
+            &MsQuicLib.BandwidthShaper,
+            (QUIC_BANDWIDTH_SHAPER_CONFIG*)Buffer);
+
+        Status = QUIC_STATUS_SUCCESS;
+        break;
 
     default:
         Status = QUIC_STATUS_INVALID_PARAMETER;

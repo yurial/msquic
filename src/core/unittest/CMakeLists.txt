@@ -3,11 +3,15 @@
 
 set(SOURCES
     main.cpp
+    BandwidthShaperHierarchyTest.cpp
+    BandwidthShaperTest.cpp
     BbrTest.cpp
+    CongestionControlPacerTest.cpp
     CubicTest.cpp
     FrameTest.cpp
     PacketNumberTest.cpp
     PartitionTest.cpp
+    PathPacerTest.cpp
     RangeTest.cpp
     RecvBufferTest.cpp
     SettingsTest.cpp

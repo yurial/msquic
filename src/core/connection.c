@@ -2490,6 +2490,45 @@ QuicConnGenerateLocalTransportParameters(
 }
 
 _IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicConnBandwidthShaperResolveParents(
+    _Inout_ QUIC_CONNECTION* Connection
+    )
+{
+    //
+    // One-time hierarchy resolution at configuration attachment
+    // (specs/bandwidth.md §15.4, §16.2). Levels stack: each installed level
+    // is captured as its own pointer; NULL means "not installed at bind
+    // time". Installed-ness (BandwidthBitsPerSecond != 0) is read under
+    // each parent's leaf lock, in the fixed global order library ->
+    // configuration (§16.4). The result is fixed for the connection's
+    // lifetime; later SETs don't rebind (§15.4) and resets/path migration
+    // don't touch it (§16.5).
+    //
+    CxPlatLockAcquire(&MsQuicLib.BandwidthShaper.Lock);
+    const BOOLEAN LibraryInstalled =
+        MsQuicLib.BandwidthShaper.Shaper.BandwidthBitsPerSecond != 0;
+    CxPlatLockRelease(&MsQuicLib.BandwidthShaper.Lock);
+
+    Connection->LibraryBandwidthShaperParent =
+        LibraryInstalled ? &MsQuicLib.BandwidthShaper : NULL;
+
+    QUIC_CONFIGURATION* Configuration = Connection->Configuration;
+    BOOLEAN ConfigInstalled = FALSE;
+    if (Configuration != NULL) {
+        CxPlatLockAcquire(&Configuration->BandwidthShaper.Lock);
+        ConfigInstalled =
+            Configuration->BandwidthShaper.Shaper.BandwidthBitsPerSecond != 0;
+        CxPlatLockRelease(&Configuration->BandwidthShaper.Lock);
+    }
+
+    Connection->ConfigBandwidthShaperParent =
+        ConfigInstalled ?
+            (QUIC_BANDWIDTH_SHAPER_PARENT*)&Configuration->BandwidthShaper :
+            NULL;
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
 QUIC_STATUS
 QuicConnSetConfiguration(
     _In_ QUIC_CONNECTION* Connection,
@@ -2516,6 +2555,14 @@ QuicConnSetConfiguration(
     QuicConfigurationAddRef(Configuration, QUIC_CONF_REF_CONNECTION);
     QuicConfigurationAttachSilo(Configuration);
     Connection->Configuration = Configuration;
+
+    //
+    // Snapshot the application-level parent shaper hierarchy now that the
+    // configuration reference is held (specs/bandwidth.md §16.2); the
+    // reference keeps the configuration-level parent's memory valid for the
+    // connection's lifetime (§16.1).
+    //
+    QuicConnBandwidthShaperResolveParents(Connection);
 
     if (QuicConnIsServer(Connection)) {
         QuicConnApplyNewSettings(
@@ -6924,6 +6971,56 @@ QuicConnParamSet(
         break;
     }
 
+    case QUIC_PARAM_CONN_BANDWIDTH_SHAPER: {
+        if (BufferLength != sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG) || Buffer == NULL) {
+            Status = QUIC_STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        const QUIC_BANDWIDTH_SHAPER_CONFIG* Config =
+            (const QUIC_BANDWIDTH_SHAPER_CONFIG*)Buffer;
+
+        //
+        // The pair is validated as a whole (specs/bandwidth.md §3.6 truth
+        // table) including the window invariant (BurstWindowUsec < now).
+        // This is the sanctioned exception to the "no clock reads" rule:
+        // the monotonic time is read here at the SetParam boundary and
+        // injected into the validation (§15.3).
+        //
+        uint64_t NowUsec = CxPlatTimeUs64();
+        if (!QuicBandwidthShaperValidateConfig(
+                Config->BandwidthBitsPerSecond,
+                Config->BurstWindowUsec,
+                NowUsec)) {
+            Status = QUIC_STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        //
+        // Atomic apply-or-nothing: the pair was already validated above, so
+        // storing it and re-applying it to every in-use path (SetConfig with
+        // the same inputs cannot fail) is atomic. Per §7, the shapers' credit
+        // (CreditBaseTimeNsec) is preserved — only the rate/window pair
+        // changes. The pair is stored AS CONFIGURED (§3.2: nothing is
+        // clamped or rewritten): the param GET echoes the raw configured
+        // window, and the pair plus the per-call Mtu (Path->Mtu at every
+        // math call, §3.3) selects the strict, continuous-rate or normal
+        // behavior inside the shaper math on each path.
+        //
+        Connection->BandwidthShaperBitsPerSecond = Config->BandwidthBitsPerSecond;
+        Connection->BandwidthShaperBurstWindowUsec = Config->BurstWindowUsec;
+        for (uint8_t i = 0; i < Connection->PathsCount; ++i) {
+            QuicBandwidthShaperSetConfig(
+                &Connection->Paths[i].PacerShaper,
+                Config->BandwidthBitsPerSecond,
+                Config->BurstWindowUsec,
+                NowUsec);
+        }
+
+        Status = QUIC_STATUS_SUCCESS;
+        break;
+    }
+
     case QUIC_PARAM_CONN_CLOSE_ASYNC:
         if (BufferLength != sizeof(BOOLEAN)) {
             Status = QUIC_STATUS_INVALID_PARAMETER;
@@ -7626,6 +7723,28 @@ QuicConnParamGet(
             sizeof(Connection->DSCP));
 
         *BufferLength = sizeof(Connection->DSCP);
+        Status = QUIC_STATUS_SUCCESS;
+        break;
+
+    case QUIC_PARAM_CONN_BANDWIDTH_SHAPER:
+
+        if (*BufferLength < sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG)) {
+            *BufferLength = sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG);
+            Status = QUIC_STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        if (Buffer == NULL) {
+            Status = QUIC_STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        *BufferLength = sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG);
+        ((QUIC_BANDWIDTH_SHAPER_CONFIG*)Buffer)->BandwidthBitsPerSecond =
+            Connection->BandwidthShaperBitsPerSecond;
+        ((QUIC_BANDWIDTH_SHAPER_CONFIG*)Buffer)->BurstWindowUsec =
+            Connection->BandwidthShaperBurstWindowUsec;
+
         Status = QUIC_STATUS_SUCCESS;
         break;
 

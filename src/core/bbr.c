@@ -615,6 +615,50 @@ BbrCongestionControlGetTargetCwnd(
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
+void
+BbrCongestionControlUpdatePacer(
+    _In_ QUIC_CONGESTION_CONTROL* Cc,
+    _In_ uint64_t NowUsec
+    )
+{
+    QUIC_CONGESTION_CONTROL_BBR* Bbr = &Cc->Bbr;
+
+    //
+    // Pacing rate in bits per second from the current bandwidth estimate and
+    // pacing gain (specs/bandwidth.md §27.2). The bandwidth filter stores
+    // BW_UNIT (8) x bytes/second, so dividing by BW_UNIT yields bytes/second
+    // and multiplying by BITS_PER_BYTE (8) converts to bits/second; the gain
+    // is scaled by GAIN_UNIT (256). Without the /BW_UNIT division the rate
+    // would be inflated 8x.
+    //
+    uint64_t BandwidthEst = BbrCongestionControlGetBandwidth(Cc);
+    uint64_t PacingRateBitsPerSec =
+        BandwidthEst / BW_UNIT * BITS_PER_BYTE * (uint64_t)Bbr->PacingGain / GAIN_UNIT;
+
+    //
+    // The burst window is set once, together with the first non-zero rate
+    // (§17/§25), and is never changed by the plugin afterwards: the current
+    // window is passed through on every subsequent configuration. The
+    // shaper stores the window verbatim in microseconds (as configured,
+    // §3.6), so the read-back is a plain field access.
+    //
+    uint64_t BurstWindowUsec = Cc->Pacer.BurstWindowUsec;
+    if (BurstWindowUsec == 0) {
+        BurstWindowUsec = QUIC_DEFAULT_PACING_BURST_WINDOW_USEC;
+    }
+
+    //
+    // Per §25 the return value is not consumed: on rejection (e.g. a
+    // degenerate zero rate, which cannot form a valid pair with a non-zero
+    // window) the shaper keeps its previous valid configuration — unlimited
+    // (i.e. the old un-paced room, capped by the quantum in
+    // GetSendAllowance) if the shaper was never configured.
+    //
+    QuicBandwidthShaperSetConfig(
+        &Cc->Pacer, PacingRateBitsPerSec, BurstWindowUsec, NowUsec);
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
 uint32_t
 BbrCongestionControlGetSendAllowance(
     _In_ QUIC_CONGESTION_CONTROL* Cc,
@@ -625,50 +669,58 @@ BbrCongestionControlGetSendAllowance(
     QUIC_CONNECTION* Connection = QuicCongestionControlGetConnection(Cc);
     QUIC_CONGESTION_CONTROL_BBR* Bbr = &Cc->Bbr;
 
-    uint64_t BandwidthEst = BbrCongestionControlGetBandwidth(Cc);
     uint32_t CongestionWindow = BbrCongestionControlGetCongestionWindow(Cc);
-
-    uint32_t SendAllowance = 0;
 
     if (Bbr->BytesInFlight >= CongestionWindow) {
         //
         // We are CC blocked, so we can't send anything.
         //
-        SendAllowance = 0;
+        return 0;
+    }
 
-    } else if (
-        !TimeSinceLastSendValid ||
+    if (!TimeSinceLastSendValid ||
         !Connection->Settings.PacingEnabled ||
         !Bbr->MinRttTimestampValid ||
         Bbr->MinRtt < QUIC_SEND_PACING_INTERVAL) {
         //
         // We're not in the necessary state to pace.
         //
-        SendAllowance = CongestionWindow - Bbr->BytesInFlight;
-
-    } else {
-        //
-        // We are pacing, so split the congestion window into chunks which are
-        // spread out over the RTT. Calculate the current send allowance (chunk
-        // size) as the time since the last send times the pacing rate (CWND / RTT).
-        //
-        if (Bbr->BbrState == BBR_STATE_STARTUP) {
-            SendAllowance = (uint32_t)CXPLAT_MAX(
-                BandwidthEst * Bbr->PacingGain * TimeSinceLastSend / GAIN_UNIT,
-                CongestionWindow * Bbr->PacingGain / GAIN_UNIT - Bbr->BytesInFlight);
-        } else {
-            SendAllowance = (uint32_t)(BandwidthEst * Bbr->PacingGain * TimeSinceLastSend / GAIN_UNIT);
-        }
-
-        if (SendAllowance > CongestionWindow - Bbr->BytesInFlight) {
-            SendAllowance = CongestionWindow - Bbr->BytesInFlight;
-        }
-
-        if (SendAllowance > (CongestionWindow >> 2)) {
-            SendAllowance = CongestionWindow >> 2; // Don't send more than a quarter of the current window.
-        }
+        return CongestionWindow - Bbr->BytesInFlight;
     }
-    return SendAllowance;
+
+    //
+    // We are pacing: the embedded bandwidth shaper (Cc->Pacer) decides how
+    // much can go out right now. The rate was configured by the last
+    // OnDataAcknowledged (BbrCongestionControlUpdatePacer, §25/§27.2: every
+    // pacing-gain and bandwidth-estimate update happens in that path), so
+    // here the shaper credit only needs to be capped by the send quantum (a
+    // quarter of the current window) and by the CC window room (§27.2).
+    //
+
+    //
+    // The caller's current monotonic moment (§2.1: time is injected, never
+    // read here). The send path (packet_builder.c) computed
+    // TimeSinceLastSend as CxPlatTimeDiff64(Send.LastFlushTime, TimeNow)
+    // from the LastFlushTime value that is still current inside this call
+    // (the send path updates it only after this call returns), and
+    // TimeSinceLastSendValid is guaranteed TRUE on this branch, so the
+    // current moment reconstructs exactly.
+    //
+    uint64_t NowUsec = Connection->Send.LastFlushTime + TimeSinceLastSend;
+
+    //
+    // Paths[0].Mtu (like Paths[0].SmoothedRtt elsewhere) diverges from the
+    // sending path's Mtu that loss detection debits with, but only for a
+    // strict-mode CC pacer (< ~5-6 Mbit/s) during path migration with
+    // differing MTUs.
+    //
+    return (uint32_t)CXPLAT_MIN(
+        QuicBandwidthShaperGetAllowance(
+            &Cc->Pacer, /*SizeBytes=*/0, NowUsec, Connection->Paths[0].Mtu)
+            .AllowedBytes,
+        CXPLAT_MIN(
+            (uint64_t)(CongestionWindow >> 2), // Quantum: don't send more than a quarter of the current window.
+            (uint64_t)(CongestionWindow - Bbr->BytesInFlight)));
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -896,6 +948,16 @@ BbrCongestionControlOnDataAcknowledged(
 
     BbrCongestionControlUpdateCongestionWindow(
         Cc, AckEvent->NumTotalAckedRetransmittableBytes, AckEvent->NumRetransmittableBytes);
+
+    //
+    // Every pacing-gain update (state machine transitions above, the PROBE_BW
+    // gain-cycle advance) and every bandwidth-estimate update (the bandwidth
+    // filter) happens in this path, so this is the single setpoint where the
+    // embedded shaper's rate is reconfigured (§25/§27.2). The implicit path
+    // above cannot change either the gain or the bandwidth estimate, so it
+    // does not reconfigure the shaper.
+    //
+    BbrCongestionControlUpdatePacer(Cc, AckEvent->TimeNow);
 
     if (Connection->Settings.NetStatsEventEnabled) {
         BbrCongestionControlIndicateConnectionEvent(Connection, Cc);

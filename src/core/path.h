@@ -39,6 +39,8 @@ typedef enum ECN_VALIDATION_STATE {
     ECN_VALIDATION_FAILED, // or not enabled by the app.
 } ECN_VALIDATION_STATE;
 
+#include "bandwidth_shaper.h"
+
 //
 // Represents all the per-path information of a connection.
 //
@@ -137,6 +139,16 @@ typedef struct QUIC_PATH {
     QUIC_MTU_DISCOVERY MtuDiscovery;
 
     //
+    // Per-path outbound bandwidth shaper (pacer). Limits how many bytes
+    // the packet builder may emit per flush and is debited after packets
+    // are actually sent. Initialized in QuicPathInitialize with the
+    // connection-wide rate configured via QUIC_PARAM_CONN_BANDWIDTH_SHAPER
+    // (specs/bandwidth.md §20, §21, §22). The shaper stores no Mtu: the
+    // path's packet size is passed per math call (§3.3).
+    //
+    QUIC_BANDWIDTH_SHAPER PacerShaper;
+
+    //
     // The binding used for sending/receiving UDP packets.
     //
     QUIC_BINDING* Binding;
@@ -199,8 +211,15 @@ typedef struct QUIC_PATH {
 #endif
 
 CXPLAT_STATIC_ASSERT(
-    sizeof(QUIC_PATH) < 256,
+    sizeof(QUIC_PATH) < 320,
     "Ensure path struct stays small since we prealloc them");
+//
+// 320 (was 256): the per-path bandwidth shaper (PacerShaper,
+// specs/bandwidth.md §20, phase 4) adds its full 32-byte budget
+// (§19.11) to each path entry. Paths is an inline array of
+// QUIC_MAX_PATH_COUNT (4) entries in QUIC_CONNECTION, so this costs
+// 128 extra bytes per connection.
+//
 
 _IRQL_requires_max_(PASSIVE_LEVEL)
 void
@@ -269,6 +288,106 @@ QuicPathGetDatagramPayloadSize(
     return
         MaxUdpPayloadSizeForFamily(
             QuicAddrGetFamily(&Path->Route.RemoteAddress), Path->Mtu);
+}
+
+//
+// Per-path bandwidth shaper cap for the packet builder (specs/bandwidth.md
+// §3.3/§3.4 applied by the caller, extended with the §16.3 hierarchy).
+// Limits the CC/amplification-limited allowance (WantedSize) by the
+// effective credit: min(child shaper credit, ParentsAllowedBytes). The
+// parent min joins the credit before the §3.3 MTU rounding, so the whole
+// §3.4 caller flow operates on Effective. ParentsAllowedBytes comes from
+// QuicConnBandwidthShaperGetParentsAllowance; pass UINT64_MAX when no
+// parents are installed (identity — bit-identical to the no-hierarchy
+// behavior). Partial packets are allowed only up to one Mtu; larger
+// requests are rounded down to whole packets of the path's Mtu — passed
+// PER CALL (Path->Mtu, DPLPMTUD/settings may change it; the shaper stores
+// no MTU) both to the shaper read and to the rounding branch. The parent
+// never chunks, §15.1. Returns the (possibly reduced) allowance
+// and sets *ShaperLimited when the shaper — not congestion control — was
+// the binding constraint. An inactive shaper (BandwidthBitsPerSecond == 0)
+// is a passthrough. (Only the AllowedBytes output of the single §9 read
+// is consumed here; SizeBytes = WantedSize keeps the paired DelayUsec
+// output meaningful — the recharge delay of exactly the wanted size —
+// while staying unused by this helper.)
+//
+QUIC_INLINE
+uint32_t
+QuicPathPacerLimitSendAllowance(
+    _In_ const QUIC_PATH* Path,
+    _In_ uint64_t NowUsec,
+    _In_ uint32_t WantedSize,
+    _In_ uint64_t ParentsAllowedBytes,
+    _Out_ BOOLEAN* ShaperLimited
+    )
+{
+    uint64_t AllowedBytes =
+        QuicBandwidthShaperGetAllowance(
+            &Path->PacerShaper, WantedSize, NowUsec, Path->Mtu).AllowedBytes;
+    if (ParentsAllowedBytes < AllowedBytes) {
+        //
+        // §16.3: an installed parent is an unconditional ceiling; the min
+        // joins at the credit level, before MTU rounding.
+        //
+        AllowedBytes = ParentsAllowedBytes;
+    }
+    uint64_t ToSend;
+    if (Path->Mtu == 0 || (uint64_t)WantedSize <= Path->Mtu) {
+        //
+        // Partial packet allowed; Mtu == 0 means chunking is disabled.
+        //
+        ToSend = AllowedBytes < (uint64_t)WantedSize ? AllowedBytes : (uint64_t)WantedSize;
+    } else {
+        //
+        // Whole packets only: floor(AllowedBytes / Mtu) * Mtu.
+        //
+        ToSend = (AllowedBytes / Path->Mtu) * Path->Mtu;
+        if (ToSend > (uint64_t)WantedSize) {
+            ToSend = WantedSize;
+        }
+    }
+    *ShaperLimited = ToSend < (uint64_t)WantedSize;
+    return (uint32_t)ToSend;
+}
+
+//
+// The "want" size used for the pacing backoff math: one whole packet of
+// the path MTU (1 byte when MTU chunking is disabled). Shared by the
+// per-path shaper's §9 delay output and the application-level parents'
+// delay (§16.3), so every installed level computes its recharge for the
+// same want.
+//
+QUIC_INLINE
+uint64_t
+QuicPathPacerGetWantSize(
+    _In_ const QUIC_PATH* Path
+    )
+{
+    return Path->Mtu != 0 ? Path->Mtu : 1;
+}
+
+//
+// Delay before the pacing flush should be retried when the per-path
+// shaper has no credit (specs/bandwidth.md §3.4/§9): the time until the
+// credit covers one more whole packet (QuicPathPacerGetWantSize; the
+// path's Mtu is passed per call, §3.3). Only the DelayUsec output of the
+// single §9 read is consumed here.
+// Clamped to uint32_t for QuicConnTimerSet.
+//
+QUIC_INLINE
+uint32_t
+QuicPathPacerGetDelayUsec(
+    _In_ const QUIC_PATH* Path,
+    _In_ uint64_t NowUsec
+    )
+{
+    uint64_t DelayUsec =
+        QuicBandwidthShaperGetAllowance(
+            &Path->PacerShaper,
+            QuicPathPacerGetWantSize(Path),
+            NowUsec,
+            Path->Mtu).DelayUsec;
+    return DelayUsec > UINT32_MAX ? UINT32_MAX : (uint32_t)DelayUsec;
 }
 
 typedef enum QUIC_PATH_VALID_REASON {

@@ -165,7 +165,6 @@ CubicCongestionControlReset(
     Cubic->HasHadCongestionEvent = FALSE;
     Cubic->CongestionWindow = DatagramPayloadLength * Cubic->InitialWindowPackets;
     Cubic->BytesInFlightMax = Cubic->CongestionWindow / 2;
-    Cubic->LastSendAllowance = 0;
     if (FullReset) {
         Cubic->BytesInFlight = 0;
     }
@@ -184,61 +183,106 @@ CubicCongestionControlGetSendAllowance(
 {
     QUIC_CONGESTION_CONTROL_CUBIC* Cubic = &Cc->Cubic;
 
-    uint32_t SendAllowance;
     QUIC_CONNECTION* Connection = QuicCongestionControlGetConnection(Cc);
     if (Cubic->BytesInFlight >= Cubic->CongestionWindow) {
         //
         // We are CC blocked, so we can't send anything.
         //
-        SendAllowance = 0;
+        return 0;
+    }
 
-    } else if (
-        !TimeSinceLastSendValid ||
+    if (!TimeSinceLastSendValid ||
         !Connection->Settings.PacingEnabled ||
         !Connection->Paths[0].GotFirstRttSample ||
         Connection->Paths[0].SmoothedRtt < QUIC_MIN_PACING_RTT) {
         //
         // We're not in the necessary state to pace.
         //
-        SendAllowance = Cubic->CongestionWindow - Cubic->BytesInFlight;
-
-    } else {
-
-        //
-        // We are pacing, so split the congestion window into chunks which are
-        // spread out over the RTT. Calculate the current send allowance (chunk
-        // size) as the time since the last send times the pacing rate (CWND / RTT).
-        //
-
-        //
-        // Since the window grows via ACK feedback and since we defer packets
-        // when pacing, using the current window to calculate the pacing
-        // interval can slow the growth of the window. So instead, use the
-        // predicted window of the next round trip. In slowstart, this is double
-        // the current window. In congestion avoidance the growth function is
-        // more complicated, and we use a simple estimate of 25% growth.
-        //
-        uint64_t EstimatedWnd;
-        if (Cubic->CongestionWindow < Cubic->SlowStartThreshold) {
-            EstimatedWnd = (uint64_t)Cubic->CongestionWindow << 1;
-            if (EstimatedWnd > Cubic->SlowStartThreshold) {
-                EstimatedWnd = Cubic->SlowStartThreshold;
-            }
-        } else {
-            EstimatedWnd = Cubic->CongestionWindow + (Cubic->CongestionWindow >> 2); // CongestionWindow * 1.25
-        }
-
-        SendAllowance =
-            Cubic->LastSendAllowance +
-            (uint32_t)((EstimatedWnd * TimeSinceLastSend) / Connection->Paths[0].SmoothedRtt);
-        if (SendAllowance < Cubic->LastSendAllowance || // Overflow case
-            SendAllowance > (Cubic->CongestionWindow - Cubic->BytesInFlight)) {
-            SendAllowance = Cubic->CongestionWindow - Cubic->BytesInFlight;
-        }
-
-        Cubic->LastSendAllowance = SendAllowance;
+        return Cubic->CongestionWindow - Cubic->BytesInFlight;
     }
-    return SendAllowance;
+
+    //
+    // We are pacing, so the embedded bandwidth shaper (Cc->Pacer) decides
+    // how much of the CC window room may go out right now: the pacing rate
+    // is (re)configured on every call from the current window estimate
+    // (specs/bandwidth.md §27.1) and the allowance is the shaper's credit
+    // clamped by the CC window room
+    // (QuicBandwidthShaperComputeSendAllowance, §13).
+    //
+
+    //
+    // Since the window grows via ACK feedback and since we defer packets
+    // when pacing, using the current window to calculate the pacing
+    // interval can slow the growth of the window. So instead, use the
+    // predicted window of the next round trip. In slowstart, this is double
+    // the current window. In congestion avoidance the growth function is
+    // more complicated, and we use a simple estimate of 25% growth.
+    //
+    uint64_t EstimatedWnd;
+    if (Cubic->CongestionWindow < Cubic->SlowStartThreshold) {
+        EstimatedWnd = (uint64_t)Cubic->CongestionWindow << 1;
+        if (EstimatedWnd > Cubic->SlowStartThreshold) {
+            EstimatedWnd = Cubic->SlowStartThreshold;
+        }
+    } else {
+        EstimatedWnd = Cubic->CongestionWindow + (Cubic->CongestionWindow >> 2); // CongestionWindow * 1.25
+    }
+
+    //
+    // Pacing rate in bits per second: the estimated window (bytes) divided
+    // by the smoothed RTT (microseconds), converted to bits/second (§27.1).
+    // EstimatedWnd * BITS_PER_BYTE * USEC_PER_SEC < 2^56, no overflow.
+    //
+    uint64_t PacingRateBitsPerSec =
+        EstimatedWnd * BITS_PER_BYTE * QUIC_BANDWIDTH_SHAPER_USEC_PER_SEC /
+        Connection->Paths[0].SmoothedRtt;
+
+    //
+    // The caller's current monotonic moment (§2.1: time is injected, never
+    // read here). The send path (packet_builder.c) computed
+    // TimeSinceLastSend as CxPlatTimeDiff64(Send.LastFlushTime, TimeNow)
+    // from the LastFlushTime value that is still current inside this call
+    // (the send path updates it only after this call returns), and
+    // TimeSinceLastSendValid is guaranteed TRUE on this branch, so the
+    // current moment reconstructs exactly.
+    //
+    uint64_t NowUsec = Connection->Send.LastFlushTime + TimeSinceLastSend;
+
+    //
+    // The burst window is set once, together with the first non-zero rate
+    // (§17/§25), and is never changed by the plugin afterwards: the current
+    // window is passed through on every subsequent configuration. The
+    // shaper stores the window verbatim in microseconds (as configured,
+    // §3.6), so the read-back is a plain field access.
+    //
+    uint64_t BurstWindowUsec = Cc->Pacer.BurstWindowUsec;
+    if (BurstWindowUsec == 0) {
+        BurstWindowUsec = QUIC_DEFAULT_PACING_BURST_WINDOW_USEC;
+    }
+
+    //
+    // Per §25 the return value is not consumed: on rejection (e.g. the
+    // window invariant cannot be verified yet, or a degenerate zero rate)
+    // the shaper keeps its previous valid configuration, and the allowance
+    // below degrades to that configuration — unlimited (i.e. the old
+    // un-paced room) if the shaper was never configured.
+    //
+    QuicBandwidthShaperSetConfig(
+        &Cc->Pacer, PacingRateBitsPerSec, BurstWindowUsec, NowUsec);
+
+    //
+    // The path's packet size is passed per call (§3.3): the embedded
+    // shaper stores no MTU. Paths[0].Mtu (like Paths[0].SmoothedRtt above)
+    // diverges from the sending path's Mtu that loss detection debits with,
+    // but only for a strict-mode CC pacer (< ~5-6 Mbit/s) during path
+    // migration with differing MTUs.
+    //
+    return QuicBandwidthShaperComputeSendAllowance(
+        &Cc->Pacer,
+        NowUsec,
+        Cubic->CongestionWindow,
+        Cubic->BytesInFlight,
+        Connection->Paths[0].Mtu);
 }
 
 //
@@ -382,12 +426,6 @@ CubicCongestionControlOnDataSent(
     if (Cubic->BytesInFlightMax < Cubic->BytesInFlight) {
         Cubic->BytesInFlightMax = Cubic->BytesInFlight;
         QuicSendBufferConnectionAdjust(QuicCongestionControlGetConnection(Cc));
-    }
-
-    if (NumRetransmittableBytes > Cubic->LastSendAllowance) {
-        Cubic->LastSendAllowance = 0;
-    } else {
-        Cubic->LastSendAllowance -= NumRetransmittableBytes;
     }
 
     if (Cubic->Exemptions > 0) {

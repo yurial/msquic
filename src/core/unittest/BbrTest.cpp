@@ -968,6 +968,8 @@ TEST_F(BbrTest_DeepTest, CanSend_WithExemptions)
 // Scenario: Sends CW bytes to fill the congestion window, then calls
 // GetSendAllowance with TimeSinceLastSend=1000 and SlowStartup=TRUE. When the
 // connection is congestion blocked (BytesInFlight >= CW), the allowance is 0.
+// The CC-blocked branch returns before any shaper interaction, so the
+// embedded Pacer (specs/bandwidth.md §27.2) stays unconfigured with no credit.
 //
 TEST_F(BbrTest_DeepTest, GetSendAllowance_CcBlocked)
 {
@@ -978,13 +980,18 @@ TEST_F(BbrTest_DeepTest, GetSendAllowance_CcBlocked)
 
     uint32_t Allowance = CC->QuicCongestionControlGetSendAllowance(CC, 1000, TRUE);
     ASSERT_EQ(Allowance, 0u);
+
+    // The shaper was never consulted: still unlimited (0, 0) with no credit.
+    ASSERT_EQ(CC->Pacer.BandwidthBitsPerSecond, 0ull);
+    ASSERT_EQ(CC->Pacer.CreditBaseTimeNsec, 0ull);
 }
 
 //
 // Test: GetSendAllowance - No Pacing With Invalid TimeSinceLastSend
 // Scenario: Sends 1000 bytes with pacing disabled, then calls GetSendAllowance with
 // TimeSinceLastSend=0 and SlowStartup=FALSE. Without pacing, the allowance is simply
-// CW - BytesInFlight regardless of timing.
+// CW - BytesInFlight regardless of timing, and the embedded shaper stays
+// unconfigured (§27.2: only the paced branch consults it).
 //
 TEST_F(BbrTest_DeepTest, GetSendAllowance_NoPacing_TimeSinceLastSendInvalid)
 {
@@ -994,13 +1001,17 @@ TEST_F(BbrTest_DeepTest, GetSendAllowance_NoPacing_TimeSinceLastSendInvalid)
     uint32_t Allowance = CC->QuicCongestionControlGetSendAllowance(CC, 0, FALSE);
     uint32_t CW = CC->QuicCongestionControlGetCongestionWindow(CC);
     ASSERT_EQ(Allowance, CW - 1000u);
+
+    ASSERT_EQ(CC->Pacer.BandwidthBitsPerSecond, 0ull);
+    ASSERT_EQ(CC->Pacer.CreditBaseTimeNsec, 0ull);
 }
 
 //
 // Test: GetSendAllowance - Pacing Disabled Falls Back to Window
 // Scenario: Initializes with PacingEnabled=FALSE, sends 1000 bytes, then calls
 // GetSendAllowance with TimeSinceLastSend=50000 and SlowStartup=TRUE. With pacing
-// disabled, allowance equals CW - BytesInFlight.
+// disabled, allowance equals CW - BytesInFlight and the shaper stays
+// unconfigured (§27.2).
 //
 TEST_F(BbrTest_DeepTest, GetSendAllowance_PacingDisabled)
 {
@@ -1010,6 +1021,9 @@ TEST_F(BbrTest_DeepTest, GetSendAllowance_PacingDisabled)
     uint32_t Allowance = CC->QuicCongestionControlGetSendAllowance(CC, 50000, TRUE);
     uint32_t CW = CC->QuicCongestionControlGetCongestionWindow(CC);
     ASSERT_EQ(Allowance, CW - 1000u);
+
+    ASSERT_EQ(CC->Pacer.BandwidthBitsPerSecond, 0ull);
+    ASSERT_EQ(CC->Pacer.CreditBaseTimeNsec, 0ull);
 }
 
 //
@@ -1397,12 +1411,29 @@ TEST_F(BbrTest_DeepTest, GetSendAllowance_CappedByQuarter)
 //
 // Test: GetSendAllowance - Non-STARTUP Pacing Formula in PROBE_BW
 // Scenario: Drives BBR to PROBE_BW state via DriveToBtlbwFound() with PacingEnabled=TRUE.
-// In PROBE_BW, the pacing gain cycle values are used. With BytesInFlight=0 and
-// TimeSinceLastSend=10000, the result is capped to CW >> 2.
+// In PROBE_BW the shaper's rate was configured by the last OnDataAcknowledged
+// (BbrCongestionControlUpdatePacer, §27.2) from the current bandwidth estimate
+// and pacing gain, so the paced allowance is the shaper's burst budget
+// (20000us of credit, pre-configured above the strict/normal boundary so
+// the proportional budget is the pre-configured window's at these low
+// rates) — below
+// the Cwnd>>2 quantum cap.
+// The cycle's gain is randomized in TransitToProbeBw, so the expectation is
+// derived from the gain actually configured; the result stays deterministic.
 //
 TEST_F(BbrTest_DeepTest, GetSendAllowance_NonStartupPacing)
 {
     InitializeWithDefaults(10, 1280, true);
+
+    // Pre-configure a burst window above the strict/normal boundary for
+    // the (low) PROBE_BW rates: NORMAL mode (§3.6) evaluates the
+    // proportional budget on the configured window, and a sub-packet
+    // budget would select the strict mode and change the expected budgets
+    // below; at 20'000 us the proportional budget is the pre-configured
+    // window's. The plugin passes the window through unchanged (§7.6).
+    ASSERT_EQ(
+        QUIC_STATUS_SUCCESS,
+        QuicBandwidthShaperSetConfig(&CC->Pacer, 8000000, 20000, 1000000));
 
     // Drive to PROBE_BW state with bandwidth and MinRtt established
     uint64_t TimeNow = DriveToBtlbwFound();
@@ -1417,9 +1448,100 @@ TEST_F(BbrTest_DeepTest, GetSendAllowance_NonStartupPacing)
 
     ASSERT_EQ(Bbr->BbrState, (uint32_t)BBR_STATE_PROBE_BW);
 
+    // The last OnDataAcknowledged configured the shaper from the current
+    // bandwidth estimate (960000 = BW_UNIT x bytes/s => 960000 bits/s after
+    // /BW_UNIT * BITS_PER_BYTE) and the current cycle gain.
+    uint64_t ExpectedRate = 960000ull / 8 * 8 * Bbr->PacingGain / 256;
+    ASSERT_EQ(CC->Pacer.BandwidthBitsPerSecond, ExpectedRate);
+    ASSERT_EQ(CC->Pacer.BurstWindowUsec, (uint64_t)20000); // stored as configured
+
+    // Paced allowance = burst budget = 20000us * rate / 8e6 bytes, below
+    // the Cwnd>>2 cap. Time is injected via LastFlushTime (kept 0 by the
+    // mock).
+    Connection.Send.LastFlushTime = TimeNow;
     uint32_t Allowance = CC->QuicCongestionControlGetSendAllowance(CC, 10000, TRUE);
-    uint32_t CW = CC->QuicCongestionControlGetCongestionWindow(CC);
-    ASSERT_EQ(Allowance, CW >> 2);
+    uint64_t ExpectedAllowance = 20000ull * ExpectedRate / (8ull * 1000000ull);
+    ASSERT_EQ(Allowance, (uint32_t)ExpectedAllowance);
+}
+
+//
+// Test: §35 case 30 (BBR analogue) — GetSendAllowance leaves the shaper
+// credit untouched
+// Scenario: A paced GetSendAllowance call reads the shaper's credit but must
+// not modify Pacer.CreditBaseTimeNsec; only a registered send (through the
+// QuicCongestionControlOnDataSent wrapper) advances it.
+//
+TEST_F(BbrTest_DeepTest, GetSendAllowance_DoesNotTouchPacerCredit)
+{
+    InitializeWithDefaults(10, 1280, true); // PacingEnabled = TRUE
+
+    // Establish MinRtt=5000us and a bandwidth sample of 8'000'000
+    // (BW_UNIT x bytes/s = 1'000'000 B/s). The ack path (UpdatePacer)
+    // configures the shaper at rate = 8'000'000/8*8*739/256 = 23'093'750
+    // bits/s with the default 2000us burst window.
+    PumpBandwidthSample(1050000, 1, 1200, 1000000, 5000);
+    ASSERT_EQ(CC->Pacer.BandwidthBitsPerSecond, 8000000ull * 739 / 256);
+    ASSERT_EQ(CC->Pacer.BurstWindowUsec, (uint64_t)2000);
+    ASSERT_EQ(CC->Pacer.CreditBaseTimeNsec, 0ull);
+
+    // Paced allowance: min(burst budget 5773, Quantum Cwnd>>2 = 3380,
+    // Cwnd room) = 3380. The read does not touch the credit base.
+    ASSERT_EQ(CC->QuicCongestionControlGetSendAllowance(CC, 1000000, TRUE), 3380u);
+    ASSERT_EQ(CC->Pacer.CreditBaseTimeNsec, 0ull);
+
+    // Only the registered send advances the timestamp: 1200 bytes take
+    // 1200 * 8e9 / 23093750 = 415'696 ns, so CreditBaseTimeNsec =
+    // max(0, 1e9 - 2e6) + 415'696 = 998'415'696.
+    QuicCongestionControlOnDataSent(CC, 1200, 1000000, Connection.Paths[0].Mtu);
+    ASSERT_EQ(CC->Pacer.CreditBaseTimeNsec, 998415696ull);
+}
+
+//
+// Test: §35 case 31 (BBR analogue) — two GetSendAllowance + OnDataSent ticks
+// spaced by 8 * Cwnd * 1e6 / B microseconds re-arm without delay
+// Scenario: With a clean rate B = 8'000'000 bits/s (1 byte/us) and the
+// default 2000us burst window, the shaper's budget is 2000 bytes. The §35
+// interval for Cwnd = 13520 is 8 * 13520 * 1e6 / 8e6 = 13520us. Both ticks
+// yield exactly the burst budget with zero extra delay.
+//
+// Note: §35 case 31's literal "Cwnd/2" expectation applies to Cubic, whose
+// paced allowance has no quantum cap; BBR's paced allowance is structurally
+// capped at Cwnd>>2 (Quantum, §27.2), so the adapted assertion is the exact
+// burst budget on both ticks.
+//
+TEST_F(BbrTest_DeepTest, GetSendAllowance_TwoTickRhythm_BurstBudgetRearms)
+{
+    InitializeWithDefaults(10, 1280, true); // PacingEnabled = TRUE
+
+    // Establish the paced state (MinRtt valid) and then override the shaper
+    // with a clean rate for exact arithmetic: 8'000'000 bits/s = 1 byte/us.
+    PumpBandwidthSample(1050000, 1, 1200, 1000000, 5000);
+    TEST_QUIC_SUCCEEDED(
+        QuicBandwidthShaperSetConfig(&CC->Pacer, 8000000, 2000, 1050000));
+
+    uint32_t Cwnd = Bbr->CongestionWindow; // 13520
+    ASSERT_EQ(Cwnd, 13520u);
+    ASSERT_EQ(Bbr->BytesInFlight, 0u);
+
+    // Tick 1: burst budget (2000), below the Quantum cap (3380).
+    const uint64_t Now1 = 1050000;
+    uint32_t Allowance1 = CC->QuicCongestionControlGetSendAllowance(CC, Now1, TRUE);
+    ASSERT_EQ(Allowance1, 2000u);
+
+    // Send the allowance through the production debit path: 2000 bytes at
+    // 1 byte/us take exactly 2000us, so the credit base moves to
+    // max(0, 1'048'000'000) + 2'000'000 = 1'050'000'000 (ns).
+    QuicCongestionControlOnDataSent(CC, Allowance1, Now1, Connection.Paths[0].Mtu);
+    ASSERT_EQ(CC->Pacer.CreditBaseTimeNsec, 1050000000ull);
+
+    // Tick 2 at exactly Now1 + 8*Cwnd*1e6/B = Now1 + 13520us: the burst
+    // budget has fully re-armed — the rhythm holds with no extra delay.
+    const uint64_t Now2 = Now1 + (uint64_t)Cwnd * BITS_PER_BYTE *
+                                  QUIC_BANDWIDTH_SHAPER_USEC_PER_SEC /
+                                  CC->Pacer.BandwidthBitsPerSecond;
+    ASSERT_EQ(Now2, 1063520ull);
+    uint32_t Allowance2 = CC->QuicCongestionControlGetSendAllowance(CC, Now2, TRUE);
+    ASSERT_EQ(Allowance2, 2000u);
 }
 
 TEST_F(BbrTest_DeepTest, Initialize_DefaultState)
@@ -1778,6 +1900,16 @@ TEST_F(BbrTest_DeepTest, SetSendQuantum_MediumPacingRate)
     //
     const uint16_t DPL = QuicPathGetDatagramPayloadSize(&Connection.Paths[0]);
     ASSERT_EQ(Bbr->SendQuantum, (uint64_t)(DPL * 2));
+
+    //
+    // §27.2: the same pacing rate is now held by the embedded shaper,
+    // configured by OnDataAcknowledged (UpdatePacer) at the ack:
+    // rate = BW / BW_UNIT * BITS_PER_BYTE * PacingGain / GAIN_UNIT
+    //      = 5000000 / 8 * 8 * 739 / 256 = 14'433'593 bits/s.
+    //
+    ASSERT_EQ(CC->Pacer.BandwidthBitsPerSecond, 5000000ull * 739 / 256);
+    ASSERT_EQ(CC->Pacer.BandwidthBitsPerSecond, 14433593ull);
+    ASSERT_EQ(CC->Pacer.BurstWindowUsec, (uint64_t)2000); // default window, set with the first rate
 }
 
 //
@@ -1819,6 +1951,14 @@ TEST_F(BbrTest_DeepTest, SetSendQuantum_HighPacingRate)
     // → high pacing rate path → SendQuantum = min(288671875*1000/8, 65536) = 65536
     //
     ASSERT_EQ(Bbr->SendQuantum, (uint64_t)65536);
+
+    //
+    // §27.2: the shaper holds the same pacing rate, configured by
+    // OnDataAcknowledged (UpdatePacer) at the ack:
+    // rate = 100000000 / 8 * 8 * 739 / 256 = 288'671'875 bits/s.
+    //
+    ASSERT_EQ(CC->Pacer.BandwidthBitsPerSecond, 100000000ull * 739 / 256);
+    ASSERT_EQ(CC->Pacer.BandwidthBitsPerSecond, 288671875ull);
 }
 
 //

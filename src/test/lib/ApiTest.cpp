@@ -3046,6 +3046,110 @@ void QuicTestGlobalParam()
         TEST_TRUE(Length >= sizeof(Expected));
     }
 
+    //
+    // QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER
+    //
+    {
+        TestScopeLogger LogScope0("QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER");
+        //
+        // GetParam default (0, 0); the length contract requires the exact
+        // size (§15.2).
+        //
+        {
+            TestScopeLogger LogScope1("GetParam default");
+            QUIC_BANDWIDTH_SHAPER_CONFIG Value = {1, 1};
+            uint32_t Length = sizeof(Value) - 8;
+            TEST_QUIC_STATUS(
+                QUIC_STATUS_INVALID_PARAMETER,
+                MsQuic->GetParam(
+                    nullptr,
+                    QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER,
+                    &Length,
+                    &Value));
+            Length = sizeof(Value);
+            TEST_QUIC_SUCCEEDED(
+                MsQuic->GetParam(
+                    nullptr,
+                    QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER,
+                    &Length,
+                    &Value));
+            TEST_EQUAL(Length, sizeof(Value));
+            TEST_EQUAL(Value.BandwidthBitsPerSecond, 0ull);
+            TEST_EQUAL(Value.BurstWindowUsec, 0ull);
+        }
+        //
+        // SetParam rejections: (0, W>0), the overflowing (UINT64_MAX, 2)
+        // pair, and a wrong length (§3.6 / §15.2).
+        //
+        {
+            TestScopeLogger LogScope1("SetParam rejections");
+            QUIC_BANDWIDTH_SHAPER_CONFIG Bad = {0, 1000};
+            TEST_QUIC_STATUS(
+                QUIC_STATUS_INVALID_PARAMETER,
+                MsQuic->SetParam(
+                    nullptr,
+                    QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER,
+                    sizeof(Bad),
+                    &Bad));
+            Bad.BandwidthBitsPerSecond = UINT64_MAX;
+            Bad.BurstWindowUsec = 2;
+            TEST_QUIC_STATUS(
+                QUIC_STATUS_INVALID_PARAMETER,
+                MsQuic->SetParam(
+                    nullptr,
+                    QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER,
+                    sizeof(Bad),
+                    &Bad));
+            TEST_QUIC_STATUS(
+                QUIC_STATUS_INVALID_PARAMETER,
+                MsQuic->SetParam(
+                    nullptr,
+                    QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER,
+                    sizeof(Bad) - 8,
+                    &Bad));
+        }
+        //
+        // Round trip, then uninstall via SET (0, 0).
+        //
+        {
+            TestScopeLogger LogScope1("SetParam/GetParam round trip and uninstall");
+            QUIC_BANDWIDTH_SHAPER_CONFIG Config = {8000000, 2000};
+            TEST_QUIC_SUCCEEDED(
+                MsQuic->SetParam(
+                    nullptr,
+                    QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER,
+                    sizeof(Config),
+                    &Config));
+            QUIC_BANDWIDTH_SHAPER_CONFIG Value = {0, 0};
+            uint32_t Length = sizeof(Value);
+            TEST_QUIC_SUCCEEDED(
+                MsQuic->GetParam(
+                    nullptr,
+                    QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER,
+                    &Length,
+                    &Value));
+            TEST_EQUAL(Length, sizeof(Value));
+            TEST_EQUAL(Value.BandwidthBitsPerSecond, Config.BandwidthBitsPerSecond);
+            TEST_EQUAL(Value.BurstWindowUsec, Config.BurstWindowUsec);
+            QUIC_BANDWIDTH_SHAPER_CONFIG Unlimited = {0, 0};
+            TEST_QUIC_SUCCEEDED(
+                MsQuic->SetParam(
+                    nullptr,
+                    QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER,
+                    sizeof(Unlimited),
+                    &Unlimited));
+            Length = sizeof(Value);
+            TEST_QUIC_SUCCEEDED(
+                MsQuic->GetParam(
+                    nullptr,
+                    QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER,
+                    &Length,
+                    &Value));
+            TEST_EQUAL(Value.BandwidthBitsPerSecond, 0ull);
+            TEST_EQUAL(Value.BurstWindowUsec, 0ull);
+        }
+    }
+
     QuicTestStatefulGlobalSetParam();
 }
 
@@ -3594,6 +3698,114 @@ void QuicTestConfigurationParam()
         }
     }
 #endif
+
+    //
+    // QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER
+    //
+    {
+        TestScopeLogger LogScope0("QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER");
+        //
+        // GetParam default (0, 0); the length contract requires the exact
+        // size (§15.2).
+        //
+        {
+            TestScopeLogger LogScope1("GetParam default");
+            MsQuicConfiguration Configuration(Registration, Alpn);
+            QUIC_BANDWIDTH_SHAPER_CONFIG Value = {1, 1};
+            uint32_t Length = sizeof(Value) + 8;
+            TEST_QUIC_STATUS(
+                QUIC_STATUS_INVALID_PARAMETER,
+                MsQuic->GetParam(
+                    Configuration.Handle,
+                    QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER,
+                    &Length,
+                    &Value));
+            Length = sizeof(Value);
+            TEST_QUIC_SUCCEEDED(
+                MsQuic->GetParam(
+                    Configuration.Handle,
+                    QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER,
+                    &Length,
+                    &Value));
+            TEST_EQUAL(Length, sizeof(Value));
+            TEST_EQUAL(Value.BandwidthBitsPerSecond, 0ull);
+            TEST_EQUAL(Value.BurstWindowUsec, 0ull);
+        }
+        //
+        // SetParam rejections: (0, W>0), the overflowing (UINT64_MAX, 2)
+        // pair, and a wrong length (§3.6 / §15.2).
+        //
+        {
+            TestScopeLogger LogScope1("SetParam rejections");
+            MsQuicConfiguration Configuration(Registration, Alpn);
+            QUIC_BANDWIDTH_SHAPER_CONFIG Bad = {0, 1000};
+            TEST_QUIC_STATUS(
+                QUIC_STATUS_INVALID_PARAMETER,
+                MsQuic->SetParam(
+                    Configuration.Handle,
+                    QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER,
+                    sizeof(Bad),
+                    &Bad));
+            Bad.BandwidthBitsPerSecond = UINT64_MAX;
+            Bad.BurstWindowUsec = 2;
+            TEST_QUIC_STATUS(
+                QUIC_STATUS_INVALID_PARAMETER,
+                MsQuic->SetParam(
+                    Configuration.Handle,
+                    QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER,
+                    sizeof(Bad),
+                    &Bad));
+            TEST_QUIC_STATUS(
+                QUIC_STATUS_INVALID_PARAMETER,
+                MsQuic->SetParam(
+                    Configuration.Handle,
+                    QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER,
+                    sizeof(Bad) + 8,
+                    &Bad));
+        }
+        //
+        // Round trip, then uninstall via SET (0, 0). Each configuration
+        // has an independent parent state.
+        //
+        {
+            TestScopeLogger LogScope1("SetParam/GetParam round trip and uninstall");
+            MsQuicConfiguration Configuration(Registration, Alpn);
+            QUIC_BANDWIDTH_SHAPER_CONFIG Config = {8000000, 2000};
+            TEST_QUIC_SUCCEEDED(
+                MsQuic->SetParam(
+                    Configuration.Handle,
+                    QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER,
+                    sizeof(Config),
+                    &Config));
+            QUIC_BANDWIDTH_SHAPER_CONFIG Value = {0, 0};
+            uint32_t Length = sizeof(Value);
+            TEST_QUIC_SUCCEEDED(
+                MsQuic->GetParam(
+                    Configuration.Handle,
+                    QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER,
+                    &Length,
+                    &Value));
+            TEST_EQUAL(Length, sizeof(Value));
+            TEST_EQUAL(Value.BandwidthBitsPerSecond, Config.BandwidthBitsPerSecond);
+            TEST_EQUAL(Value.BurstWindowUsec, Config.BurstWindowUsec);
+            QUIC_BANDWIDTH_SHAPER_CONFIG Unlimited = {0, 0};
+            TEST_QUIC_SUCCEEDED(
+                MsQuic->SetParam(
+                    Configuration.Handle,
+                    QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER,
+                    sizeof(Unlimited),
+                    &Unlimited));
+            Length = sizeof(Value);
+            TEST_QUIC_SUCCEEDED(
+                MsQuic->GetParam(
+                    Configuration.Handle,
+                    QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER,
+                    &Length,
+                    &Value));
+            TEST_EQUAL(Value.BandwidthBitsPerSecond, 0ull);
+            TEST_EQUAL(Value.BurstWindowUsec, 0ull);
+        }
+    }
 }
 
 // Used by Listener and Connection
@@ -5237,6 +5449,216 @@ void QuicTest_QUIC_PARAM_CONN_SEND_DSCP(MsQuicRegistration& Registration)
     }
 }
 
+void QuicTest_QUIC_PARAM_CONN_BANDWIDTH_SHAPER(MsQuicRegistration& Registration)
+{
+    TestScopeLogger LogScope0("QUIC_PARAM_CONN_BANDWIDTH_SHAPER");
+    {
+        TestScopeLogger LogScope1("GetParam default (0, 0)");
+        MsQuicConnection Connection(Registration);
+        TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
+        uint32_t Length = 0;
+        TEST_QUIC_STATUS(
+            QUIC_STATUS_BUFFER_TOO_SMALL,
+            Connection.GetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                &Length,
+                nullptr));
+        TEST_EQUAL(Length, sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG));
+        TEST_QUIC_STATUS(
+            QUIC_STATUS_INVALID_PARAMETER,
+            Connection.GetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                &Length,
+                nullptr)); // correct length, null buffer
+        QUIC_BANDWIDTH_SHAPER_CONFIG Value = {0, 0};
+        Length = sizeof(Value);
+        TEST_QUIC_SUCCEEDED(
+            Connection.GetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                &Length,
+                &Value));
+        TEST_EQUAL(Length, sizeof(Value));
+        TEST_EQUAL(Value.BandwidthBitsPerSecond, 0ull);
+        TEST_EQUAL(Value.BurstWindowUsec, 0ull);
+    }
+    {
+        TestScopeLogger LogScope1("SetParam wrong length or null buffer");
+        MsQuicConnection Connection(Registration);
+        TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
+        uint64_t Dummy[3] = {8000000, 1000, 0};
+        TEST_QUIC_STATUS(
+            QUIC_STATUS_INVALID_PARAMETER,
+            Connection.SetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                sizeof(Dummy[0]), // too small
+                &Dummy));
+        TEST_QUIC_STATUS(
+            QUIC_STATUS_INVALID_PARAMETER,
+            Connection.SetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                sizeof(Dummy), // too big
+                &Dummy));
+        TEST_QUIC_STATUS(
+            QUIC_STATUS_INVALID_PARAMETER,
+            Connection.SetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG),
+                nullptr)); // null buffer
+    }
+    {
+        TestScopeLogger LogScope1("SetParam (0, W>0) rejected (§3.6)");
+        MsQuicConnection Connection(Registration);
+        TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
+        QUIC_BANDWIDTH_SHAPER_CONFIG Config = {0, 1000};
+        TEST_QUIC_STATUS(
+            QUIC_STATUS_INVALID_PARAMETER,
+            Connection.SetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                sizeof(Config),
+                &Config));
+        //
+        // The rejected SET must not change the default (0, 0).
+        //
+        QUIC_BANDWIDTH_SHAPER_CONFIG Value = {1, 1};
+        uint32_t Length = sizeof(Value);
+        TEST_QUIC_SUCCEEDED(
+            Connection.GetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                &Length,
+                &Value));
+        TEST_EQUAL(Value.BandwidthBitsPerSecond, 0ull);
+        TEST_EQUAL(Value.BurstWindowUsec, 0ull);
+    }
+    {
+        TestScopeLogger LogScope1("SetParam overflowing pair rejected (§3.6)");
+        MsQuicConnection Connection(Registration);
+        TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
+        QUIC_BANDWIDTH_SHAPER_CONFIG Config;
+        Config.BandwidthBitsPerSecond = UINT64_MAX;
+        Config.BurstWindowUsec = 2; // NORMAL-mode ns combination bound: W <= UINT64_MAX / B / 1'000 == 0
+        TEST_QUIC_STATUS(
+            QUIC_STATUS_INVALID_PARAMETER,
+            Connection.SetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                sizeof(Config),
+                &Config));
+    }
+    {
+        TestScopeLogger LogScope1("SetParam strict pair accepted, GetParam echoes raw value");
+        MsQuicConnection Connection(Registration);
+        TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
+        //
+        // Strict pair (§3.2/§3.6): W = 0 at B = 8 Mbit/s configures no
+        // burst. Consumers that pass a packet size per call (the
+        // per-connection shaper gets the current path MTU) pace exactly
+        // one MTU-sized packet per debit interval and nothing in between;
+        // consumers without a packet size (the parent shapers) run the
+        // continuous-rate credit model. The pair is valid at any current
+        // time, and the configured value is stored AS CONFIGURED: GET
+        // echoes the raw 0.
+        //
+        QUIC_BANDWIDTH_SHAPER_CONFIG Strict = {8000000, 0};
+        TEST_QUIC_SUCCEEDED(
+            Connection.SetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                sizeof(Strict),
+                &Strict));
+        QUIC_BANDWIDTH_SHAPER_CONFIG Value = {0, 0};
+        uint32_t Length = sizeof(Value);
+        TEST_QUIC_SUCCEEDED(
+            Connection.GetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                &Length,
+                &Value));
+        TEST_EQUAL(Length, sizeof(Value));
+        TEST_EQUAL(Value.BandwidthBitsPerSecond, Strict.BandwidthBitsPerSecond);
+        TEST_EQUAL(Value.BurstWindowUsec, 0ull);
+    }
+    {
+        TestScopeLogger LogScope1("SetParam sub-minimum pair echoed raw");
+        MsQuicConnection Connection(Registration);
+        TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
+        //
+        // A sub-minimum (but valid) pair is stored and echoed verbatim:
+        // SET {8000000, 1499} -> GET {8000000, 1499}. For a consumer
+        // pacing 1500-byte packets the budget stays below one packet, so
+        // the pair selects the strict one-packet-per-interval behavior
+        // (§3.2 — the mode is a use-time property of the per-call packet
+        // size).
+        //
+        QUIC_BANDWIDTH_SHAPER_CONFIG SubMin = {8000000, 1499};
+        TEST_QUIC_SUCCEEDED(
+            Connection.SetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                sizeof(SubMin),
+                &SubMin));
+        QUIC_BANDWIDTH_SHAPER_CONFIG Value = {0, 0};
+        uint32_t Length = sizeof(Value);
+        TEST_QUIC_SUCCEEDED(
+            Connection.GetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                &Length,
+                &Value));
+        TEST_EQUAL(Value.BandwidthBitsPerSecond, SubMin.BandwidthBitsPerSecond);
+        TEST_EQUAL(Value.BurstWindowUsec, SubMin.BurstWindowUsec);
+    }
+    {
+        TestScopeLogger LogScope1("SetParam realistic pair, rejections, uninstall");
+        MsQuicConnection Connection(Registration);
+        TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
+        QUIC_BANDWIDTH_SHAPER_CONFIG Config = {8000000, 2000}; // 8 Mbit/s, 2 ms burst
+        TEST_QUIC_SUCCEEDED(
+            Connection.SetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                sizeof(Config),
+                &Config));
+        QUIC_BANDWIDTH_SHAPER_CONFIG Value = {0, 0};
+        uint32_t Length = sizeof(Value);
+        TEST_QUIC_SUCCEEDED(
+            Connection.GetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                &Length,
+                &Value));
+        TEST_EQUAL(Length, sizeof(Value));
+        TEST_EQUAL(Value.BandwidthBitsPerSecond, Config.BandwidthBitsPerSecond);
+        TEST_EQUAL(Value.BurstWindowUsec, Config.BurstWindowUsec);
+        //
+        // Rejected SET must not change the previously stored pair
+        // (apply-or-nothing, §7).
+        //
+        QUIC_BANDWIDTH_SHAPER_CONFIG Bad = {0, 1000};
+        TEST_QUIC_STATUS(
+            QUIC_STATUS_INVALID_PARAMETER,
+            Connection.SetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                sizeof(Bad),
+                &Bad));
+        TEST_QUIC_SUCCEEDED(
+            Connection.GetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                &Length,
+                &Value));
+        TEST_EQUAL(Value.BandwidthBitsPerSecond, Config.BandwidthBitsPerSecond);
+        TEST_EQUAL(Value.BurstWindowUsec, Config.BurstWindowUsec);
+        //
+        // SET (0, 0) removes the limit (uninstall) and round-trips.
+        //
+        QUIC_BANDWIDTH_SHAPER_CONFIG Unlimited = {0, 0};
+        TEST_QUIC_SUCCEEDED(
+            Connection.SetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                sizeof(Unlimited),
+                &Unlimited));
+        TEST_QUIC_SUCCEEDED(
+            Connection.GetParam(
+                QUIC_PARAM_CONN_BANDWIDTH_SHAPER,
+                &Length,
+                &Value));
+        TEST_EQUAL(Value.BandwidthBitsPerSecond, 0ull);
+        TEST_EQUAL(Value.BurstWindowUsec, 0ull);
+    }
+}
+
 void QuicTest_QUIC_PARAM_CONN_NETWORK_STATISTICS(MsQuicRegistration& Registration)
 {
 #ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
@@ -5337,6 +5759,7 @@ void QuicTestConnectionParam()
     QuicTest_QUIC_PARAM_CONN_STATISTICS_V2_PLAT(Registration);
     QuicTest_QUIC_PARAM_CONN_ORIG_DEST_CID(Registration, ClientConfiguration);
     QuicTest_QUIC_PARAM_CONN_SEND_DSCP(Registration);
+    QuicTest_QUIC_PARAM_CONN_BANDWIDTH_SHAPER(Registration);
     QuicTest_QUIC_PARAM_CONN_NETWORK_STATISTICS(Registration);
     QuicTest_QUIC_PARAM_CONN_CLOSE_ASYNC(Registration);
 }

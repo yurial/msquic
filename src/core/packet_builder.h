@@ -151,6 +151,29 @@ typedef struct QUIC_PACKET_BUILDER {
     //
     uint32_t SendAllowance;
 
+    //
+    // Set by QuicPacketBuilderInitialize when the per-path bandwidth
+    // shaper (Path->PacerShaper, specs/bandwidth.md §3.4) — not congestion
+    // control — reduced SendAllowance. The send loop uses it to schedule
+    // the pacing timer for exactly the shaper's recharge delay (§9)
+    // instead of the fixed pacing interval.
+    //
+    BOOLEAN PacingShaperLimited;
+
+    //
+    // Set by QuicPacketBuilderInitialize when an application-level parent
+    // shaper (library/configuration, §16.3) participates in the allowance
+    // cap: the max §9 recharge delay (usec) over the installed parents
+    // for one whole packet (QuicPathPacerGetWantSize), computed from the
+    // same leaf-lock snapshot and the same TimeNow as the parents'
+    // allowance min. The send loop takes the max of this and the child's
+    // own §9 delay for the pacing backoff, so a parent-bound flush waits
+    // for the parent's exact replenishment moment instead of spinning on
+    // the timer tick. 0 when no parents are installed — the child-only
+    // backoff is unchanged.
+    //
+    uint32_t PacingParentDelayUsec;
+
     uint64_t BatchId;
 
     //

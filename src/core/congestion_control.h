@@ -5,8 +5,13 @@
 
 --*/
 
+#include "bandwidth_shaper.h"
 #include "bbr.h"
 #include "cubic.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
 
 typedef struct QUIC_ACK_EVENT {
 
@@ -169,6 +174,16 @@ typedef struct QUIC_CONGESTION_CONTROL {
         QUIC_CONGESTION_CONTROL_BBR Bbr;
     };
 
+    //
+    // Embedded bandwidth shaper (pacer). Initialized unlimited with the
+    // default (0, 0) pair by QuicCongestionControlInitialize; a plugin opts
+    // in by configuring it via QuicBandwidthShaperSetConfig
+    // (specs/bandwidth.md §17, §24). While BandwidthBitsPerSecond == 0 every
+    // shaper operation is a cheap no-op, so existing congestion control
+    // behavior is unchanged.
+    //
+    QUIC_BANDWIDTH_SHAPER Pacer;
+
 } QUIC_CONGESTION_CONTROL;
 
 
@@ -250,6 +265,12 @@ QuicCongestionControlReset(
     )
 {
     Cc->QuicCongestionControlReset(Cc, FullReset);
+    //
+    // Forget the shaper's credit (CreditBaseTimeNsec := 0) while keeping
+    // its validated configuration, for both FullReset modes
+    // (specs/bandwidth.md §17).
+    //
+    QuicBandwidthShaperReset(&Cc->Pacer);
 }
 
 //
@@ -268,17 +289,29 @@ QuicCongestionControlGetSendAllowance(
 }
 
 //
-// Called when any retransmittable data is sent.
+// Called when any retransmittable data is sent. NowUsec is the monotonic
+// send time (microseconds) injected by the send-path caller, which already
+// holds it; Mtu is the sending path's packet size per call (Path->Mtu at
+// the loss-detection debit site; the shaper stores no MTU, §3.3 of
+// specs/bandwidth.md). Neither the shaper nor the CC layer reads the
+// system clock (specs/bandwidth.md §14).
 //
 _IRQL_requires_max_(PASSIVE_LEVEL)
 QUIC_INLINE
 void
 QuicCongestionControlOnDataSent(
     _In_ QUIC_CONGESTION_CONTROL* Cc,
-    _In_ uint32_t NumRetransmittableBytes
+    _In_ uint32_t NumRetransmittableBytes,
+    _In_ uint64_t NowUsec, // microsec
+    _In_ uint16_t Mtu
     )
 {
     Cc->QuicCongestionControlOnDataSent(Cc, NumRetransmittableBytes);
+    //
+    // Debit the send from the embedded shaper's credit. A no-op while the
+    // shaper is unlimited (BandwidthBitsPerSecond == 0) (§10, §14).
+    //
+    QuicBandwidthShaperRegisterSend(&Cc->Pacer, NumRetransmittableBytes, NowUsec, Mtu);
 }
 
 //
@@ -412,3 +445,7 @@ QuicCongestionControlSetAppLimited(
 {
     Cc->QuicCongestionControlSetAppLimited(Cc);
 }
+
+#if defined(__cplusplus)
+}
+#endif

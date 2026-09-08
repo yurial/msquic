@@ -84,6 +84,14 @@ MsQuicConfigurationOpen(
     Configuration->ClientContext = Context;
     Configuration->Registration = Registration;
     CxPlatRefInitialize(&Configuration->RefCount);
+
+    //
+    // Application-level parent shaper, configuration level (§16.1):
+    // default (0, 0) = "not installed"; lives for the lifetime of the
+    // configuration.
+    //
+    QuicBandwidthShaperParentInitialize(&Configuration->BandwidthShaper);
+
 #if DEBUG
     CxPlatRefInitializeMultiple(Configuration->RefTypeBiasedCount, QUIC_CONF_REF_COUNT);
     CxPlatRefIncrement(&Configuration->RefTypeBiasedCount[QUIC_CONF_REF_HANDLE]);
@@ -267,6 +275,8 @@ QuicConfigurationUninitialize(
 #endif
 
     QuicSettingsCleanup(&Configuration->Settings);
+
+    QuicBandwidthShaperParentUninitialize(&Configuration->BandwidthShaper);
 
     QuicRegistrationRundownRelease(Configuration->Registration, QUIC_REG_REF_CONFIGURATION);
 
@@ -471,6 +481,28 @@ QuicConfigurationParamGet(
         return QUIC_STATUS_SUCCESS;
     }
 
+    if (Param == QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER) {
+
+        //
+        // §15.2: the buffer must be exactly sizeof the config structure;
+        // any length mismatch is INVALID_PARAMETER (not BUFFER_TOO_SMALL).
+        // Default (no SET yet) is the all-zero (0, 0) pair.
+        //
+        if (*BufferLength != sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG)) {
+            return QUIC_STATUS_INVALID_PARAMETER;
+        }
+
+        if (Buffer == NULL) {
+            return QUIC_STATUS_INVALID_PARAMETER;
+        }
+
+        QuicBandwidthShaperParentGetConfig(
+            &Configuration->BandwidthShaper,
+            (QUIC_BANDWIDTH_SHAPER_CONFIG*)Buffer);
+
+        return QUIC_STATUS_SUCCESS;
+    }
+
     return QUIC_STATUS_INVALID_PARAMETER;
 }
 
@@ -589,6 +621,31 @@ QuicConfigurationParamSet(
                 BufferLength,
                 Buffer);
 #endif
+
+    case QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER: {
+        if (Buffer == NULL ||
+            BufferLength != sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG)) {
+            return QUIC_STATUS_INVALID_PARAMETER;
+        }
+
+        const QUIC_BANDWIDTH_SHAPER_CONFIG* Config =
+            (const QUIC_BANDWIDTH_SHAPER_CONFIG*)Buffer;
+
+        //
+        // The pair is validated as a whole (specs/bandwidth.md §3.6 truth
+        // table) including the window invariant (BurstWindowUsec < now).
+        // Sanctioned exception to the "no clock reads" rule: the monotonic
+        // time is read here at the SetParam boundary and injected into the
+        // validation (§15.3). Applied atomically to the shared parent
+        // object; the credit (CreditBaseTimeNsec) is preserved (§7.3).
+        //
+        return
+            QuicBandwidthShaperParentSetConfig(
+                &Configuration->BandwidthShaper,
+                Config->BandwidthBitsPerSecond,
+                Config->BurstWindowUsec,
+                CxPlatTimeUs64());
+    }
 
     default:
         break;

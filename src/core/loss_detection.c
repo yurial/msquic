@@ -450,7 +450,39 @@ QuicLossDetectionOnPacketSent(
         }
 
         QuicCongestionControlOnDataSent(
-            &Connection->CongestionControl, SentPacket->PacketLength);
+            &Connection->CongestionControl,
+            SentPacket->PacketLength,
+            SentPacket->SentTime,
+            Path->Mtu);
+
+        //
+        // Debit the per-path bandwidth shaper for the same bytes, at the
+        // same injected moment (specs/bandwidth.md §10/§21; no-op when the
+        // shaper is inactive). Limit and debit cover the same byte class:
+        // ack-eliciting packets, exactly what the builder's SendAllowance
+        // is consumed by. The path's packet size is passed per call
+        // (§3.3): the shaper stores no MTU.
+        //
+        QuicBandwidthShaperOnSend(
+            &Path->PacerShaper,
+            SentPacket->PacketLength,
+            SentPacket->SentTime,
+            Path->Mtu);
+
+        //
+        // Shared debit of the installed application-level parents (§16.4):
+        // child first, then each installed parent — library, then
+        // configuration — for the same bytes at the same injected moment,
+        // each parent under its own leaf lock. Skipped entirely (two NULL
+        // checks, no lock traffic) when no parents are installed.
+        //
+        if (Connection->LibraryBandwidthShaperParent != NULL ||
+            Connection->ConfigBandwidthShaperParent != NULL) {
+            QuicConnBandwidthShaperDebitParents(
+                Connection,
+                SentPacket->PacketLength,
+                SentPacket->SentTime);
+        }
     }
 
     uint64_t SendPostedBytes = Connection->SendBuffer.PostedBytes;

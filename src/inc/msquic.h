@@ -698,6 +698,37 @@ typedef struct QUIC_LISTENER_STATISTICS {
 
 } QUIC_LISTENER_STATISTICS;
 
+typedef struct QUIC_BANDWIDTH_SHAPER_CONFIG {
+    //
+    // Target bandwidth in BITS per second. 0 means "unlimited" and is
+    // valid only together with BurstWindowUsec == 0. BITS (not bytes)
+    // per second is the canonical network-speed unit. The pair is
+    // validated as a whole (combination validation, no per-parameter
+    // limits).
+    //
+    uint64_t BandwidthBitsPerSecond;
+
+    //
+    // Burst window in microseconds, stored AS CONFIGURED: the configured
+    // value is never rewritten, and param GET echoes the configured value
+    // verbatim (including 0). The window participates in the pacing math
+    // as the burst budget of the proportional credit model; it must be
+    // less than the current monotonic time at set time (window invariant)
+    // and at most UINT64_MAX / BandwidthBitsPerSecond / 1'000 (ns
+    // combination bound), so acceptance may depend on the current time.
+    // A window of 0 configures no burst at all: consumers that pass a
+    // packet size per call (the per-connection shaper gets the current
+    // path MTU, which the implementation tracks itself) pace exactly one
+    // MTU-sized packet per debit interval
+    // (Mtu * 8'000'000'000 / BandwidthBitsPerSecond) and nothing in
+    // between; consumers without a packet size (the application-level
+    // parent shapers) run the raw continuous-rate credit model. The
+    // shaper never hard-blocks a send: exceeding the allowed bytes is
+    // permitted and incurs debt.
+    //
+    uint64_t BurstWindowUsec;
+} QUIC_BANDWIDTH_SHAPER_CONFIG;
+
 typedef enum QUIC_PERFORMANCE_COUNTERS {
     QUIC_PERF_COUNTER_CONN_CREATED,         // Total connections ever allocated.
     QUIC_PERF_COUNTER_CONN_HANDSHAKE_FAIL,  // Total connections that failed during handshake.
@@ -1009,6 +1040,7 @@ void
 #ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
 #define QUIC_PARAM_GLOBAL_XDP_MAP_CONFIG                0x0100000E  // QUIC_XDP_MAP_CONFIG[]
 #endif
+#define QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER              0x0100000F  // QUIC_BANDWIDTH_SHAPER_CONFIG
 
 //
 // Parameters for Registration.
@@ -1029,6 +1061,7 @@ typedef struct QUIC_SCHANNEL_CREDENTIAL_ATTRIBUTE_W {
     void* Buffer;
 } QUIC_SCHANNEL_CREDENTIAL_ATTRIBUTE_W;
 #define QUIC_PARAM_CONFIGURATION_SCHANNEL_CREDENTIAL_ATTRIBUTE_W  0x03000003  // QUIC_SCHANNEL_CREDENTIAL_ATTRIBUTE_W
+#define QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER       0x03000004  // QUIC_BANDWIDTH_SHAPER_CONFIG
 
 //
 // Parameters for Listener.
@@ -1078,6 +1111,7 @@ typedef struct QUIC_SCHANNEL_CREDENTIAL_ATTRIBUTE_W {
 #define QUIC_PARAM_CONN_NETWORK_STATISTICS              0x05000020  // struct QUIC_NETWORK_STATISTICS
 #define QUIC_PARAM_CONN_CLOSE_ASYNC                     0x0500001A  // uint8_t
 #endif
+#define QUIC_PARAM_CONN_BANDWIDTH_SHAPER                0x05000021  // QUIC_BANDWIDTH_SHAPER_CONFIG
 
 //
 // Parameters for TLS.

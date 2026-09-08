@@ -102,6 +102,8 @@ QuicPacketBuilderInitialize(
     Builder->PacketBatchSent = FALSE;
     Builder->PacketBatchRetransmittable = FALSE;
     Builder->WrittenConnectionCloseFrame = FALSE;
+    Builder->PacingShaperLimited = FALSE;
+    Builder->PacingParentDelayUsec = 0;
     Builder->Metadata = &Builder->MetadataStorage.Metadata;
     Builder->EncryptionOverhead = CXPLAT_ENCRYPTION_OVERHEAD;
     Builder->TotalDatagramsLength = 0;
@@ -136,6 +138,52 @@ QuicPacketBuilderInitialize(
     if (Builder->SendAllowance > Path->Allowance) {
         Builder->SendAllowance = Path->Allowance;
     }
+
+    //
+    // Per-path bandwidth shaper cap (specs/bandwidth.md §3.4 applied at the
+    // caller): limits the bytes this flush may emit and reports when the
+    // shaper (not CC) is the binding constraint, so the send loop can back
+    // off for exactly the shaper's recharge delay (§9). Inactive shaper
+    // (rate 0) is a passthrough — behavior is unchanged.
+    //
+    // Extended with the application-level parent hierarchy (§16.3): the
+    // min over the installed library/configuration parents joins at the
+    // credit level, before the §3.3 MTU rounding, at this same TimeNow
+    // (one NowUsec for the whole effective computation). With no parents
+    // installed (the default) the value stays UINT64_MAX and the result is
+    // bit-identical to the no-hierarchy computation; the NULL checks keep
+    // the hot path free of lock traffic in that case.
+    //
+    // The same per-parent snapshot also yields each parent's §9 recharge
+    // delay for the next MTU-sized want (the same want the child's own
+    // §9 backoff uses). The max is stashed in the builder so the send
+    // loop can back off for the parent's exact replenishment moment when
+    // a parent — not the child — was the binding constraint (otherwise a
+    // 0 child delay would collapse the pacing timer to its ~1 ms tick
+    // while the parent trickle-feeds one MTU per ~150 ms at e.g.
+    // 64 kbit/s). No extra clock reads: it reuses this TimeNow.
+    //
+    uint64_t ParentsAllowedBytes = UINT64_MAX;
+    if (Connection->LibraryBandwidthShaperParent != NULL ||
+        Connection->ConfigBandwidthShaperParent != NULL) {
+        uint32_t ParentsPacingDelayUsec = 0;
+        ParentsAllowedBytes =
+            QuicConnBandwidthShaperGetParentsAllowance(
+                Connection,
+                TimeNow,
+                QuicPathPacerGetWantSize(Path),
+                &ParentsPacingDelayUsec);
+        Builder->PacingParentDelayUsec = ParentsPacingDelayUsec;
+    }
+
+    Builder->SendAllowance =
+        QuicPathPacerLimitSendAllowance(
+            Path,
+            TimeNow,
+            Builder->SendAllowance,
+            ParentsAllowedBytes,
+            &Builder->PacingShaperLimited);
+
     Connection->Send.LastFlushTime = TimeNow;
     Connection->Send.LastFlushTimeValid = TRUE;
 

@@ -516,6 +516,34 @@ typedef struct QUIC_CONNECTION {
     QUIC_VAR_INT RetirePriorTo;
 
     //
+    // Per-connection bandwidth shaper rate (BITS per second) and burst
+    // window (microseconds), configured via QUIC_PARAM_CONN_BANDWIDTH_SHAPER
+    // and applied to every path's PacerShaper, existing and future
+    // (specs/bandwidth.md §22). The pair is validated as a whole at SET time
+    // (§3.6, window invariant included) and stored verbatim; the mode
+    // (strict/normal/continuous) is selected per call from the stored pair
+    // and the per-call Mtu, and the param GET echoes the configured values
+    // verbatim (§3.2). (0, 0) = unlimited (default).
+    //
+    uint64_t BandwidthShaperBitsPerSecond;
+    uint64_t BandwidthShaperBurstWindowUsec;
+
+    //
+    // Application-level parent shaper ceilings captured once when the
+    // configuration is bound to the connection (specs/bandwidth.md §15.4,
+    // §16.2). One optional pointer per hierarchy level; both levels stack
+    // and neither replaces the other. NULL means the level was not
+    // installed at bind time; the pointers never change afterwards (later
+    // SETs on a level do not rebind live connections, §16.6).
+    //
+    // Lifetime: the library-level parent lives as long as the library;
+    // the configuration-level parent is kept valid by the configuration's
+    // QUIC_CONF_REF_CONNECTION reference held by the connection (§16.1).
+    //
+    QUIC_BANDWIDTH_SHAPER_PARENT* LibraryBandwidthShaperParent;
+    QUIC_BANDWIDTH_SHAPER_PARENT* ConfigBandwidthShaperParent;
+
+    //
     // Per-path state. The first entry in the list is the active path. All the
     // rest (if any) are other tracked paths, sorted from most to least recently
     // used.
@@ -834,6 +862,129 @@ QuicCongestionControlGetConnection(
     )
 {
     return CXPLAT_CONTAINING_RECORD(Cc, QUIC_CONNECTION, CongestionControl);
+}
+
+//
+// Resolves the application-level parent shaper hierarchy into the
+// connection (specs/bandwidth.md §16.2). Performed exactly once, at
+// configuration attachment (QuicConnSetConfiguration — client connections
+// bind their configuration at start, server connections via
+// ConnectionSetConfiguration). Each level is captured independently
+// (levels stack; no fallback): a level installed at bind time contributes
+// its parent pointer, otherwise NULL. Installed-ness (§16.1) is read under
+// each parent's leaf lock, in the fixed global order library ->
+// configuration (§16.4). Later SETs never rebind a live connection
+// (§15.4); resets and path migrations never touch the result (§16.5).
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+#ifdef __cplusplus
+extern "C"
+#endif
+void
+QuicConnBandwidthShaperResolveParents(
+    _Inout_ QUIC_CONNECTION* Connection
+    );
+
+//
+// Effective ceiling of the installed application-level parents at the
+// single injected moment NowUsec (specs/bandwidth.md §16.3): the min over
+// each installed parent's credit, read as a copy-out under that parent's
+// leaf lock, in the fixed order library -> configuration. Absent (NULL) or
+// unlimited (B == 0) levels contribute the UINT64_MAX identity, so with no
+// parents installed the result is UINT64_MAX and the caller's computation
+// is bit-identical to the no-hierarchy behavior (§19.14). The child's own
+// credit (Path PacerShaper / Cc->Pacer) is min-ed with this by the caller
+// before MTU rounding.
+//
+// When ParentsRetryDelayUsec is non-NULL, it also receives the max §9
+// retry delay over the installed parents for RetryDelaySizeBytes (the
+// same MTU-sized want the child's backoff uses), computed from the same
+// per-parent snapshot as the credit at the same NowUsec. This is the
+// pacing backoff for the case where a parent, not the child, was the
+// binding constraint on the send allowance (§3.4's Schedule applied to
+// every min level). A parent with credit >= RetryDelaySizeBytes has a
+// zero delay, so the max is over exactly the parents that participate in
+// the binding min; with no parents installed it stays 0 (child-only
+// behavior unchanged). Pass RetryDelaySizeBytes == 0 (or NULL) to skip
+// the delay computation.
+//
+// Locking: each parent lock is acquired and released before the next one
+// is taken; leaf locks are never nested (§16.4).
+//
+QUIC_INLINE
+uint64_t
+QuicConnBandwidthShaperGetParentsAllowance(
+    _In_ const QUIC_CONNECTION* Connection,
+    _In_ uint64_t NowUsec,
+    _In_ uint64_t RetryDelaySizeBytes,
+    _Out_opt_ uint32_t* ParentsRetryDelayUsec
+    )
+{
+    //
+    // Fixed order: library parent, then configuration parent.
+    //
+    QUIC_BANDWIDTH_SHAPER_PARENT* Parents[2] = {
+        (QUIC_BANDWIDTH_SHAPER_PARENT*)Connection->LibraryBandwidthShaperParent,
+        (QUIC_BANDWIDTH_SHAPER_PARENT*)Connection->ConfigBandwidthShaperParent
+    };
+    uint64_t Effective = UINT64_MAX;
+    if (ParentsRetryDelayUsec != NULL) {
+        *ParentsRetryDelayUsec = 0;
+    }
+    for (uint8_t i = 0; i < 2; ++i) {
+        QUIC_BANDWIDTH_SHAPER_PARENT* Parent = Parents[i];
+        if (Parent != NULL) {
+            uint32_t ParentDelayUsec = 0;
+            uint64_t ParentAllowance =
+                QuicBandwidthShaperParentGetAllowedBytesAndDelay(
+                    Parent,
+                    NowUsec,
+                    RetryDelaySizeBytes,
+                    &ParentDelayUsec);
+            if (ParentsRetryDelayUsec != NULL &&
+                ParentDelayUsec > *ParentsRetryDelayUsec) {
+                *ParentsRetryDelayUsec = ParentDelayUsec;
+            }
+            if (ParentAllowance < Effective) {
+                Effective = ParentAllowance;
+            }
+        }
+    }
+    return Effective;
+}
+
+//
+// Shared debit of the installed application-level parents for one send
+// (specs/bandwidth.md §16.4): each installed parent is debited for the same
+// byte count at the same injected moment as the child, each under its own
+// leaf lock, in the fixed order library -> configuration. A level with a
+// NULL pointer is skipped (no debit for absent levels, §19.14); an
+// unlimited parent's debit is a no-op inside the shaper (§10). The debit is
+// unconditional for installed parents, including over-sends beyond the
+// effective limit (debt is recorded per §3.2/§10).
+//
+QUIC_INLINE
+void
+QuicConnBandwidthShaperDebitParents(
+    _Inout_ QUIC_CONNECTION* Connection,
+    _In_ uint32_t NumBytesSent,
+    _In_ uint64_t NowUsec
+    )
+{
+    //
+    // Fixed order: library parent, then configuration parent. Each lock is
+    // released before the next one is acquired.
+    //
+    QUIC_BANDWIDTH_SHAPER_PARENT* Parents[2] = {
+        Connection->LibraryBandwidthShaperParent,
+        Connection->ConfigBandwidthShaperParent
+    };
+    for (uint8_t i = 0; i < 2; ++i) {
+        QUIC_BANDWIDTH_SHAPER_PARENT* Parent = Parents[i];
+        if (Parent != NULL) {
+            QuicBandwidthShaperParentDebit(Parent, NumBytesSent, NowUsec);
+        }
+    }
 }
 
 //
