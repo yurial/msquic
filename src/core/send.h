@@ -7,6 +7,8 @@
 
 #define SEND_PACKET_SHORT_HEADER_TYPE 0xff
 
+#include "ingress_shaper.h"
+
 QUIC_INLINE
 uint8_t
 QuicKeyTypeToPacketTypeV1(
@@ -338,6 +340,26 @@ typedef struct QUIC_SEND {
     // advertised window.
     //
     uint64_t DeferredMaxData;
+
+    //
+    // Ingress window shaper (specs/ingress-window.md): the configured
+    // ceiling on this connection's outstanding receive window
+    // (MaxData - OrderedStreamBytesReceived), in bytes; 0 = unset (R1/R2).
+    // A runtime SET takes effect lazily on subsequent grant events; an
+    // already advertised limit is never withdrawn (R2/R8). While the limit
+    // is set, connection-level credit grants follow R6 and MAX_DATA
+    // emission follows R15 (replacing the legacy deliveries-accumulator
+    // threshold).
+    //
+    uint64_t ConnIngressLimit;
+
+    //
+    // MAX_DATA emission bookkeeping of the ingress shaper (R15): time of
+    // the last MAX_DATA emission (ns, monotonic) and the pending (not yet
+    // announced) credit accumulated since it. Untouched while
+    // ConnIngressLimit is 0 (the legacy accumulator threshold governs).
+    //
+    QUIC_INGRESS_EMISSION MaxDataEmission;
 
     //
     // Set of flags indicating what data is ready to be sent out.

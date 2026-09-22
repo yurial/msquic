@@ -1,0 +1,43 @@
+# iwpair network profile: net-10mbit (S13(f), IWP_NETWORK_PROFILES)
+#
+# 10 Mbit channel emulation: one labeled session (net-10mbit) - a pace
+# phase at the channel rate, the suite's 800 ms decay idle (>=
+# IW_E2E_IDLE_DECAY_NSEC = 700 ms, past the quiet-idle settle), then a
+# 1048576 B burst (= 8.4 x L_c = 42 x L_s, full stream-scope J4
+# teeth).
+#
+# The line's `L:10:2` segment commands the session limits (L_c, L_s) =
+# (125000, 25000) - the window equals one estimator interval of the
+# channel (mbit x 12500 B = bandwidth x the shaper's 100 ms
+# measurement interval, IWP_LINE_LIMIT_BYTES_PER_MBIT). The
+# -client_conn_limit / -client_stream_limit flags DO NOT reach this
+# session: the `L:` value overrides them (S13(c)); changing the limits
+# means editing (a copy of) this file - the former "optional
+# -client_conn_limit raise" suggestion is superseded, the raise is
+# built in.
+#
+# Paired usage line (the file carries the script WITH its limits - the
+# channel cap stays a server flag, one per run):
+#
+#   iwpair-server -script_file:src/tools/iwpair/profiles/net-10mbit.txt \
+#       -network_output_bandwidth:1250000 -burst_ref_rate:1250000
+#   iwpair-client -target:<addr>
+#
+# -burst_ref_rate = the cap keeps the capped burst's plan rate r_b
+# equal to the drain rate (with the default 1 MB/s reference the
+# strict band upper (~1.1 x r_b) would false-fail at the 1.25 MB/s
+# drain, ~+25%, R16(c1)/J18(e)).
+#
+# Shaper zone at the line's limits: conn k-hat = 1 (Sat = RawSat =
+# 1250000 = r - the saturation edge); the STREAM scope binds B<: the
+# effective stream limit is min(125000, 25000) = 25000, Floor_s =
+# 16384, r = 5 x RawSat_s => k-hat_s = 1. B2 is derived at BOTH scopes
+# (conn: 1250000 <= 128 x Floor_c = 2500000... via max(20 x L, 2 MiB)
+# the conn bound is 2500000; stream: 1250000 <= 2097152 - the stream
+# via the 16384 rate floor).
+#
+# Runtime: ~2.8 s session, ~2.5 MB payload. The pairing is a
+# convention, not an enforced contract: without the cap this is a
+# plain uncapped run of the same script (its `L:` limits still apply).
+
+net-10mbit: P:1250000:1200;I:800;B:1048576;L:10:2

@@ -33,7 +33,10 @@ QuicSendInitialize(
     )
 {
     CxPlatListInitializeHead(&Send->SendStreams);
-    Send->MaxData = Settings->ConnFlowControlWindow;
+    Send->MaxData =
+        QuicIngressClampScale(
+            Settings->ConnFlowControlWindow,
+            Send->ConnIngressLimit);   // 0 at initialization: passthrough (R9)
     Send->SkippedPacketNumber = UINT64_MAX;
 
     //
@@ -91,7 +94,16 @@ QuicSendApplyNewSettings(
     _In_ const QUIC_SETTINGS_INTERNAL* Settings
     )
 {
-    Send->MaxData = Settings->ConnFlowControlWindow;
+    //
+    // While an ingress limit is configured, a settings change (including a
+    // grown ConnFlowControlWindow) must not raise the initial advertised
+    // limit above the ceiling (R9/R16); with no limit set this is a
+    // passthrough.
+    //
+    Send->MaxData =
+        QuicIngressClampScale(
+            Settings->ConnFlowControlWindow,
+            Send->ConnIngressLimit);
 }
 
 _IRQL_requires_max_(PASSIVE_LEVEL)

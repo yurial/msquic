@@ -883,6 +883,38 @@ QuicTestRecvPauseDeferredCredit(
     );
 
 void
+QuicTestIngressWindowE2ECi(
+    );
+
+//
+// R16(h): the expectation-registry unit tests (pure IwPairCommon; no
+// network, no MsQuic).
+//
+void
+IwpairExpectationGolden(
+    );
+
+void
+IwpairExpectationDerivedNa(
+    );
+
+void
+IwpairExpectationVerdicts(
+    );
+
+//
+// The script-file line-limits segment (e2e/line-limits, S13(b)):
+// conversion + parse-error grammar (pure IwPairCommon).
+//
+void
+IwpairExpectationLineLimits(
+    );
+
+void
+QuicTestIngressWindowE2EExtended(
+    );
+
+void
 QuicTestStreamDifferentAbortErrors(
     );
 

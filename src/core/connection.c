@@ -2172,13 +2172,30 @@ QuicConnRecvResumptionTicket(
         }
 
         //
-        // Validate resumed TP are <= current settings
+        // Validate resumed TP are <= current settings. With an ingress
+        // limit configured, the comparison bounds are clamped by the same
+        // ceiling as the local transport parameters (R9): resumption TPs
+        // from before the limit was configured are then correctly rejected
+        // as exceeding current settings; without a limit the clamps are
+        // pass-through (R1).
         //
         if (ResumedTP.ActiveConnectionIdLimit > QUIC_ACTIVE_CONNECTION_ID_LIMIT ||
-            ResumedTP.InitialMaxData > Connection->Send.MaxData ||
-            ResumedTP.InitialMaxStreamDataBidiLocal > Connection->Settings.StreamRecvWindowBidiLocalDefault ||
-            ResumedTP.InitialMaxStreamDataBidiRemote > Connection->Settings.StreamRecvWindowBidiRemoteDefault ||
-            ResumedTP.InitialMaxStreamDataUni > Connection->Settings.StreamRecvWindowUnidiDefault ||
+            ResumedTP.InitialMaxData >
+                QuicIngressClampScale(
+                    Connection->Send.MaxData,
+                    Connection->Send.ConnIngressLimit) ||
+            ResumedTP.InitialMaxStreamDataBidiLocal >
+                QuicIngressClampScale(
+                    Connection->Settings.StreamRecvWindowBidiLocalDefault,
+                    Connection->Send.ConnIngressLimit) ||
+            ResumedTP.InitialMaxStreamDataBidiRemote >
+                QuicIngressClampScale(
+                    Connection->Settings.StreamRecvWindowBidiRemoteDefault,
+                    Connection->Send.ConnIngressLimit) ||
+            ResumedTP.InitialMaxStreamDataUni >
+                QuicIngressClampScale(
+                    Connection->Settings.StreamRecvWindowUnidiDefault,
+                    Connection->Send.ConnIngressLimit) ||
             ResumedTP.InitialMaxUniStreams > Connection->Streams.Types[STREAM_ID_FLAG_IS_CLIENT | STREAM_ID_FLAG_IS_UNI_DIR].MaxTotalStreamCount ||
             ResumedTP.InitialMaxBidiStreams > Connection->Streams.Types[STREAM_ID_FLAG_IS_CLIENT | STREAM_ID_FLAG_IS_BI_DIR].MaxTotalStreamCount) {
             //
@@ -2319,10 +2336,30 @@ QuicConnGenerateLocalTransportParameters(
             QUIC_CID_HASH_ENTRY,
             Link);
 
-    LocalTP->InitialMaxData = Connection->Send.MaxData;
-    LocalTP->InitialMaxStreamDataBidiLocal = Connection->Settings.StreamRecvWindowBidiLocalDefault;
-    LocalTP->InitialMaxStreamDataBidiRemote = Connection->Settings.StreamRecvWindowBidiRemoteDefault;
-    LocalTP->InitialMaxStreamDataUni = Connection->Settings.StreamRecvWindowUnidiDefault;
+    //
+    // R9: while the connection's ingress shaper is active, the initial
+    // advertised limits never exceed the connection ceiling. Send.MaxData
+    // is clamped pre-start (R9); the initial per-stream windows are clamped
+    // here at the transport-parameter boundary — the connection-wide
+    // ceiling applies to every stream scale (the per-stream limits apply on
+    // top at stream creation, see QuicStreamInitialize).
+    //
+    LocalTP->InitialMaxData =
+        QuicIngressClampScale(
+            Connection->Send.MaxData,
+            Connection->Send.ConnIngressLimit);
+    LocalTP->InitialMaxStreamDataBidiLocal =
+        QuicIngressClampScale(
+            Connection->Settings.StreamRecvWindowBidiLocalDefault,
+            Connection->Send.ConnIngressLimit);
+    LocalTP->InitialMaxStreamDataBidiRemote =
+        QuicIngressClampScale(
+            Connection->Settings.StreamRecvWindowBidiRemoteDefault,
+            Connection->Send.ConnIngressLimit);
+    LocalTP->InitialMaxStreamDataUni =
+        QuicIngressClampScale(
+            Connection->Settings.StreamRecvWindowUnidiDefault,
+            Connection->Send.ConnIngressLimit);
     LocalTP->MaxUdpPayloadSize =
         MaxUdpPayloadSizeFromMTU(
             CxPlatSocketGetLocalMtu(
@@ -5033,6 +5070,17 @@ QuicConnRecvFrames(
                 Connection,
                 "Peer Connection FC blocked (%llu)",
                 Frame.DataLimit);
+            if (Connection->Send.ConnIngressLimit != 0) {
+                //
+                // R14: DATA_BLOCKED triggers an immediate re-announcement of
+                // the current limit without new credit; it is an immediate
+                // emission exception (R15) — the pending credit is announced
+                // at once.
+                //
+                QuicIngressEmissionRecord(
+                    &Connection->Send.MaxDataEmission,
+                    QuicIngressNowNsec());
+            }
             QuicSendSetSendFlag(&Connection->Send, QUIC_CONN_SEND_FLAG_MAX_DATA);
 
             AckEliciting = TRUE;
@@ -7021,6 +7069,52 @@ QuicConnParamSet(
         break;
     }
 
+    case QUIC_PARAM_CONN_INGRESS_WINDOW_LIMIT: {
+        if (BufferLength != sizeof(uint64_t) || Buffer == NULL) {
+            Status = QUIC_STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        //
+        // The ingress window shaper's connection limit (R2): every uint64_t
+        // value is valid, 0 unsets the shaper (R1). The limit takes effect
+        // lazily on the following grant events and the estimator state is
+        // not reset (R4). While the connection hasn't started, the initial
+        // advertised limit (Send.MaxData) is clamped so the initial
+        // transport parameters never announce more than the ceiling (R9);
+        // after the start the advertised limit is never withdrawn (R2/R8) —
+        // a lowered limit suspends grants until the window drains below the
+        // ceiling (R8/A8). A re-activation (unset -> set) drops the stale
+        // emission bookkeeping of the previous activation so the first
+        // grant is immediately emission-eligible (R15/D4).
+        //
+        {
+            const uint64_t PreviousLimit = Connection->Send.ConnIngressLimit;
+            Connection->Send.ConnIngressLimit = *(uint64_t*)Buffer;
+            QuicIngressEmissionReactivate(
+                &Connection->Send.MaxDataEmission,
+                PreviousLimit,
+                Connection->Send.ConnIngressLimit);
+        }
+        if (!Connection->State.Started) {
+            //
+            // Re-derive the initial advertised limit from the current
+            // settings window: raising the limit before start may raise the
+            // initial window back up, never above min(window, limit) (R9).
+            // After the start the advertised limit is never withdrawn
+            // (R2/R8) — a lowered limit suspends grants until the window
+            // drains below the ceiling (R8/A8).
+            //
+            Connection->Send.MaxData =
+                QuicIngressClampScale(
+                    Connection->Settings.ConnFlowControlWindow,
+                    Connection->Send.ConnIngressLimit);
+        }
+
+        Status = QUIC_STATUS_SUCCESS;
+        break;
+    }
+
     case QUIC_PARAM_CONN_CLOSE_ASYNC:
         if (BufferLength != sizeof(BOOLEAN)) {
             Status = QUIC_STATUS_INVALID_PARAMETER;
@@ -7748,6 +7842,29 @@ QuicConnParamGet(
         Status = QUIC_STATUS_SUCCESS;
         break;
 
+    case QUIC_PARAM_CONN_INGRESS_WINDOW_LIMIT:
+
+        if (*BufferLength < sizeof(uint64_t)) {
+            *BufferLength = sizeof(uint64_t);
+            Status = QUIC_STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        if (Buffer == NULL) {
+            Status = QUIC_STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        //
+        // GET echoes the stored value as-is (R2): the raw configured limit,
+        // 0 when unset.
+        //
+        *BufferLength = sizeof(uint64_t);
+        *(uint64_t*)Buffer = Connection->Send.ConnIngressLimit;
+
+        Status = QUIC_STATUS_SUCCESS;
+        break;
+
     case QUIC_PARAM_CONN_NETWORK_STATISTICS:
         Status =
             QuicConnGetNetworkStatistics(Connection, BufferLength, (QUIC_NETWORK_STATISTICS *)Buffer);
@@ -8028,15 +8145,31 @@ QuicConnRecvResume(
 
     Connection->State.ReceivePaused = FALSE;
 
-    //
-    // Apply any flow control credit that accumulated while receive was
-    // paused (see Send.DeferredMaxData), then trigger sending of a MAX_DATA
-    // frame. Send.MaxData was never lowered during the pause, so this
-    // (re)advertises the current real limit, restoring the peer's ability to
-    // send new data.
-    //
-    Connection->Send.MaxData += Connection->Send.DeferredMaxData;
-    Connection->Send.DeferredMaxData = 0;
+    if (Connection->Send.ConnIngressLimit != 0) {
+        //
+        // R10: apply the credit parked while paused through the shaper clamp
+        // as one grant; the clamp-suppressed surplus is discarded (not
+        // re-parked, not carried). The resume announcement is an immediate
+        // emission exception (R15) — the bookkeeping is recorded inside.
+        //
+        QuicIngressApplyDeferredOnResume(
+            &Connection->Send.MaxData,
+            Connection->Send.OrderedStreamBytesReceived,
+            Connection->Send.ConnIngressLimit,
+            &Connection->Send.DeferredMaxData,
+            &Connection->Send.MaxDataEmission,
+            QuicIngressNowNsec());
+    } else {
+        //
+        // Apply any flow control credit that accumulated while receive was
+        // paused (see Send.DeferredMaxData), then trigger sending of a
+        // MAX_DATA frame. Send.MaxData was never lowered during the pause,
+        // so this (re)advertises the current real limit, restoring the
+        // peer's ability to send new data.
+        //
+        Connection->Send.MaxData += Connection->Send.DeferredMaxData;
+        Connection->Send.DeferredMaxData = 0;
+    }
 
     QuicSendSetSendFlag(&Connection->Send, QUIC_CONN_SEND_FLAG_MAX_DATA);
     QuicSendQueueFlush(&Connection->Send, REASON_CONNECTION_FLOW_CONTROL);

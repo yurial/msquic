@@ -1113,6 +1113,8 @@ typedef struct QUIC_SCHANNEL_CREDENTIAL_ATTRIBUTE_W {
 #endif
 #define QUIC_PARAM_CONN_BANDWIDTH_SHAPER                0x05000021  // QUIC_BANDWIDTH_SHAPER_CONFIG
 
+#define QUIC_PARAM_CONN_INGRESS_WINDOW_LIMIT            0x05000022  // uint64_t - bytes, 0 = unset
+
 //
 // Parameters for TLS.
 //
@@ -1145,6 +1147,8 @@ typedef struct QUIC_SCHANNEL_CONTEXT_ATTRIBUTE_EX_W {
 #ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
 #define QUIC_PARAM_STREAM_RELIABLE_OFFSET               0x08000005  // uint64_t
 #endif
+
+#define QUIC_PARAM_STREAM_INGRESS_WINDOW_LIMIT          0x08000006  // uint64_t - bytes, 0 = unset
 
 typedef
 _IRQL_requires_max_(PASSIVE_LEVEL)

@@ -161,7 +161,18 @@ QuicStreamInitialize(
         goto Exit;
     }
 
-    Stream->MaxAllowedRecvOffset = Stream->RecvBuffer.VirtualBufferLength;
+    //
+    // R9: while the ingress shaper is active (a connection or stream limit
+    // is set), the initially advertised stream limit is the smaller of the
+    // receive buffer's initial window and the stream's effective ceiling;
+    // the grants then grow it back per R7.
+    //
+    Stream->MaxAllowedRecvOffset =
+        QuicIngressClampScale(
+            Stream->RecvBuffer.VirtualBufferLength,
+            QuicIngressEffectiveStreamLimit(
+                Connection->Send.ConnIngressLimit,
+                Stream->IngressShaper.Limit));
     Stream->RecvWindowLastUpdate = CxPlatTimeUs64();
 
     QuicConnAddRef(Connection, QUIC_CONN_REF_STREAM);
@@ -749,6 +760,37 @@ QuicStreamParamSet(
         Status = QUIC_STATUS_SUCCESS;
         break;
 
+    case QUIC_PARAM_STREAM_INGRESS_WINDOW_LIMIT:
+
+        if (BufferLength != sizeof(uint64_t) || Buffer == NULL) {
+            Status = QUIC_STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        //
+        // The ingress window shaper's stream limit (R2): every uint64_t
+        // value is valid, 0 unsets the shaper for the stream scale (R1).
+        // The limit takes effect lazily on the following grant events and
+        // the estimator state is not reset (R4). An already advertised
+        // stream limit is never withdrawn (R2/R8): a lowered limit
+        // suspends the stream's grants until the window drains below the
+        // new ceiling (A8). The initial advertised value was clamped at
+        // stream creation (R9). A re-activation (unset -> set) drops the
+        // stale emission bookkeeping of the previous activation so the
+        // first grant is immediately emission-eligible (R15/D4).
+        //
+        {
+            const uint64_t PreviousLimit = Stream->IngressShaper.Limit;
+            Stream->IngressShaper.Limit = *(uint64_t*)Buffer;
+            QuicIngressEmissionReactivate(
+                &Stream->IngressShaper.Emission,
+                PreviousLimit,
+                Stream->IngressShaper.Limit);
+        }
+
+        Status = QUIC_STATUS_SUCCESS;
+        break;
+
     default:
         Status = QUIC_STATUS_INVALID_PARAMETER;
         break;
@@ -966,6 +1008,27 @@ QuicStreamParamGet(
         Status = QUIC_STATUS_SUCCESS;
         break;
 
+    case QUIC_PARAM_STREAM_INGRESS_WINDOW_LIMIT:
+
+        if (*BufferLength < sizeof(uint64_t)) {
+            *BufferLength = sizeof(uint64_t);
+            Status = QUIC_STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        if (Buffer == NULL) {
+            Status = QUIC_STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        //
+        // GET echoes the stored value as-is (R2): the raw configured
+        // limit, 0 when unset.
+        //
+        *BufferLength = sizeof(uint64_t);
+        *(uint64_t*)Buffer = Stream->IngressShaper.Limit;
+        Status = QUIC_STATUS_SUCCESS;
+        break;
+
     default:
         Status = QUIC_STATUS_INVALID_PARAMETER;
         break;
@@ -1020,9 +1083,12 @@ QuicStreamProvideRecvBuffers(
         // virtual buffer size.
         //
         // Skip the update while the stream is receive-paused so the peer
-        // doesn't see a larger window than what we advertised at pause time.
+        // doesn't see a larger window than what we advertised at pause time,
+        // and while the stream's ingress shaper is active: the advertised
+        // value is then governed by grants only and must never be raised
+        // from buffer growth (R16).
         //
-        if (!Stream->Flags.ReceivePaused) {
+        if (!Stream->Flags.ReceivePaused && Stream->IngressShaper.Limit == 0) {
             uint64_t NewMaxAllowedRecvOffset =
                 Stream->RecvBuffer.BaseOffset + Stream->RecvBuffer.VirtualBufferLength;
             if (Stream->MaxAllowedRecvOffset < NewMaxAllowedRecvOffset) {
@@ -1104,6 +1170,30 @@ QuicStreamRecvPause(
 
 _IRQL_requires_max_(PASSIVE_LEVEL)
 void
+QuicStreamShapedRecvResume(
+    _In_ QUIC_STREAM* Stream
+    )
+{
+    //
+    // R11: while the stream's ingress limit is set, the advertised value is
+    // not recomputed from the receive buffer — the current
+    // MaxAllowedRecvOffset is re-announced as is (it may have gone stale
+    // during the pause; grants resume per R7).
+    //
+    QuicIngressEmissionRecord(
+        &Stream->IngressShaper.Emission,
+        QuicIngressNowNsec());
+
+    //
+    // Refresh the tuning clock exactly like the legacy resume: the paused
+    // interval must not look like a long silent gap to the legacy
+    // auto-tuning when the stream limit is later cleared (D5).
+    //
+    Stream->RecvWindowLastUpdate = CxPlatTimeUs64();
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
 QuicStreamRecvResume(
     _In_ QUIC_STREAM* Stream
     )
@@ -1117,25 +1207,33 @@ QuicStreamRecvResume(
 
     Stream->Flags.ReceivePaused = FALSE;
 
-    //
-    // The advertised window may have gone stale while paused: deliveries
-    // during the pause (data within the previously advertised window is
-    // still accepted) don't advance MaxAllowedRecvOffset, so immediately
-    // re-announce the up-to-date limit the same way the delivery path does
-    // (monotonically; the limit never decreases), and refresh
-    // RecvWindowLastUpdate so the auto-tuning algorithm doesn't treat the
-    // paused interval as a long silent gap. Then trigger sending of a
-    // MAX_STREAM_DATA frame so the peer promptly regains the ability to
-    // send new data on this stream. No connection-level MAX_DATA is
-    // scheduled here: the connection limit doesn't change on resume, so
-    // the frame would be a no-op.
-    //
-    uint64_t NewMaxAllowedRecvOffset =
-        Stream->RecvBuffer.BaseOffset + Stream->RecvBuffer.VirtualBufferLength;
-    if (NewMaxAllowedRecvOffset > Stream->MaxAllowedRecvOffset) {
-        Stream->MaxAllowedRecvOffset = NewMaxAllowedRecvOffset;
+    if (Stream->IngressShaper.Limit != 0) {
+        //
+        // R11/D5: shaped resume — no window recompute, immediate emission
+        // bookkeeping, tuning-clock refresh.
+        //
+        QuicStreamShapedRecvResume(Stream);
+    } else {
+        //
+        // The advertised window may have gone stale while paused: deliveries
+        // during the pause (data within the previously advertised window is
+        // still accepted) don't advance MaxAllowedRecvOffset, so immediately
+        // re-announce the up-to-date limit the same way the delivery path does
+        // (monotonically; the limit never decreases), and refresh
+        // RecvWindowLastUpdate so the auto-tuning algorithm doesn't treat the
+        // paused interval as a long silent gap. Then trigger sending of a
+        // MAX_STREAM_DATA frame so the peer promptly regains the ability to
+        // send new data on this stream. No connection-level MAX_DATA is
+        // scheduled here: the connection limit doesn't change on resume, so
+        // the frame would be a no-op.
+        //
+        uint64_t NewMaxAllowedRecvOffset =
+            Stream->RecvBuffer.BaseOffset + Stream->RecvBuffer.VirtualBufferLength;
+        if (NewMaxAllowedRecvOffset > Stream->MaxAllowedRecvOffset) {
+            Stream->MaxAllowedRecvOffset = NewMaxAllowedRecvOffset;
+        }
+        Stream->RecvWindowLastUpdate = CxPlatTimeUs64();
     }
-    Stream->RecvWindowLastUpdate = CxPlatTimeUs64();
 
     QuicSendSetStreamSendFlag(
         &Stream->Connection->Send,

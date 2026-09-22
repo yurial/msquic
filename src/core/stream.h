@@ -9,6 +9,8 @@
 #include "stream.h.clog.h"
 #endif
 
+#include "ingress_shaper.h"
+
 typedef struct QUIC_CONNECTION QUIC_CONNECTION;
 
 //
@@ -420,6 +422,18 @@ typedef struct QUIC_STREAM {
     // Timestamp of the last recv window update.
     //
     uint64_t RecvWindowLastUpdate;
+
+    //
+    // Ingress window shaper state (specs/ingress-window.md): the configured
+    // per-stream limit (0 = unset, R2), the stream's delivery-rate
+    // estimator (R3) and the MAX_STREAM_DATA emission bookkeeping (R15).
+    // While Limit is set, stream-level credit grants follow R7 and
+    // MAX_STREAM_DATA emission follows R15 (replacing the legacy
+    // drain-threshold logic); the estimator is also the jitter source of
+    // the connection-level grants (R6/J3). Zero-initialized memory is the
+    // "shaper off" state (R1).
+    //
+    QUIC_INGRESS_STREAM_SHAPER IngressShaper;
 
     //
     // The structure for tracking received buffers.
@@ -1105,3 +1119,66 @@ void
 QuicStreamRecvResume(
     _In_ QUIC_STREAM* Stream
     );
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+//
+// The shaped stream resume bookkeeping (R11/D5): the advertised value is
+// not recomputed from the receive buffer, the MAX_STREAM_DATA emission
+// bookkeeping records the immediate re-announcement (R15) and the tuning
+// clock is refreshed so the paused interval doesn't look like a silent gap
+// to the legacy auto-tuning after a later limit clear.
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicStreamShapedRecvResume(
+    _In_ QUIC_STREAM* Stream
+    );
+
+//
+// Keeps the stream's receive buffer capacity covering the advertised window
+// (D1): grows RecvBuffer.VirtualBufferLength (growth-only, uint32_t-wide)
+// so the accept bound RecvBuffer.BaseOffset + VirtualBufferLength never
+// falls below the announced MaxAllowedRecvOffset.
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicStreamTrackShapedRecvBufferCapacity(
+    _In_ QUIC_STREAM* Stream
+    );
+
+//
+// The shaped R7 grant of a non-paused stream: applies the clamped grant
+// (effective ceiling, additionally capped at the receive buffer's uint32_t
+// window width) to MaxAllowedRecvOffset and keeps the receive buffer
+// capacity tracking the granted window (D1). Returns TRUE when
+// MAX_STREAM_DATA must be emitted (R15).
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+BOOLEAN
+QuicStreamStreamGrantShaped(
+    _In_ QUIC_STREAM* Stream,
+    _In_ uint64_t EffectiveLimit,
+    _In_ uint64_t DeliveryCredit,
+    _In_ uint64_t NowNsec
+    );
+
+//
+// The legacy receive-window maintenance of a stream (drain-threshold
+// accounting, receive buffer auto-tuning and the MaxAllowedRecvOffset
+// advance from the buffer); used when the stream scale is not shaped.
+// Returns TRUE when the window was advanced and the caller should announce
+// it.
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+BOOLEAN
+QuicStreamRecvWindowAdvanceLegacy(
+    _In_ QUIC_STREAM* Stream,
+    _In_ uint64_t BytesDelivered
+    );
+
+#if defined(__cplusplus)
+}
+#endif

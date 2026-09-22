@@ -309,6 +309,23 @@ QuicStreamProcessResetFrame(
                 // credit and apply it on resume (QuicConnRecvResume).
                 //
                 Stream->Connection->Send.DeferredMaxData += FlowControlIncrease;
+            } else if (Stream->Connection->Send.ConnIngressLimit != 0) {
+                //
+                // R12: the RESET_STREAM credit is granted at the connection
+                // level 1:1 (no jitter) through the R6 clamp; the emission
+                // follows the R15 policy (cadence or fill).
+                //
+                if (QuicIngressGrant(
+                        &Stream->Connection->Send.MaxData,
+                        Stream->Connection->Send.OrderedStreamBytesReceived,
+                        Stream->Connection->Send.ConnIngressLimit,
+                        &Stream->Connection->Send.MaxDataEmission,
+                        FlowControlIncrease,
+                        QuicIngressNowNsec())) {
+                    QuicSendSetSendFlag(
+                        &Stream->Connection->Send,
+                        QUIC_CONN_SEND_FLAG_MAX_DATA);
+                }
             } else {
                 Stream->Connection->Send.MaxData += FlowControlIncrease;
                 QuicSendSetSendFlag(
@@ -742,6 +759,18 @@ QuicStreamRecv(
             "Remote FC blocked (%llu)",
             Frame.StreamDataLimit);
 
+        if (Stream->IngressShaper.Limit != 0) {
+            //
+            // R14: STREAM_DATA_BLOCKED triggers an immediate re-announcement
+            // of the current limit without new credit; it is an immediate
+            // emission exception (R15) — the pending credit is announced at
+            // once.
+            //
+            QuicIngressEmissionRecord(
+                &Stream->IngressShaper.Emission,
+                QuicIngressNowNsec());
+        }
+
         QuicSendSetStreamSendFlag(
             &Stream->Connection->Send,
             Stream,
@@ -791,17 +820,31 @@ QuicStreamRecv(
 //
 // Criteria for sending MAX_DATA/MAX_STREAM_DATA frames:
 //
-// Whenever bytes are delivered on a stream, a MAX_STREAM_DATA frame is sent if an ACK
-// is already queued, or if the buffer tuning algorithm below increases the buffer size.
+// While no ingress limit is configured (specs/ingress-window.md R1), the
+// legacy rules apply: whenever bytes are delivered on a stream, a
+// MAX_STREAM_DATA frame is sent if an ACK is already queued, or if the
+// buffer tuning algorithm below increases the buffer size. The
+// connection-wide MAX_DATA frame is sent independently from MAX_STREAM_DATA
+// (see use of OrderedStreamBytesDeliveredAccumulator). This prevents issues
+// in corner cases, like when many short streams are used, in which case we
+// might never actually send a MAX_STREAM_DATA update since each stream's
+// entire payload fits in the initial window.
 //
-// The connection-wide MAX_DATA frame is sent independently from MAX_STREAM_DATA (see use
-// of OrderedStreamBytesDeliveredAccumulator). This prevents issues in corner cases, like
-// when many short streams are used, in which case we might never actually send a
-// MAX_STREAM_DATA update since each stream's entire payload fits in the initial window.
+// While an ingress limit is configured on either scale (R2), the delivery
+// credit is granted per R6 (connection) / R7 (stream) through the
+// QuicIngressGrant engine and the frame emission follows the R15
+// coalescing policy (cadence or fill) on the shaped scales.
+//
+
+//
+// The legacy receive-window maintenance of a stream: drain-threshold
+// accounting, receive buffer auto-tuning and the MaxAllowedRecvOffset
+// advance from the buffer. Returns TRUE when the window was advanced and
+// the caller should announce it.
 //
 _IRQL_requires_max_(PASSIVE_LEVEL)
-void
-QuicStreamOnBytesDelivered(
+BOOLEAN
+QuicStreamRecvWindowAdvanceLegacy(
     _In_ QUIC_STREAM* Stream,
     _In_ uint64_t BytesDelivered
     )
@@ -809,15 +852,112 @@ QuicStreamOnBytesDelivered(
     const uint64_t RecvBufferDrainThreshold =
         Stream->RecvBuffer.VirtualBufferLength / QUIC_RECV_BUFFER_DRAIN_RATIO;
 
-    if (!Stream->Connection->State.ReceivePaused) {
-        Stream->Connection->Send.MaxData += BytesDelivered;
+    Stream->RecvWindowBytesDelivered += BytesDelivered;
 
-        Stream->Connection->Send.OrderedStreamBytesDeliveredAccumulator += BytesDelivered;
-        if (Stream->Connection->Send.OrderedStreamBytesDeliveredAccumulator >=
-            Stream->Connection->Settings.ConnFlowControlWindow / QUIC_RECV_BUFFER_DRAIN_RATIO) {
-            Stream->Connection->Send.OrderedStreamBytesDeliveredAccumulator = 0;
+    if (Stream->RecvWindowBytesDelivered >= RecvBufferDrainThreshold) {
+
+        uint64_t TimeNow = CxPlatTimeUs64();
+
+        //
+        // Limit stream FC window growth by the connection FC window size.
+        //
+        if (Stream->RecvBuffer.VirtualBufferLength != 0 &&
+            Stream->RecvBuffer.VirtualBufferLength < Stream->Connection->Settings.ConnFlowControlWindow) {
+            uint64_t TimeThreshold =
+                ((Stream->RecvWindowBytesDelivered * Stream->Connection->Paths[0].SmoothedRtt) / RecvBufferDrainThreshold);
+            if (CxPlatTimeDiff64(Stream->RecvWindowLastUpdate, TimeNow) <= TimeThreshold) {
+
+                //
+                // Buffer tuning:
+                //
+                // VirtualBufferLength limits the connection's throughput to:
+                //   R = VirtualBufferLength / RTT
+                //
+                // We've delivered data at an average rate of at least:
+                //   R / QUIC_RECV_BUFFER_DRAIN_RATIO
+                //
+                // Double VirtualBufferLength to make sure it doesn't limit
+                // throughput.
+                //
+                // Mainly people complain about flow control when it limits
+                // throughput. But if we grow the buffer limit and then the app
+                // stops receiving data, bytes will pile up in the buffer. We could
+                // add logic to shrink the buffer when the app absorb rate is too
+                // low.
+                //
+
+                uint64_t NewLength = (uint64_t)Stream->RecvBuffer.VirtualBufferLength * 2;
+                if (NewLength <= UINT32_MAX) {
+                    QuicRecvBufferIncreaseVirtualBufferLength(
+                        &Stream->RecvBuffer,
+                        (uint32_t)NewLength);
+
+                    QuicTraceLogStreamVerbose(
+                        IncreaseRxBuffer,
+                        Stream,
+                        "Increasing max RX buffer size to %u (MinRtt=%llu; TimeNow=%llu; LastUpdate=%llu)",
+                        (uint32_t)NewLength,
+                        Stream->Connection->Paths[0].MinRtt,
+                        TimeNow,
+                        Stream->RecvWindowLastUpdate);
+                }
+            }
+        }
+
+        Stream->RecvWindowLastUpdate = TimeNow;
+        Stream->RecvWindowBytesDelivered = 0;
+
+    } else if (!(Stream->Connection->Send.SendFlags & QUIC_CONN_SEND_FLAG_ACK)) {
+        //
+        // We haven't hit the drain limit AND we don't have any ACKs to send
+        // immediately, so we don't need to immediately update the max stream data
+        // values.
+        //
+        return FALSE;
+    }
+
+    //
+    // Advance MaxAllowedRecvOffset.
+    //
+
+    QuicTraceLogStreamVerbose(
+        UpdateFlowControl,
+        Stream,
+        "Updating flow control window");
+
+    CXPLAT_DBG_ASSERT(
+        Stream->RecvBuffer.BaseOffset + Stream->RecvBuffer.VirtualBufferLength >=
+        Stream->MaxAllowedRecvOffset);
+
+    Stream->MaxAllowedRecvOffset =
+        Stream->RecvBuffer.BaseOffset + Stream->RecvBuffer.VirtualBufferLength;
+
+    return TRUE;
+}
+
+//
+// The credit accounting of a delivery event while no ingress limit is
+// configured on either scale (R1): byte-identical to the pre-shaper
+// behavior on both scales.
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicStreamOnBytesDeliveredLegacy(
+    _In_ QUIC_STREAM* Stream,
+    _In_ uint64_t BytesDelivered
+    )
+{
+    QUIC_CONNECTION* Connection = Stream->Connection;
+
+    if (!Connection->State.ReceivePaused) {
+        Connection->Send.MaxData += BytesDelivered;
+
+        Connection->Send.OrderedStreamBytesDeliveredAccumulator += BytesDelivered;
+        if (Connection->Send.OrderedStreamBytesDeliveredAccumulator >=
+            Connection->Settings.ConnFlowControlWindow / QUIC_RECV_BUFFER_DRAIN_RATIO) {
+            Connection->Send.OrderedStreamBytesDeliveredAccumulator = 0;
             QuicSendSetSendFlag(
-                &Stream->Connection->Send,
+                &Connection->Send,
                 QUIC_CONN_SEND_FLAG_MAX_DATA);
         }
     } else {
@@ -826,100 +966,247 @@ QuicStreamOnBytesDelivered(
         // can be applied to MaxData on resume (QuicConnRecvResume) instead of
         // being lost (which would permanently shrink the window).
         //
-        Stream->Connection->Send.DeferredMaxData += BytesDelivered;
+        Connection->Send.DeferredMaxData += BytesDelivered;
     }
 
-    if (!Stream->Flags.ReceivePaused) {
-
-        Stream->RecvWindowBytesDelivered += BytesDelivered;
-
-        if (Stream->RecvWindowBytesDelivered >= RecvBufferDrainThreshold) {
-
-            uint64_t TimeNow = CxPlatTimeUs64();
-
-            //
-            // Limit stream FC window growth by the connection FC window size.
-            //
-            if (Stream->RecvBuffer.VirtualBufferLength != 0 &&
-                Stream->RecvBuffer.VirtualBufferLength < Stream->Connection->Settings.ConnFlowControlWindow) {
-                uint64_t TimeThreshold =
-                    ((Stream->RecvWindowBytesDelivered * Stream->Connection->Paths[0].SmoothedRtt) / RecvBufferDrainThreshold);
-                if (CxPlatTimeDiff64(Stream->RecvWindowLastUpdate, TimeNow) <= TimeThreshold) {
-
-                    //
-                    // Buffer tuning:
-                    //
-                    // VirtualBufferLength limits the connection's throughput to:
-                    //   R = VirtualBufferLength / RTT
-                    //
-                    // We've delivered data at an average rate of at least:
-                    //   R / QUIC_RECV_BUFFER_DRAIN_RATIO
-                    //
-                    // Double VirtualBufferLength to make sure it doesn't limit
-                    // throughput.
-                    //
-                    // Mainly people complain about flow control when it limits
-                    // throughput. But if we grow the buffer limit and then the app
-                    // stops receiving data, bytes will pile up in the buffer. We could
-                    // add logic to shrink the buffer when the app absorb rate is too
-                    // low.
-                    //
-
-                    uint64_t NewLength = (uint64_t)Stream->RecvBuffer.VirtualBufferLength * 2;
-                    if (NewLength <= UINT32_MAX) {
-                        QuicRecvBufferIncreaseVirtualBufferLength(
-                            &Stream->RecvBuffer,
-                            (uint32_t)NewLength);
-
-                        QuicTraceLogStreamVerbose(
-                            IncreaseRxBuffer,
-                            Stream,
-                            "Increasing max RX buffer size to %u (MinRtt=%llu; TimeNow=%llu; LastUpdate=%llu)",
-                            (uint32_t)NewLength,
-                            Stream->Connection->Paths[0].MinRtt,
-                            TimeNow,
-                            Stream->RecvWindowLastUpdate);
-                    }
-                }
-            }
-
-            Stream->RecvWindowLastUpdate = TimeNow;
-            Stream->RecvWindowBytesDelivered = 0;
-
-        } else if (!(Stream->Connection->Send.SendFlags & QUIC_CONN_SEND_FLAG_ACK)) {
-            //
-            // We haven't hit the drain limit AND we don't have any ACKs to send
-            // immediately, so we don't need to immediately update the max stream data
-            // values.
-            //
-            return;
-        }
-
-        //
-        // Advance MaxAllowedRecvOffset.
-        //
-
-        QuicTraceLogStreamVerbose(
-            UpdateFlowControl,
-            Stream,
-            "Updating flow control window");
-
-        CXPLAT_DBG_ASSERT(
-            Stream->RecvBuffer.BaseOffset + Stream->RecvBuffer.VirtualBufferLength >=
-            Stream->MaxAllowedRecvOffset);
-
-        Stream->MaxAllowedRecvOffset =
-            Stream->RecvBuffer.BaseOffset + Stream->RecvBuffer.VirtualBufferLength;
-
+    if (!Stream->Flags.ReceivePaused &&
+        QuicStreamRecvWindowAdvanceLegacy(Stream, BytesDelivered)) {
         QuicSendSetSendFlag(
-            &Stream->Connection->Send,
+            &Connection->Send,
             QUIC_CONN_SEND_FLAG_MAX_DATA);
         QuicSendSetStreamSendFlag(
-            &Stream->Connection->Send,
+            &Connection->Send,
             Stream,
             QUIC_STREAM_SEND_FLAG_MAX_DATA,
             FALSE);
     }
+}
+
+//
+// The connection-scale credit of a shaped delivery event: an R6 grant (or a
+// 1:1 parking while the connection receive is paused, R10); with only a
+// stream limit configured the connection scale stays legacy (R1) and the
+// accumulator threshold governs MAX_DATA. Jitter is the delivering stream's
+// jitter (J3).
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicStreamConnCreditShaped(
+    _In_ QUIC_STREAM* Stream,
+    _In_ uint64_t BytesDelivered,
+    _In_ uint64_t ConnLimit,
+    _In_ uint64_t Jitter,
+    _In_ uint64_t NowNsec
+    )
+{
+    QUIC_CONNECTION* Connection = Stream->Connection;
+
+    if (Connection->State.ReceivePaused) {
+        //
+        // R10: the advertised limit is pinned while paused; the credit
+        // parks 1:1, without jitter.
+        //
+        Connection->Send.DeferredMaxData += BytesDelivered;
+        return;
+    }
+
+    BOOLEAN EmitMaxData;
+    if (ConnLimit != 0) {
+        EmitMaxData =
+            QuicIngressGrant(
+                &Connection->Send.MaxData,
+                Connection->Send.OrderedStreamBytesReceived,
+                ConnLimit,
+                &Connection->Send.MaxDataEmission,
+                Jitter,
+                NowNsec);
+    } else {
+        //
+        // Stream-only shaping: the connection scale stays legacy (R1).
+        //
+        Connection->Send.MaxData += BytesDelivered;
+        Connection->Send.OrderedStreamBytesDeliveredAccumulator += BytesDelivered;
+        EmitMaxData =
+            Connection->Send.OrderedStreamBytesDeliveredAccumulator >=
+            Connection->Settings.ConnFlowControlWindow / QUIC_RECV_BUFFER_DRAIN_RATIO;
+        if (EmitMaxData) {
+            Connection->Send.OrderedStreamBytesDeliveredAccumulator = 0;
+        }
+    }
+    if (EmitMaxData) {
+        QuicSendSetSendFlag(
+            &Connection->Send,
+            QUIC_CONN_SEND_FLAG_MAX_DATA);
+    }
+}
+
+//
+// Keeps the stream's receive buffer capacity covering the advertised window
+// (D1): a compliant peer may send up to MaxAllowedRecvOffset, while
+// QuicRecvBufferWrite rejects anything beyond RecvBuffer.BaseOffset +
+// RecvBuffer.VirtualBufferLength with FLOW_CONTROL_ERROR — the accept bound
+// must never fall below the announced bound. Growth-only (the buffer API
+// doesn't support decrease) and driven by shaped grants up to the effective
+// ceiling, so the buffer grows to the limit and never beyond it (R16:
+// auto-tune doubling beyond the limit stays suppressed — the legacy
+// RTT-based growth doesn't run while a stream limit is set).
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicStreamTrackShapedRecvBufferCapacity(
+    _In_ QUIC_STREAM* Stream
+    )
+{
+    const uint64_t RequiredVBL =
+        QuicIngressRequiredVirtualBufferLength(
+            Stream->MaxAllowedRecvOffset,
+            Stream->RecvBuffer.BaseOffset);
+
+    CXPLAT_DBG_ASSERT(RequiredVBL <= UINT32_MAX);
+
+    if (RequiredVBL > (uint64_t)Stream->RecvBuffer.VirtualBufferLength) {
+        QuicRecvBufferIncreaseVirtualBufferLength(
+            &Stream->RecvBuffer,
+            (uint32_t)RequiredVBL);
+    }
+}
+
+//
+// The shaped R7 grant of a non-paused stream: applies the clamped grant to
+// MaxAllowedRecvOffset and grows the receive buffer capacity to cover the
+// granted window (D1). Returns TRUE when MAX_STREAM_DATA must be emitted
+// (R15). The stream window is additionally capped at the receive buffer's
+// virtual length width (uint32_t): a wider window could not be backed by
+// the accept bound, and the connection-level limit still governs the
+// aggregate.
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+BOOLEAN
+QuicStreamStreamGrantShaped(
+    _In_ QUIC_STREAM* Stream,
+    _In_ uint64_t EffectiveLimit,
+    _In_ uint64_t DeliveryCredit,
+    _In_ uint64_t NowNsec
+    )
+{
+    const uint64_t StreamCeiling =
+        CXPLAT_MIN(EffectiveLimit, (uint64_t)UINT32_MAX);
+
+    const BOOLEAN EmitMaxStreamData =
+        QuicIngressGrant(
+            &Stream->MaxAllowedRecvOffset,
+            Stream->RecvBuffer.BaseOffset,
+            StreamCeiling,
+            &Stream->IngressShaper.Emission,
+            DeliveryCredit,
+            NowNsec);
+
+    QuicStreamTrackShapedRecvBufferCapacity(Stream);
+
+    return EmitMaxStreamData;
+}
+
+//
+// The stream-scale credit of a shaped delivery event: an R7 grant through
+// the effective ceiling while the stream is not paused (R11); with only a
+// connection limit configured the stream scale stays legacy (R7), and its
+// window announcement no longer sets the connection MAX_DATA flag — that
+// scale's emission is governed by R15 (see QuicStreamConnCreditShaped).
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicStreamStreamCreditShaped(
+    _In_ QUIC_STREAM* Stream,
+    _In_ uint64_t BytesDelivered,
+    _In_ uint64_t StreamLimit,
+    _In_ uint64_t EffectiveLimit,
+    _In_ uint64_t Jitter,
+    _In_ uint64_t NowNsec
+    )
+{
+    QUIC_CONNECTION* Connection = Stream->Connection;
+
+    if (Stream->Flags.ReceivePaused) {
+        //
+        // R11: a paused stream grants nothing; the connection grant is
+        // unaffected (QuicStreamConnCreditShaped).
+        //
+        return;
+    }
+
+    if (StreamLimit != 0) {
+        if (QuicStreamStreamGrantShaped(Stream, EffectiveLimit, Jitter, NowNsec)) {
+            QuicSendSetStreamSendFlag(
+                &Connection->Send,
+                Stream,
+                QUIC_STREAM_SEND_FLAG_MAX_DATA,
+                FALSE);
+        }
+    } else if (QuicStreamRecvWindowAdvanceLegacy(Stream, BytesDelivered)) {
+        QuicSendSetStreamSendFlag(
+            &Connection->Send,
+            Stream,
+            QUIC_STREAM_SEND_FLAG_MAX_DATA,
+            FALSE);
+    }
+}
+
+//
+// The credit accounting of a delivery event while an ingress limit is
+// configured (R2): the delivery-rate estimator drives the R5 jitter; the
+// connection scale grants per R6 (or parks 1:1 while paused, R10) and the
+// stream scale grants per R7 while the stream is not paused (R11); each
+// shaped scale emits its frame per the R15 policy.
+//
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicStreamOnBytesDeliveredShaped(
+    _In_ QUIC_STREAM* Stream,
+    _In_ uint64_t BytesDelivered,
+    _In_ uint64_t ConnLimit,
+    _In_ uint64_t StreamLimit
+    )
+{
+    const uint64_t EffectiveLimit = QuicIngressEffectiveStreamLimit(ConnLimit, StreamLimit);
+    const uint64_t NowNsec = QuicIngressNowNsec();
+
+    //
+    // R3/R4/R5: the estimator is updated (independently of paused states),
+    // the knee anchors are recomputed from the current effective limit and
+    // the jitter is the jitter of the delivering stream (J3) — shared by
+    // both scales.
+    //
+    const uint64_t DeliveryCredit =
+        QuicIngressSatAdd(
+            QuicIngressStreamJitter(
+                &Stream->IngressShaper.Estimator, EffectiveLimit, BytesDelivered, NowNsec),
+            BytesDelivered);
+
+    QuicStreamConnCreditShaped(Stream, BytesDelivered, ConnLimit, DeliveryCredit, NowNsec);
+    QuicStreamStreamCreditShaped(
+        Stream, BytesDelivered, StreamLimit, EffectiveLimit, DeliveryCredit, NowNsec);
+}
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+void
+QuicStreamOnBytesDelivered(
+    _In_ QUIC_STREAM* Stream,
+    _In_ uint64_t BytesDelivered
+    )
+{
+    const uint64_t ConnLimit = Stream->Connection->Send.ConnIngressLimit;
+    const uint64_t StreamLimit = Stream->IngressShaper.Limit;
+
+    if (ConnLimit == 0 && StreamLimit == 0) {
+        //
+        // R1: no limit configured on either scale — byte-identical legacy
+        // behavior, no estimator state is kept.
+        //
+        QuicStreamOnBytesDeliveredLegacy(Stream, BytesDelivered);
+        return;
+    }
+
+    QuicStreamOnBytesDeliveredShaped(Stream, BytesDelivered, ConnLimit, StreamLimit);
 }
 
 _IRQL_requires_max_(PASSIVE_LEVEL)

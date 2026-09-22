@@ -94,6 +94,7 @@
 ../src/test/lib/TestConnection.cpp
 ../src/test/lib/MtuTest.cpp
 ../src/test/lib/HandshakeTest.cpp
+../src/test/lib/IngressWindowE2ETest.cpp
 ../src/test/lib/QuicDrill.cpp
 ../src/test/lib/DatagramTest.cpp
 ../src/test/lib/OwnershipTest.cpp

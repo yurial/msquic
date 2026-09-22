@@ -9,6 +9,7 @@ set(SOURCES
     CongestionControlPacerTest.cpp
     CubicTest.cpp
     FrameTest.cpp
+    IngressShaperTest.cpp
     PacketNumberTest.cpp
     PartitionTest.cpp
     PathPacerTest.cpp

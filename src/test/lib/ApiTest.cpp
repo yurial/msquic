@@ -5659,6 +5659,104 @@ void QuicTest_QUIC_PARAM_CONN_BANDWIDTH_SHAPER(MsQuicRegistration& Registration)
     }
 }
 
+void QuicTest_QUIC_PARAM_CONN_INGRESS_WINDOW_LIMIT(MsQuicRegistration& Registration)
+{
+    TestScopeLogger LogScope0("QUIC_PARAM_CONN_INGRESS_WINDOW_LIMIT");
+    {
+        TestScopeLogger LogScope1("GetParam default (0 = unset)");
+        MsQuicConnection Connection(Registration);
+        TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
+        uint32_t Length = 0;
+        TEST_QUIC_STATUS(
+            QUIC_STATUS_BUFFER_TOO_SMALL,
+            Connection.GetParam(
+                QUIC_PARAM_CONN_INGRESS_WINDOW_LIMIT,
+                &Length,
+                nullptr));
+        TEST_EQUAL(Length, sizeof(uint64_t));
+        uint64_t Value = 0xFFFFFFFFFFFFFFFFull;
+        Length = sizeof(Value);
+        TEST_QUIC_SUCCEEDED(
+            Connection.GetParam(
+                QUIC_PARAM_CONN_INGRESS_WINDOW_LIMIT,
+                &Length,
+                &Value));
+        TEST_EQUAL(Length, sizeof(Value));
+        TEST_EQUAL(Value, 0ull); // 0 = no limit configured (R1)
+    }
+    {
+        TestScopeLogger LogScope1("SetParam wrong length or null buffer");
+        MsQuicConnection Connection(Registration);
+        TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
+        uint64_t Dummy = 32768;
+        uint64_t Value = 0xFFFFFFFFFFFFFFFFull;
+        uint32_t Length = sizeof(Value);
+        TEST_QUIC_STATUS(
+            QUIC_STATUS_INVALID_PARAMETER,
+            Connection.SetParam(
+                QUIC_PARAM_CONN_INGRESS_WINDOW_LIMIT,
+                sizeof(Dummy) - 1, // too small
+                &Dummy));
+        TEST_QUIC_STATUS(
+            QUIC_STATUS_INVALID_PARAMETER,
+            Connection.SetParam(
+                QUIC_PARAM_CONN_INGRESS_WINDOW_LIMIT,
+                sizeof(Dummy) + 1, // too big
+                &Dummy));
+        TEST_QUIC_STATUS(
+            QUIC_STATUS_INVALID_PARAMETER,
+            Connection.SetParam(
+                QUIC_PARAM_CONN_INGRESS_WINDOW_LIMIT,
+                sizeof(Dummy),
+                nullptr)); // null buffer
+        //
+        // The rejected SETs must not change the default.
+        //
+        TEST_QUIC_SUCCEEDED(
+            Connection.GetParam(
+                QUIC_PARAM_CONN_INGRESS_WINDOW_LIMIT,
+                &Length,
+                &Value));
+        TEST_EQUAL(Value, 0ull);
+    }
+    {
+        TestScopeLogger LogScope1("SetParam/GetParam round-trip (echo as-is)");
+        MsQuicConnection Connection(Registration);
+        TEST_QUIC_SUCCEEDED(Connection.GetInitStatus());
+        const uint64_t LimitValue = 1048576; // 1 MiB
+        TEST_QUIC_SUCCEEDED(
+            Connection.SetParam(
+                QUIC_PARAM_CONN_INGRESS_WINDOW_LIMIT,
+                sizeof(LimitValue),
+                &LimitValue));
+        uint64_t Value = 0;
+        uint32_t Length = sizeof(Value);
+        TEST_QUIC_SUCCEEDED(
+            Connection.GetParam(
+                QUIC_PARAM_CONN_INGRESS_WINDOW_LIMIT,
+                &Length,
+                &Value));
+        TEST_EQUAL(Length, sizeof(Value));
+        TEST_EQUAL(Value, LimitValue);
+        //
+        // Clearing (0) is valid and round-trips (R1: shaper off).
+        //
+        const uint64_t Clear = 0;
+        TEST_QUIC_SUCCEEDED(
+            Connection.SetParam(
+                QUIC_PARAM_CONN_INGRESS_WINDOW_LIMIT,
+                sizeof(Clear),
+                &Clear));
+        Length = sizeof(Value);
+        TEST_QUIC_SUCCEEDED(
+            Connection.GetParam(
+                QUIC_PARAM_CONN_INGRESS_WINDOW_LIMIT,
+                &Length,
+                &Value));
+        TEST_EQUAL(Value, 0ull);
+    }
+}
+
 void QuicTest_QUIC_PARAM_CONN_NETWORK_STATISTICS(MsQuicRegistration& Registration)
 {
 #ifdef QUIC_API_ENABLE_PREVIEW_FEATURES
@@ -5760,6 +5858,7 @@ void QuicTestConnectionParam()
     QuicTest_QUIC_PARAM_CONN_ORIG_DEST_CID(Registration, ClientConfiguration);
     QuicTest_QUIC_PARAM_CONN_SEND_DSCP(Registration);
     QuicTest_QUIC_PARAM_CONN_BANDWIDTH_SHAPER(Registration);
+    QuicTest_QUIC_PARAM_CONN_INGRESS_WINDOW_LIMIT(Registration);
     QuicTest_QUIC_PARAM_CONN_NETWORK_STATISTICS(Registration);
     QuicTest_QUIC_PARAM_CONN_CLOSE_ASYNC(Registration);
 }
@@ -6491,6 +6590,99 @@ void QuicTestStreamParam()
         }
     }
 #endif // QUIC_PARAM_STREAM_RELIABLE_OFFSET
+
+    //
+    // QUIC_PARAM_STREAM_INGRESS_WINDOW_LIMIT
+    //
+    {
+        TestScopeLogger LogScope0("QUIC_PARAM_STREAM_INGRESS_WINDOW_LIMIT");
+        MsQuicStream Stream(Connection, QUIC_STREAM_OPEN_FLAG_NONE);
+        {
+            TestScopeLogger LogScope1("GetParam default (0 = unset)");
+            uint32_t Length = 0;
+            TEST_QUIC_STATUS(
+                QUIC_STATUS_BUFFER_TOO_SMALL,
+                MsQuic->GetParam(
+                    Stream.Handle,
+                    QUIC_PARAM_STREAM_INGRESS_WINDOW_LIMIT,
+                    &Length,
+                    nullptr));
+            TEST_EQUAL(Length, sizeof(uint64_t));
+            uint64_t Value = 0xFFFFFFFFFFFFFFFFull;
+            Length = sizeof(Value);
+            TEST_QUIC_SUCCEEDED(
+                MsQuic->GetParam(
+                    Stream.Handle,
+                    QUIC_PARAM_STREAM_INGRESS_WINDOW_LIMIT,
+                    &Length,
+                    &Value));
+            TEST_EQUAL(Length, sizeof(Value));
+            TEST_EQUAL(Value, 0ull); // 0 = no limit configured (R1)
+        }
+        {
+            TestScopeLogger LogScope1("SetParam wrong length or null buffer");
+            uint64_t Dummy = 32768;
+            TEST_QUIC_STATUS(
+                QUIC_STATUS_INVALID_PARAMETER,
+                MsQuic->SetParam(
+                    Stream.Handle,
+                    QUIC_PARAM_STREAM_INGRESS_WINDOW_LIMIT,
+                    sizeof(Dummy) - 1, // too small
+                    &Dummy));
+            TEST_QUIC_STATUS(
+                QUIC_STATUS_INVALID_PARAMETER,
+                MsQuic->SetParam(
+                    Stream.Handle,
+                    QUIC_PARAM_STREAM_INGRESS_WINDOW_LIMIT,
+                    sizeof(Dummy) + 1, // too big
+                    &Dummy));
+            TEST_QUIC_STATUS(
+                QUIC_STATUS_INVALID_PARAMETER,
+                MsQuic->SetParam(
+                    Stream.Handle,
+                    QUIC_PARAM_STREAM_INGRESS_WINDOW_LIMIT,
+                    sizeof(Dummy),
+                    nullptr)); // null buffer
+        }
+        {
+            TestScopeLogger LogScope1("SetParam/GetParam round-trip (echo as-is)");
+            const uint64_t LimitValue = 524288; // 512 KiB
+            TEST_QUIC_SUCCEEDED(
+                MsQuic->SetParam(
+                    Stream.Handle,
+                    QUIC_PARAM_STREAM_INGRESS_WINDOW_LIMIT,
+                    sizeof(LimitValue),
+                    &LimitValue));
+            uint64_t Value = 0;
+            uint32_t Length = sizeof(Value);
+            TEST_QUIC_SUCCEEDED(
+                MsQuic->GetParam(
+                    Stream.Handle,
+                    QUIC_PARAM_STREAM_INGRESS_WINDOW_LIMIT,
+                    &Length,
+                    &Value));
+            TEST_EQUAL(Length, sizeof(Value));
+            TEST_EQUAL(Value, LimitValue);
+            //
+            // Clearing (0) is valid and echoes back as 0.
+            //
+            const uint64_t Clear = 0;
+            TEST_QUIC_SUCCEEDED(
+                MsQuic->SetParam(
+                    Stream.Handle,
+                    QUIC_PARAM_STREAM_INGRESS_WINDOW_LIMIT,
+                    sizeof(Clear),
+                    &Clear));
+            Length = sizeof(Value);
+            TEST_QUIC_SUCCEEDED(
+                MsQuic->GetParam(
+                    Stream.Handle,
+                    QUIC_PARAM_STREAM_INGRESS_WINDOW_LIMIT,
+                    &Length,
+                    &Value));
+            TEST_EQUAL(Value, 0ull);
+        }
+    }
 }
 
 void

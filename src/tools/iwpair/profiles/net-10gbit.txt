@@ -1,0 +1,45 @@
+# iwpair network profile: net-10gbit (S13(f), IWP_NETWORK_PROFILES)
+#
+# 10 Gbit channel emulation: one labeled session (net-10gbit) - a pace
+# phase at the channel rate shortened to 600 ms (the volume/CPU
+# ceiling: ~750 MB per session is near the sustained userspace QUIC
+# pacing limit on typical hardware, J18(d)), the suite's 800 ms decay
+# idle (>= IW_E2E_IDLE_DECAY_NSEC = 700 ms), then a 2097152 B burst
+# (the IWP_MAX_BURST_BYTES ceiling - far below 12 x L_c; the
+# ceiling-binding burst coverage stays with the suite's IWP-S-Burst
+# and the narrow profiles, J18(d)).
+#
+# The line's `L:10000:0` segment commands the session limits (L_c,
+# L_s) = (125000000, 0) - the window equals one estimator interval of
+# the channel (mbit x 12500 B = bandwidth x the shaper's 100 ms
+# measurement interval, IWP_LINE_LIMIT_BYTES_PER_MBIT). The
+# -client_conn_limit / -client_stream_limit flags DO NOT reach this
+# session: the `L:` value overrides them (S13(c)); changing the limits
+# means editing (a copy of) this file - the former "optional
+# -client_conn_limit raise" suggestion is superseded, the raise is
+# built in.
+#
+# Paired usage line (the file carries the script WITH its limits - the
+# channel cap stays a server flag, one per run):
+#
+#   iwpair-server -script_file:src/tools/iwpair/profiles/net-10gbit.txt \
+#       -network_output_bandwidth:1250000000 -burst_ref_rate:1250000000
+#   iwpair-client -target:<addr>
+#
+# -burst_ref_rate = the cap keeps the capped burst's plan rate r_b
+# equal to the drain rate (with the default 1 MB/s reference the
+# strict flatness/total-time ideals would anchor at r_b while the
+# delivery runs at 1250 x r_b - false failures, R16(c1)/J18(e)).
+#
+# Shaper zone at the line's limits: as net-1gbit - k-hat = 1 (the
+# saturation edge); B2 derived (r0 = 1250000000 <= 2500000000 - at the
+# former default L_c = 64 KiB this row was N-A "decay condition
+# violated"). Flatness N-A "window not measurable" (the 2 MiB burst
+# drains in ~1.7 ms, R16(d) #28); the total-time pair and the byte
+# rows remain the coverage.
+#
+# Runtime: ~1.4 s session, ~750 MB payload (CPU-bound). The pairing is
+# a convention, not an enforced contract: without the cap this is a
+# plain uncapped run of the same script (its `L:` limits still apply).
+
+net-10gbit: P:1250000000:600;I:800;B:2097152;L:10000:0

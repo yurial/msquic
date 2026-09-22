@@ -24,6 +24,7 @@ set(SOURCES
     bbr.c
     datagram.c
     frame.c
+    ingress_shaper.c
     partition.c
     library.c
     listener.c

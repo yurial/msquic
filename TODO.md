@@ -1,6 +1,12 @@
 # TODO
 
 ## Known issues / deviations
+- [ ] Ingress-window shaper — accepted by review.
+  Known follow-up (non-blocking): TP-generation clamping in
+  QuicConnGenerateLocalTransportParameters has no dedicated test
+  (the wire-level gap for stream limits > 64 KiB is covered end-to-end by
+  src/test/lib/IngressWindowE2ETest.cpp, see specs/ingress-window-e2e-test.md;
+  min()-mutation coverage via extended mode IW-Bless-Burst).
 - [ ] Deliberate deviation from RFC 9000 Section 4.1 (both connection and
   stream level): an incoming MAX_DATA frame always sets the connection
   flow control limit, and an incoming MAX_STREAM_DATA frame always sets the

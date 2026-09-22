@@ -783,6 +783,16 @@ QuicLossDetectionRetransmitFrames(
             break;
 
         case QUIC_FRAME_MAX_DATA:
+            if (Connection->Send.ConnIngressLimit != 0) {
+                //
+                // R13: the re-announcement repeats the current computed
+                // limit without new credit; it is an immediate emission
+                // exception (R15) — the pending credit is announced at once.
+                //
+                QuicIngressEmissionRecord(
+                    &Connection->Send.MaxDataEmission,
+                    QuicIngressNowNsec());
+            }
             NewDataQueued |=
                 QuicSendSetSendFlag(
                     &Connection->Send,
@@ -790,6 +800,16 @@ QuicLossDetectionRetransmitFrames(
             break;
 
         case QUIC_FRAME_MAX_STREAM_DATA:
+            if (Packet->Frames[i].MAX_STREAM_DATA.Stream->IngressShaper.Limit != 0) {
+                //
+                // R13: the re-announcement repeats the current computed
+                // limit without new credit; it is an immediate emission
+                // exception (R15) — the pending credit is announced at once.
+                //
+                QuicIngressEmissionRecord(
+                    &Packet->Frames[i].MAX_STREAM_DATA.Stream->IngressShaper.Emission,
+                    QuicIngressNowNsec());
+            }
             NewDataQueued |=
                 QuicSendSetStreamSendFlag(
                     &Connection->Send,

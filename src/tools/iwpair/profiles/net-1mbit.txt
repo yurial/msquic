@@ -1,0 +1,45 @@
+# iwpair network profile: net-1mbit (S13(f), IWP_NETWORK_PROFILES)
+#
+# 1 Mbit channel emulation: one labeled session (net-1mbit) - a pace
+# phase at the channel rate, the suite's 800 ms decay idle (>=
+# IW_E2E_IDLE_DECAY_NSEC = 700 ms, past the quiet-idle settle), then a
+# 131072 B burst (= 10.5 x L_c, near-full J4 teeth; the narrow-channel
+# time-budget compromise: a 12 x L burst would drain ~6.3 s - the
+# full-teeth burst coverage stays with the suite's IWP-S-Burst,
+# J18(d)).
+#
+# The line's `L:1:0` segment commands the session limits (L_c, L_s) =
+# (12500, 0) - the window equals one estimator interval of the channel
+# (mbit x 12500 B = bandwidth x the shaper's 100 ms measurement
+# interval, IWP_LINE_LIMIT_BYTES_PER_MBIT). The -client_conn_limit /
+# -client_stream_limit flags DO NOT reach this session: the `L:` value
+# overrides them (S13(c)); changing the limits means editing (a copy
+# of) this file - the former "optional -client_conn_limit raise"
+# suggestion is superseded, the raise is built in.
+#
+# Paired usage line (the file carries the script WITH its limits - the
+# channel cap stays a server flag, one per run):
+#
+#   iwpair-server -script_file:src/tools/iwpair/profiles/net-1mbit.txt \
+#       -network_output_bandwidth:125000 -burst_ref_rate:125000
+#   iwpair-client -target:<addr>
+#
+# -burst_ref_rate = the cap keeps the capped burst's plan rate r_b
+# equal to the drain rate (with the default 1 MB/s reference and a
+# wider cap the strict flatness/total-time ideals would anchor below
+# the actual rate and false-fail, R16(c1)/J18(e)).
+#
+# Shaper zone at the line's limits: the saturation edge - the window
+# holds exactly one estimator interval of the channel, so Sat = RawSat
+# = 125000 = r and k-hat = 1 (grants 2x; supersedes the former 64 KiB
+# knee-zone note); B2 derived (r0 = 125000 <= 128 x Floor = 2097152).
+# L_c = 12500 is below IwLimit16K and below the 65536 preset - the
+# below-16-KiB caveat applies, no_choke is N-A (R16(d) #24: L_eff <
+# 16 KiB), and the initial-window exemption member A0 - D_cum ~=
+# 53036 B (~0.42 s of the pace) covers the release (R16(d) #26).
+#
+# Runtime: ~2.9 s session, ~0.25 MB payload. The pairing is a
+# convention, not an enforced contract: without the cap this is a
+# plain uncapped run of the same script (its `L:` limits still apply).
+
+net-1mbit: P:125000:1000;I:800;B:131072;L:1:0

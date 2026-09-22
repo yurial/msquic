@@ -2867,6 +2867,49 @@ TEST(Misc, RecvPauseDeferredCredit) {
 }
 #endif // QUIC_API_ENABLE_PREVIEW_FEATURES
 
+TEST(Misc, IngressWindowE2ECi) {
+    TestLogger Logger("IngressWindowE2ECi");
+    if (TestingKernelMode) {
+        ASSERT_TRUE(InvokeKernelTest(FUNC(QuicTestIngressWindowE2ECi)));
+    } else {
+        QuicTestIngressWindowE2ECi();
+    }
+}
+
+TEST(Misc, IngressWindowE2EExtended) {
+    TestLogger Logger("IngressWindowE2EExtended");
+    if (TestingKernelMode) {
+        ASSERT_TRUE(InvokeKernelTest(FUNC(QuicTestIngressWindowE2EExtended)));
+    } else {
+        QuicTestIngressWindowE2EExtended();
+    }
+}
+
+//
+// R16(h): the expectation-registry unit tests (pure IwPairCommon, no
+// network, no MsQuic) - golden literals, the derived/N-A enumeration
+// and the verdict/rendering rules.
+//
+TEST(Misc, IwpairExpectationGolden) {
+    TestLogger Logger("IwpairExpectationGolden");
+    IwpairExpectationGolden();
+}
+
+TEST(Misc, IwpairExpectationDerivedNa) {
+    TestLogger Logger("IwpairExpectationDerivedNa");
+    IwpairExpectationDerivedNa();
+}
+
+TEST(Misc, IwpairExpectationVerdicts) {
+    TestLogger Logger("IwpairExpectationVerdicts");
+    IwpairExpectationVerdicts();
+}
+
+TEST(Misc, IwpairExpectationLineLimits) {
+    TestLogger Logger("IwpairExpectationLineLimits");
+    IwpairExpectationLineLimits();
+}
+
 TEST(Misc, StreamAbortRecvFinRace) {
     TestLogger Logger("StreamAbortRecvFinRace");
     if (TestingKernelMode) {

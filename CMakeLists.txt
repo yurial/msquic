@@ -981,6 +981,16 @@ if(QUIC_BUILD_TOOLS)
     add_subdirectory(src/tools)
 endif()
 
+#
+# Shared code of the ingress-window e2e test and the standalone iwpair
+# tools (specs/ingress-window-e2e-test.md, S2). Added when tools or tests
+# are built, so test-only configurations keep building; the iwpair tools
+# themselves are registered from within (guarded by QUIC_BUILD_TOOLS).
+#
+if(QUIC_BUILD_TOOLS OR QUIC_BUILD_TEST)
+    add_subdirectory(src/tools/iwpair)
+endif()
+
 # Performance code
 if(QUIC_BUILD_PERF)
     add_subdirectory(src/perf/lib)

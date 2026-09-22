@@ -4,134 +4,137 @@
 > Owner: Transport
 > Branch: `issue-bandwidth-shaper`
 > Files (target): `src/core/bandwidth_shaper.h`, `src/core/bandwidth_shaper.c`;
-> иерархия (§15, §16): `src/inc/msquic.h`, `src/core/library.{h,c}`,
+> hierarchy (§15, §16): `src/inc/msquic.h`, `src/core/library.{h,c}`,
 > `src/core/configuration.{h,c}`, `src/core/connection.{h,c}`,
 > `src/core/congestion_control.h`
 
 ## §1 Goal and Scope
 
-Реализовать отдельный компонент шейпера исходящего трафика (pacer) для
-ограничения мгновенной скорости отправки данных на уровне `bytes per second`
-с конечным burst-budget. Шейпер должен быть переиспользуемым, не иметь
-зависимостей от congestion control и иметь детерминированный контракт,
-пригодный для юнит-тестирования.
+Implement a standalone outgoing-traffic shaper component (pacer) that limits
+the instantaneous data-sending rate at the `bytes per second` level with a
+finite burst budget. The shaper must be reusable, have no dependencies on
+congestion control, and have a deterministic contract suitable for unit
+testing.
 
-Не входит в scope данной спецификации:
+Out of scope of this specification:
 
-- per-path **настройка rate**: параметр `QUIC_PARAM_CONN_BANDWIDTH_SHAPER`
-  (§22) задаёт один rate на соединение, применяемый ко всем путям; шейпер
-  при этом живёт на каждом пути (`QUIC_PATH.PacerShaper`, §20) ради
-  независимого кредита каждого маршрута, но отдельного per-path параметра
-  конфигурации не вводится;
-- динамическая перепривязка живых соединений к родителям, установленным
-  после привязки (snapshot-at-bind, §15.4, §16.6);
-- MTU-sync родительского шейпера (родитель не выполняет MTU-chunking,
+- per-path **rate configuration**: the parameter
+  `QUIC_PARAM_CONN_BANDWIDTH_SHAPER` (§22) sets a single rate per connection,
+  applied to all paths; the shaper itself lives on each path
+  (`QUIC_PATH.PacerShaper`, §20) for the sake of each route's independent
+  credit, but no separate per-path configuration parameter is introduced;
+- dynamic rebinding of live connections to parents established after
+  binding (snapshot-at-bind, §15.4, §16.6);
+- MTU-sync of the parent shaper (the parent does not perform MTU-chunking,
   §15.1/§16.3);
-- отдельный тип «BandwidthLimiter» с обратной связью (§39, риск 4).
+- a separate "BandwidthLimiter" type with feedback (§39, risk 4).
 
-В scope входит вся реализованная в этой работе функциональность (фазы
+In scope is all the functionality implemented in this work (phases
 1–5, §40):
 
-- самостоятельный модуль шейпера `src/core/bandwidth_shaper.{h,c}`
-  (§3–§14) — внутренний для ядра;
-- встраивание шейпера в `QUIC_CONGESTION_CONTROL` как CC-внутреннего
-  пейсера `Cc->Pacer` (§17, §24), управляющего rate-плагина (§25–§27),
-  с миграцией Cubic/BBR;
-- интеграция в путь отправки: per-path шейпер `QUIC_PATH.PacerShaper`
-  (§20), точки вызова в `QuicPacketBuilderInitialize`/`QuicSendFlush`/
+- the standalone shaper module `src/core/bandwidth_shaper.{h,c}`
+  (§3–§14) — internal to the core;
+- embedding the shaper into `QUIC_CONGESTION_CONTROL` as the CC-internal
+  pacer `Cc->Pacer` (§17, §24), the controlling rate plugin (§25–§27),
+  with the Cubic/BBR migration;
+- integration into the send path: the per-path shaper `QUIC_PATH.PacerShaper`
+  (§20), call sites in `QuicPacketBuilderInitialize`/`QuicSendFlush`/
   `QuicLossDetectionOnPacketSent` (§21);
-- connection-level параметр `QUIC_PARAM_CONN_BANDWIDTH_SHAPER` (§22);
-- application-level родительская иерархия (§15, §16): публичная
-  структура `QUIC_BANDWIDTH_SHAPER_CONFIG` и параметры
+- the connection-level parameter `QUIC_PARAM_CONN_BANDWIDTH_SHAPER` (§22);
+- the application-level parent hierarchy (§15, §16): the public structure
+  `QUIC_BANDWIDTH_SHAPER_CONFIG` and the parameters
   `QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER` /
-  `QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER` в `msquic.h`; application-level
-  часть — родительский шейпер на двух уровнях (библиотека и
-  `QUIC_CONFIGURATION`), объектная модель и интеграция иерархии (§16).
+  `QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER` in `msquic.h`; the
+  application-level part — the parent shaper at two levels (library and
+  `QUIC_CONFIGURATION`), the object model, and the hierarchy integration
+  (§16).
 
-## §2 Терминология и обозначения
+## §2 Terminology and Notation
 
-### §2.1 Термины
+### §2.1 Terms
 
-| Термин                  | Тип     | Определение                                                                                                  |
+| Term                    | Type     | Definition                                                                                                  |
 | ----------------------- | ------- | ------------------------------------------------------------------------------------------------------------ |
-| `NowUsec`               | `uint64_t` | Текущее монотонное время в микросекундах. Платформо-независимо; всегда инъецируется вызывающим кодом — модуль шейпера не читает системные часы (см. §14); единственное исключение — граница SetParam публичных параметров, где время читается библиотекой и инъецируется дальше (§15.3). **Контракт представимости:** `NowUsec <= UINT64_MAX / 1'000` (конвертация в наносекунды `NowNsec = NowUsec * 1'000` не переполняется; ~584'942 года в мкс — с запасом для любых монотонных источников). |
-| `Bandwidth`             | `uint64_t` | Целевая пропускная способность, **бит/с**. `0` означает «без ограничений».                                |
-| `BurstWindowUsec`       | `uint64_t` | Окно, мкс, определяющее burst-budget. Публичный аргумент конфигурации; **хранится в точности как сконфигурировано** (включая `0`) и возвращается GET-путями как есть — ничто не переписывается и не выводится. Поведение выбирается **при вызове** парой окна и per-call `Mtu` (§3.2): при `Mtu > 0` и burst-бюджете `BurstWindowUsec * BandwidthBitsPerSecond / 8'000'000 < Mtu` — **явный «строгий» режим** «один пакет размера `Mtu` на интервал дебита», окно в математике не участвует вовсе; при `Mtu == 0` и `BurstWindowUsec == 0` — **непрерывный режим** (continuous-rate): сырая пропорциональная модель без клэмп-окна и без квантования; иначе — **обычный** (пропорциональный) режим, окно участвует в арифметике как есть. |
-| `Mtu`                   | `uint16_t` | Размер пакета вызывающей стороны, байт — **per-call аргумент математических функций** (§3.3), а не хранимое состояние: шейпер поле `Mtu` не хранит. На пути отправки передаётся `Path->Mtu` (меняется DPLPMTUD/настройками — читается актуальное значение на каждый вызов); родители и standalone-потребители без размера пакета передают `0`. |
-| `Родитель` (parent)     | `QUIC_BANDWIDTH_SHAPER_PARENT*` | Application-level шейпер-потолок, разделяемый несколькими соединениями; устанавливается на уровне библиотеки и/или `QUIC_CONFIGURATION` (§15, §16). Уровни **стекуются**: соединение может иметь до двух родителей одновременно — по одному на уровень (§16.2). `NULL` — родителя на уровне нет. |
-| `Ребёнок` (child)       | `QUIC_BANDWIDTH_SHAPER` | Per-path шейпер-ребёнок иерархии `QUIC_PATH.PacerShaper` (§20, §16.3); CC-внутренний пейсер `Cc->Pacer` (`QUIC_CONGESTION_CONTROL`, §17, §24) — отдельная сущность, ребёнком иерархии не является. |
-| `CreditBaseTimeNsec`    | `uint64_t` | Виртуальное **время-база кредита в наносекундах**, от которого вычисляется лимит отправляемых байт. НЕ равно времени последней отправки: обновляется по формуле `max(CreditBaseTimeNsec, NowNsec - BurstWindowNsec) + DebitNsec` (обычный режим), `max(CreditBaseTimeNsec, NowNsec - MtuDebitNsec) + max(DebitNsec, MtuDebitNsec)` (строгий режим) или `max(CreditBaseTimeNsec, NowNsec) + DebitNsec` (непрерывный режим, §3.2). `0` — отправок не было. |
-| `BurstWindowNsec`       | `uint64_t` | Окно в наносекундах — **вычисляемая** величина (не поле структуры): `BurstWindowUsec * 1'000`, конвертируется из хранимого `BurstWindowUsec` при каждом использовании в обычном режиме (§3.2, §4); в строгом режиме не вычисляется вовсе. |
-| `DebitNsec`             | `uint64_t` | Время передачи последнего пакета при текущем `Bandwidth`, нс: `BytesSent * BITS_PER_BYTE * 1'000'000'000 / BandwidthBitsPerSecond`. На эту величину каждая отправка сдвигает `CreditBaseTimeNsec` вперёд. Суб-микросекундный остаток сохраняется (в отличие от µs-дебита, который при `BandwidthBitsPerSecond >= 9,6 Гбит/с` уходил бы в 0). |
-| `MtuDebitNsec`          | `uint64_t` | Дебит одного пакета переданного per-call размера `Mtu`, нс: `Mtu * BITS_PER_BYTE * 1'000'000'000 / BandwidthBitsPerSecond` (т.е. `Mtu * 8'000'000'000 / BandwidthBitsPerSecond`). Единица строгого режима (§3.2): интервал, через который строгий шейпер снова предлагает один пакет; числитель `Mtu * 8e9 <= 65535 * 8e9 < 2^64` не переполняется ни при каком `Bandwidth` и ни при каком `Mtu`. |
-| `EffectiveLastSendNsec` | `uint64_t` | `CreditBaseTimeNsec`, ограниченный burst-окном в **обычном** режиме: `max(CreditBaseTimeNsec, NowNsec - BurstWindowNsec)`. В строгом режиме не используется (§3.2). |
-| `BytesSent`             | `uint32_t` | Количество байт, фактически переданных сетью. Параметр вызывающей стороны, а не поле структуры; тип `uint32_t` соответствует существующему интерфейсу CC: `QuicCongestionControlOnDataSent` принимает `_In_ uint32_t NumRetransmittableBytes` (`congestion_control.h`, см. §10). **Контракт:** `BytesSent <= 2^31` (см. §3.5/§10). |
-| `AllowedBytes`          | `uint64_t` | Байты, разрешённые к немедленной отправке.                                                                |
-| `CcWindowBytes`         | `uint64_t` | Congestion window плагина, байт.                                                                           |
-| `BytesInFlight`         | `uint32_t` | Байт в полёте (in-flight) на момент запроса.                                                              |
-| `DeltaNsec`             | `uint64_t` | Время, прошедшее с `EffectiveLastSendNsec` до `NowNsec`, нс.                                               |
-| `TimeNeededNsec`        | `uint64_t` | Время, необходимое для передачи `SizeBytes` байт при `Bandwidth` бит/с, нс.                                |
-| `EarliestNsec`          | `uint64_t` | Момент (нс), не раньше которого можно начать передачу.                                                    |
+| `NowUsec`               | `uint64_t` | The current monotonic time in microseconds. Platform-independent; always injected by the calling code — the shaper module does not read the system clock (see §14); the only exception is the SetParam boundary of the public parameters, where the time is read by the library and injected further (§15.3). **Representability contract:** `NowUsec <= UINT64_MAX / 1'000` (the conversion to nanoseconds `NowNsec = NowUsec * 1'000` does not overflow; ~584'942 years in µs — ample margin for any monotonic source). |
+| `Bandwidth`             | `uint64_t` | The target bandwidth, **bit/s**. `0` means "no limit".                                |
+| `BurstWindowUsec`       | `uint64_t` | The window, in µs, that defines the burst budget. A public configuration argument; **stored exactly as configured** (including `0`) and returned as is by the GET paths — nothing is rewritten or derived. The behavior is selected **at call time** by the pair of the window and the per-call `Mtu` (§3.2): with `Mtu > 0` and a burst budget of `BurstWindowUsec * BandwidthBitsPerSecond / 8'000'000 < Mtu` — the explicit **"strict" mode** of "one packet of size `Mtu` per debit interval", the window does not participate in the math at all; with `Mtu == 0` and `BurstWindowUsec == 0` — **continuous mode** (continuous-rate): the raw proportional model without a clamp window and without quantization; otherwise — the **normal** (proportional) mode, the window participates in the arithmetic as is. |
+| `Mtu`                   | `uint16_t` | The caller's packet size, in bytes — a **per-call argument of the math functions** (§3.3), not stored state: the shaper does not store an `Mtu` field. On the send path `Path->Mtu` is passed (it changes with DPLPMTUD/settings — the current value is read on every call); parents and standalone consumers without a packet size pass `0`. |
+| `Parent`                | `QUIC_BANDWIDTH_SHAPER_PARENT*` | An application-level shaper ceiling shared by multiple connections; set at the library level and/or `QUIC_CONFIGURATION` (§15, §16). Levels **stack**: a connection can have up to two parents at once — one per level (§16.2). `NULL` — no parent at the level. |
+| `Child`                 | `QUIC_BANDWIDTH_SHAPER` | The per-path child shaper of the `QUIC_PATH.PacerShaper` hierarchy (§20, §16.3); the CC-internal pacer `Cc->Pacer` (`QUIC_CONGESTION_CONTROL`, §17, §24) is a separate entity and is not a child of the hierarchy. |
+| `CreditBaseTimeNsec`    | `uint64_t` | The virtual **credit time base in nanoseconds** from which the limit of bytes allowed to send is computed. NOT equal to the time of the last send: updated by the formula `max(CreditBaseTimeNsec, NowNsec - BurstWindowNsec) + DebitNsec` (normal mode), `max(CreditBaseTimeNsec, NowNsec - MtuDebitNsec) + max(DebitNsec, MtuDebitNsec)` (strict mode), or `max(CreditBaseTimeNsec, NowNsec) + DebitNsec` (continuous mode, §3.2). `0` — no sends have happened. |
+| `BurstWindowNsec`       | `uint64_t` | The window in nanoseconds — a **computed** quantity (not a structure field): `BurstWindowUsec * 1'000`, converted from the stored `BurstWindowUsec` at every use in normal mode (§3.2, §4); not computed at all in strict mode. |
+| `DebitNsec`             | `uint64_t` | The transmission time of the last packet at the current `Bandwidth`, in ns: `BytesSent * BITS_PER_BYTE * 1'000'000'000 / BandwidthBitsPerSecond`. Every send advances `CreditBaseTimeNsec` forward by this amount. The sub-microsecond remainder is preserved (unlike a µs debit, which would collapse to 0 at `BandwidthBitsPerSecond >= 9.6 Gbit/s`). |
+| `MtuDebitNsec`          | `uint64_t` | The debit of one packet of the passed per-call size `Mtu`, in ns: `Mtu * BITS_PER_BYTE * 1'000'000'000 / BandwidthBitsPerSecond` (i.e. `Mtu * 8'000'000'000 / BandwidthBitsPerSecond`). The unit of strict mode (§3.2): the interval after which the strict shaper again offers one packet; the numerator `Mtu * 8e9 <= 65535 * 8e9 < 2^64` does not overflow for any `Bandwidth` and any `Mtu`. |
+| `EffectiveLastSendNsec` | `uint64_t` | `CreditBaseTimeNsec` clamped by the burst window in **normal** mode: `max(CreditBaseTimeNsec, NowNsec - BurstWindowNsec)`. Not used in strict mode (§3.2). |
+| `BytesSent`             | `uint32_t` | The number of bytes actually transmitted over the network. A caller parameter, not a structure field; the `uint32_t` type matches the existing CC interface: `QuicCongestionControlOnDataSent` takes `_In_ uint32_t NumRetransmittableBytes` (`congestion_control.h`, see §10). **Contract:** `BytesSent <= 2^31` (see §3.5/§10). |
+| `AllowedBytes`          | `uint64_t` | Bytes allowed to be sent immediately.                                                                |
+| `CcWindowBytes`         | `uint64_t` | The plugin's congestion window, in bytes.                                                                           |
+| `BytesInFlight`         | `uint32_t` | Bytes in flight (in-flight) at the time of the request.                                                              |
+| `DeltaNsec`             | `uint64_t` | Time elapsed from `EffectiveLastSendNsec` to `NowNsec`, in ns.                                               |
+| `TimeNeededNsec`        | `uint64_t` | The time needed to transmit `SizeBytes` bytes at `Bandwidth` bit/s, in ns.                                |
+| `EarliestNsec`          | `uint64_t` | The point in time (ns) no earlier than which transmission may start.                                                    |
 
-> **Важно про единицы.** Публичный интерфейс модуля — в **микросекундах**
-> (аргументы `NowUsec`, `BurstWindowUsec`, возвращаемые задержки; подписи и
-> `msquic.h` не менялись), а внутренняя арифметика времени — в
-> **наносекундах** (поле `CreditBaseTimeNsec`, §4; окно участвует в ней как
-> вычисляемый `BurstWindowNsec = BurstWindowUsec * 1'000`, §3.2).
+> **A note on units.** The module's public interface is in **microseconds**
+> (the arguments `NowUsec`, `BurstWindowUsec`, the returned delays; the
+> signatures and `msquic.h` were not changed), while the internal time
+> arithmetic is in **nanoseconds** (the field `CreditBaseTimeNsec`, §4; the
+> window participates in it as the computed `BurstWindowNsec = BurstWindowUsec * 1'000`, §3.2).
 >
-> | Величина            | Публично (граница API) | Внутри структуры            |
+> | Quantity            | Public (API boundary) | Inside the structure            |
 > | ------------------- | ---------------------- | --------------------------- |
-> | Текущее время       | `NowUsec`, мкс          | `NowNsec = NowUsec * 1'000` |
-> | Burst-окно          | `BurstWindowUsec`, мкс (хранится как задано) | `BurstWindowNsec = BurstWindowUsec * 1'000` (нс, конвертируется при использовании, обычный режим) |
-> | Кредит-база         | —                       | `CreditBaseTimeNsec` (нс)   |
-> | Дебит               | —                       | `DebitNsec` (нс)            |
-> | Скорость            | `Bandwidth`, бит/с      | без изменений               |
+> | Current time       | `NowUsec`, µs          | `NowNsec = NowUsec * 1'000` |
+> | Burst window          | `BurstWindowUsec`, µs (stored as configured) | `BurstWindowNsec = BurstWindowUsec * 1'000` (ns, converted at use, normal mode) |
+> | Credit base         | —                       | `CreditBaseTimeNsec` (ns)   |
+> | Debit               | —                       | `DebitNsec` (ns)            |
+> | Rate            | `Bandwidth`, bit/s      | unchanged               |
 >
-> Мотивация: при `BandwidthBitsPerSecond >= 9,6 Гбит/с` дебит пакета в µs уходил бы в `floor -> 0`
-> — ограничение полностью отключалось именно на быстрых NIC. Наносекундная
-> база сохраняет суб-микросекундную точность (§3.1).
+> Motivation: at `BandwidthBitsPerSecond >= 9.6 Gbit/s` a packet's debit in µs
+> would collapse to `floor -> 0` — the limit would be fully disabled precisely
+> on fast NICs. The nanosecond base preserves sub-microsecond precision
+> (§3.1).
 >
-> `Bandwidth` измеряется в **бит/с**, а не байт/с; любые формулы включают
-> множитель `8 (бит/байт)`.
+> `Bandwidth` is measured in **bit/s**, not bytes/s; all formulas include the
+> `8 (bits/byte)` multiplier.
 
-### §2.2 Правила типизации
+### §2.2 Typing Rules
 
-- Все временные величины — `uint64_t`; публичная единица — микросекунды,
-  внутренняя (поля структуры и все промежуточные вычисления) — наносекунды
-  (§2.1).
-- Все счётчики байт — `uint64_t`, если не указано иное.
-- `BOOLEAN` (а не `bool`) — для совместимости с sal/кьютом ядра.
-- SAL-аннотации обязательны для всех публичных функций.
+- All time quantities are `uint64_t`; the public unit is microseconds, the
+  internal one (structure fields and all intermediate computations) is
+  nanoseconds (§2.1).
+- All byte counters are `uint64_t`, unless stated otherwise.
+- `BOOLEAN` (not `bool`) — for compatibility with the core's SAL/kernel
+  conventions.
+- SAL annotations are mandatory for all public functions.
 
-### §2.3 Константы
+### §2.3 Constants
 
 ```c
 //
-// Количество бит в одном байте. Используется при преобразовании
-// BandwidthBitsPerSecond <-> байт/с.
+// The number of bits in one byte. Used when converting
+// BandwidthBitsPerSecond <-> bytes/s.
 //
 #define BITS_PER_BYTE                         ((uint64_t)8)
 
 //
-// Количество микросекунд в одной секунде. Используется при
-// переводе BandwidthBitsPerSecond <-> байт/мкс.
+// The number of microseconds in one second. Used when converting
+// BandwidthBitsPerSecond <-> bytes/µs.
 //
 #define QUIC_BANDWIDTH_SHAPER_USEC_PER_SEC    ((uint64_t)1'000'000)
 
 //
-// Количество наносекунд в одной микросекунде. Граница публичного
-// (мкс) и внутреннего (нс) представлений времени.
+// The number of nanoseconds in one microsecond. The boundary between the
+// public (µs) and internal (ns) time representations.
 //
 #define QUIC_BANDWIDTH_SHAPER_NSEC_PER_USEC   ((uint64_t)1'000)
 
 //
-// Количество наносекунд в одной секунде. Знаменатель пути чтения
-// (§9) и множитель пути записи (§10).
+// The number of nanoseconds in one second. The denominator of the read
+// path (§9) and the multiplier of the write path (§10).
 //
 #define QUIC_BANDWIDTH_SHAPER_NSEC_PER_SEC    ((uint64_t)1'000'000'000)
 ```
 
-Сокращённый вид:
+Short form:
 
 ```
 BITS_PER_BYTE  : uint64_t = BITS_PER_BYTE = 8
@@ -140,50 +143,51 @@ NSEC_PER_USEC  : uint64_t = QUIC_BANDWIDTH_SHAPER_NSEC_PER_USEC = 1'000
 NSEC_PER_SEC   : uint64_t = QUIC_BANDWIDTH_SHAPER_NSEC_PER_SEC = 1'000'000'000
 ```
 
-Константа «максимальный пакет» (`QUIC_BANDWIDTH_SHAPER_MAX_PACKET_BYTES`)
-**не вводится**: размер пакета — per-call аргумент вызывающей стороны
-(`Path->Mtu` на пути отправки; меняется DPLPMTUD и настройками), и никакая
-платформенная константа MTU в шейпере не используется (§3.2, §3.3).
+A "maximum packet" constant (`QUIC_BANDWIDTH_SHAPER_MAX_PACKET_BYTES`)
+is **not introduced**: the packet size is a per-call argument from the caller
+(`Path->Mtu` on the send path; changed by DPLPMTUD and settings), and no
+platform MTU constant is used in the shaper (§3.2, §3.3).
 
-Эти константы вводятся в `quicdef.h`. Перевод между единицами времени при
-необходимости выполняется через платформенные константы `CXPLAT_*`
-(например, `CXPLAT_MICROSEC_PER_SEC`/`CXPLAT_MICROSEC_PER_MS` в
-платформенных заголовках `src/inc/quic_platform_*.h`); собственных дублей
-таких констант шейпер не вводит. По-параметровые пределы конфигурации
-(`MAX_BANDWIDTH`, `MAX_BURST_WINDOW`) не вводятся — их заменяет валидация
-комбинации параметров (§3.6).
+These constants are introduced in `quicdef.h`. Conversion between time units,
+when needed, is done via the platform constants `CXPLAT_*`
+(for example, `CXPLAT_MICROSEC_PER_SEC`/`CXPLAT_MICROSEC_PER_MS` in the
+platform headers `src/inc/quic_platform_*.h`); the shaper does not introduce
+its own duplicates of such constants. Per-parameter configuration limits
+(`MAX_BANDWIDTH`, `MAX_BURST_WINDOW`) are not introduced — they are replaced
+by validation of the parameter combination (§3.6).
 
-### §2.4 Обозначения в формулах и тексте
+### §2.4 Notation in Formulas and Text
 
-Однобуквенные сокращения в формулах и тексте недопустимы: используются
-только полные имена `BandwidthBitsPerSecond` (бит/с) и
-`BurstWindowUsec` (окно burst-бюджета, как сконфигурировано) /
-`BurstWindowNsec` (конвертируемое окно в нс, `= BurstWindowUsec * 1'000`,
-обычный режим).
-Строгий режим описывается через `MtuDebitNsec` (§2.1) — дебит одного
-пакета переданного per-call размера `Mtu`.
-Правило охватывает формулы, псевдокод, таблицы, тест-кейсы и прозу;
-идентификаторы кода (C-структуры, функции, параметры публичного API)
-сохраняют свои канонические имена и действию правила не подлежат.
-Числовые литералы (включая hex, например `0xFFFFFFFFFFFFFFFFull`, и
-разделение разрядов `8'000'000'000`) обозначениями не являются.
+Single-letter abbreviations are not allowed in formulas and text: only the
+full names `BandwidthBitsPerSecond` (bit/s) and
+`BurstWindowUsec` (the burst-budget window, as configured) /
+`BurstWindowNsec` (the converted window in ns, `= BurstWindowUsec * 1'000`,
+normal mode) are used.
+Strict mode is described through `MtuDebitNsec` (§2.1) — the debit of one
+packet of the passed per-call size `Mtu`.
+The rule covers formulas, pseudocode, tables, test cases, and prose;
+code identifiers (C structures, functions, public API parameters)
+keep their canonical names and are not subject to the rule.
+Numeric literals (including hex, e.g. `0xFFFFFFFFFFFFFFFFull`, and digit
+grouping `8'000'000'000`) are not notations.
 
-## §3 Алгоритм
+## §3 Algorithm
 
-### §3.1 Базовая формула
+### §3.1 Base Formula
 
-Все расчёты делаются в беззнаковой 64-битной арифметике; отсутствие
-переполнений на граничных значениях обеспечивается не пооператорными
-проверками, а валидацией конфигурации (§3.5, §3.6) и контрактами вызовов.
-`Bandwidth` задаётся в **бит/с**; преобразование в байты делается с явным
-умножением на `BITS_PER_BYTE (8)`. Внутреннее время — наносекунды (§2.1).
+All computations are done in unsigned 64-bit arithmetic; the absence of
+overflows at boundary values is ensured not by per-operator checks but by
+configuration validation (§3.5, §3.6) and call contracts.
+`Bandwidth` is specified in **bit/s**; conversion to bytes is done with an
+explicit multiplication by `BITS_PER_BYTE (8)`. Internal time is nanoseconds
+(§2.1).
 
 ```
-BandwidthBitsPerSecond  : uint64_t, бит/с
-SizeBytes               : uint64_t, байт
-DeltaNsec               : uint64_t, нс
-Allowed                 : uint64_t, байт
-TimeNeededNsec          : uint64_t, нс
+BandwidthBitsPerSecond  : uint64_t, bit/s
+SizeBytes               : uint64_t, bytes
+DeltaNsec               : uint64_t, ns
+Allowed                 : uint64_t, bytes
+TimeNeededNsec          : uint64_t, ns
 
 BITS_PER_BYTE           : uint64_t = 8
 NSEC_PER_SEC            : uint64_t = 1'000'000'000
@@ -200,215 +204,213 @@ time_needed_nsec(BandwidthBitsPerSecond, SizeBytes)  : uint64_t
 next_send_nsec(Last, BandwidthBitsPerSecond, SizeBytes) : uint64_t
    = Last + time_needed_nsec(BandwidthBitsPerSecond, SizeBytes)
 
-allowed_since_last_nsec(BandwidthBitsPerSecond, DeltaNsec) : uint64_t   (в байтах)
+allowed_since_last_nsec(BandwidthBitsPerSecond, DeltaNsec) : uint64_t   (in bytes)
    = DeltaNsec * BandwidthBitsPerSecond / (BITS_PER_BYTE * NSEC_PER_SEC)
    = DeltaNsec * BandwidthBitsPerSecond / 8'000'000'000
 ```
 
-Для `BandwidthBitsPerSecond == 0` шейпер работает в режиме unlimited:
+For `BandwidthBitsPerSecond == 0` the shaper operates in unlimited mode:
 `Allowed = UINT64_MAX (0xFFFFFFFFFFFFFFFFull)`, `TimeNeededNsec = 0`.
 
-> Округление при делении: в обе стороны. `Allowed` округляется вниз
-> (`floor`), `TimeNeededNsec` — вниз; возвращаемый наружу выход задержки (§9,
-> поле `DelayUsec`)
-> округляется **вверх** до целых мкс (консервативно; ошибка < 1 мкс).
-> Это даёт «консервативную» оценку: заявленная пропускная способность не
-> превышается; пик чуть ниже `BandwidthBitsPerSecond` допустим. Наносекундная база сохраняет
-> суб-микросекундную точность: дебит пакета при `BandwidthBitsPerSecond >= 9,6 Гбит/с` больше
-> не уходит в `floor -> 0` (например, 1'200 байт при 19,2 Гбит/с — это
-> ровно 500 нс дебита, тогда как µs-база давала 0).
+> Rounding on division: in both directions. `Allowed` is rounded down
+> (`floor`), `TimeNeededNsec` — down; the delay output returned to the
+> outside (§9, the field `DelayUsec`)
+> is rounded **up** to whole µs (conservatively; error < 1 µs).
+> This yields a "conservative" estimate: the declared bandwidth is never
+> exceeded; a peak slightly below `BandwidthBitsPerSecond` is acceptable. The
+> nanosecond base preserves sub-microsecond
+> precision: a packet's debit at `BandwidthBitsPerSecond >= 9.6 Gbit/s` no
+> longer collapses to `floor -> 0` (for example, 1'200 bytes at 19.2 Gbit/s
+> is exactly 500 ns of debit, whereas the µs base yielded 0).
 
-### §3.2 Модель кредита и BurstWindow: поведение выбирается при вызове
+### §3.2 Credit Model and BurstWindow: Behavior Is Selected at Call Time
 
-Шейпер ведёт учёт «кредита на отправку» через одну переменную —
-виртуальное время-базу `CreditBaseTimeNsec`. Это **не** wall-clock время
-последней отправки, а момент, относительно которого вычисляется лимит
-отправляемых байт. Поведение выбирается **при каждом вызове** комбинацией
-хранящейся пары `(BandwidthBitsPerSecond, BurstWindowUsec)` и переданного
-per-call размера пакета `Mtu` — строгий/непрерывный режим является
-**use-time свойством**, а не свойством конфигурации.
+The shaper tracks the "send credit" through a single variable — the virtual
+time base `CreditBaseTimeNsec`. This is **not** the wall-clock time of the
+last send, but the point relative to which the limit of bytes allowed to
+send is computed. The behavior is selected **on every call** by the
+combination of the stored pair `(BandwidthBitsPerSecond, BurstWindowUsec)`
+and the passed per-call packet size `Mtu` — strict/continuous mode is a
+**use-time property**, not a property of the configuration.
 
-**Режим выбирается предикатом** `QuicBandwidthShaperIsStrictMode`
-(единственное, хорошо определённое правило; §3.6):
+**The mode is selected by the predicate** `QuicBandwidthShaperIsStrictMode`
+(the single, well-defined rule; §3.6):
 
 ```
-строгий режим  ⇔  BandwidthBitsPerSecond > 0  и  Mtu > 0
-                  и BurstWindowUsec * BandwidthBitsPerSecond / 8'000'000
+strict mode  ⇔  BandwidthBitsPerSecond > 0  and  Mtu > 0
+                and BurstWindowUsec * BandwidthBitsPerSecond / 8'000'000
                     < Mtu
 ```
 
-(произведение в этой форме может переполняться, поэтому предикат
-вычисляется точно эквивалентным, свободным от переполнения сравнением
+(the product in this form can overflow, so the predicate is computed by the
+exactly equivalent, overflow-free comparison
 `BurstWindowUsec < ceil(Mtu * 8'000'000 / BandwidthBitsPerSecond)`:
-над целыми числами `W * B < Mtu * 8e6  ⇔  W < ceil(Mtu * 8e6 / B)`;
-`Mtu * 8e6 <= 65535 * 8e6 < 2^50` — переполнения нет).
-`BandwidthBitsPerSecond == 0` (unlimited) — не строгий режим;
-`Mtu == 0` — никогда не строгий режим (без размера пакета нечего
-квантовать). Бюджет ровно в один пакет (`W * B / 8e6 == Mtu`) — уже
-**обычный** режим.
+over the integers `W * B < Mtu * 8e6  ⇔  W < ceil(Mtu * 8e6 / B)`;
+`Mtu * 8e6 <= 65535 * 8e6 < 2^50` — no overflow).
+`BandwidthBitsPerSecond == 0` (unlimited) — not strict mode;
+`Mtu == 0` — never strict mode (without a packet size there is nothing to
+quantize). A budget of exactly one packet (`W * B / 8e6 == Mtu`) is already
+the **normal** mode.
 
-**Обычный (пропорциональный) режим** — всё остальное, кроме строгих
-вызовов с `Mtu > 0` и непрерывных вызовов с `W == 0, Mtu == 0`: бюджет
-окна покрывает хотя бы один пакет размера `Mtu` (при `Mtu == 0` правило
-«пакета» не применяется вовсе). Кредит накапливается со скоростью
-`Bandwidth` бит/с, начиная с `CreditBaseTimeNsec`, и ограничивается
-burst-окном. Каждая отправка `BytesSent` байт списывает кредит, сдвигая
-время-базу вперёд на `DebitNsec` — время, которое заняла бы передача этих
-байт на скорости `Bandwidth`:
+The **normal (proportional) mode** is everything else, except strict calls
+with `Mtu > 0` and continuous calls with `W == 0, Mtu == 0`: the window
+budget covers at least one packet of size `Mtu` (with `Mtu == 0` the
+"packet" rule does not apply at all). Credit accrues at the rate of
+`Bandwidth` bit/s, starting from `CreditBaseTimeNsec`, and is capped by the
+burst window. Each send of `BytesSent` bytes debits the credit, advancing
+the time base forward by `DebitNsec` — the time transmitting these bytes
+would take at the rate `Bandwidth`:
 
 ```
-CreditBaseTimeNsec  : uint64_t   (виртуальное время-база, нс, см. §2.1)
+CreditBaseTimeNsec  : uint64_t   (virtual time base, ns, see §2.1)
 NowNsec             : uint64_t   = NowUsec * 1'000
-BurstWindowNsec     : uint64_t   (нс; конвертируется при каждом использовании:
-                                  = BurstWindowUsec * 1'000, не хранится)
+BurstWindowNsec     : uint64_t   (ns; converted at every use:
+                                  = BurstWindowUsec * 1'000, not stored)
 DebitNsec           : uint64_t = BytesSent * BITS_PER_BYTE * 1'000'000'000 / BandwidthBitsPerSecond
 EffectiveLastSendNsec : uint64_t = max(CreditBaseTimeNsec, NowNsec - BurstWindowNsec)
 
-Чтение (§9):  AllowedBytes = (NowNsec - EffectiveLastSendNsec) * BandwidthBitsPerSecond / 8'000'000'000
-Запись (§10):  CreditBaseTimeNsec := EffectiveLastSendNsec + DebitNsec
+Read (§9):   AllowedBytes = (NowNsec - EffectiveLastSendNsec) * BandwidthBitsPerSecond / 8'000'000'000
+Write (§10): CreditBaseTimeNsec := EffectiveLastSendNsec + DebitNsec
 ```
 
-**Строгий режим** — per-call `Mtu > 0` и бюджет окна ниже одного такого
-пакета (включая `BurstWindowUsec == 0`): суб-пакетный бюджет не может
-профинансировать целый пакет за одно чтение, поэтому окно в математике
-**не участвует вовсе** — вместо него действует ровно один интервал дебита
-`MtuDebitNsec`, а чтения **бинарны** (0 или ровно один пакет размера
-`Mtu`):
+**Strict mode** — per-call `Mtu > 0` and a window budget below one such
+packet (including `BurstWindowUsec == 0`): a sub-packet budget cannot finance
+a whole packet in a single read, so the window **does not participate in the
+math at all** — exactly one debit interval `MtuDebitNsec` acts in its place,
+and reads are **binary** (0 or exactly one packet of size `Mtu`):
 
 ```
 MtuDebitNsec  : uint64_t = Mtu * BITS_PER_BYTE * 1'000'000'000 / BandwidthBitsPerSecond
-                              (= Mtu * 8'000'000'000 / BandwidthBitsPerSecond; числитель < 2^64)
+                              (= Mtu * 8'000'000'000 / BandwidthBitsPerSecond; numerator < 2^64)
 
-Чтение (§9):  AllowedBytes = Mtu, если (NowNsec - CreditBaseTimeNsec >= MtuDebitNsec), иначе 0
-               (разность вычисляется только при NowNsec >= CreditBaseTimeNsec:
-                время-база в будущем — долг — означает 0 без вычитания)
-Запись (§10):  CreditBaseTimeNsec := max(CreditBaseTimeNsec, NowNsec - MtuDebitNsec)
+Read (§9):    AllowedBytes = Mtu, if (NowNsec - CreditBaseTimeNsec >= MtuDebitNsec), else 0
+               (the difference is computed only when NowNsec >= CreditBaseTimeNsec:
+                a time base in the future — debt — means 0 without subtraction)
+Write (§10):  CreditBaseTimeNsec := max(CreditBaseTimeNsec, NowNsec - MtuDebitNsec)
                                         + max(DebitNsec, MtuDebitNsec)
-Задержка (§9): 0, если пакет разрешён прямо сейчас; иначе время до
+Delay (§9):   0, if the packet is allowed right now; otherwise the time until
                NowNsec - CreditBaseTimeNsec == MtuDebitNsec
 ```
 
-Клэмп-база записи `max(CreditBaseTimeNsec, NowNsec - MtuDebitNsec)`
-заменяет burst-окно ровно одним интервалом дебита — минимальным окном,
-которое может профинансировать один пакет. После разрешённой отправки
-время-база оказывается в `NowNsec` или позже, поэтому следующий пакет
-разрешён не раньше, чем через полный интервал дебита; отправка меньше
-пакета списывает весь интервал (`max(DebitNsec, MtuDebitNsec)`), и
-средняя скорость никогда не превышает `Bandwidth`. Наивная база
-`max(CreditBaseTimeNsec, NowNsec)` отодвигала бы каждый следующий пакет
-ещё на один интервал и уполовинивала строгую скорость; формула выше —
-ровно та, что задаёт ритм «один пакет на интервал дебита» (проверяется
-ритм-тестом §32.3). Сколь-нибудь иного клэмпа/выводимого окна в строгом
-режиме нет: настроенное значение хранится и возвращается как есть.
+The write clamp base `max(CreditBaseTimeNsec, NowNsec - MtuDebitNsec)`
+replaces the burst window with exactly one debit interval — the minimal
+window that can finance one packet. After an allowed send the time base ends
+up at `NowNsec` or later, so the next packet is not allowed earlier than
+after a full debit interval; a send smaller than a packet debits the whole
+interval (`max(DebitNsec, MtuDebitNsec)`), and the average rate never
+exceeds `Bandwidth`. A naive base `max(CreditBaseTimeNsec, NowNsec)` would
+push each subsequent packet yet another interval away and halve the strict
+rate; the formula above is exactly the one that sets the "one packet per
+debit interval" cadence (verified by the cadence test §32.3). No other
+clamp or derived window exists in strict mode: the configured value is
+stored and returned as is.
 
-**Непрерывный режим (continuous-rate)** — per-call `Mtu == 0` и
-`BurstWindowUsec == 0` (родители, standalone-потребители без размера
-пакета и без burst-окна): никакого квантования и никакого клэмп-окна
-вообще — сырая пропорциональная модель по всей накопленной дельте:
+**Continuous mode (continuous-rate)** — per-call `Mtu == 0` and
+`BurstWindowUsec == 0` (parents, standalone consumers without a packet size
+and without a burst window): no quantization and no clamp window at all —
+the raw proportional model over the entire accumulated delta:
 
 ```
-Чтение (§9):  AllowedBytes = (NowNsec - CreditBaseTimeNsec) * BandwidthBitsPerSecond /
-                               8'000'000'000, если положительно, иначе 0
-               (без window-клэмпа; saturating guard §9 покрывает неограниченную дельту)
-Запись (§10):  CreditBaseTimeNsec := max(CreditBaseTimeNsec, NowNsec) + DebitNsec
-Задержка (§9): точное время до NowNsec - CreditBaseTimeNsec >= DebitNsec(SizeBytes)
-               (§9 без burst-окна; зависит от SizeBytes)
+Read (§9):    AllowedBytes = (NowNsec - CreditBaseTimeNsec) * BandwidthBitsPerSecond /
+                               8'000'000'000, if positive, else 0
+               (no window clamp; the saturating guard §9 covers an unbounded delta)
+Write (§10):  CreditBaseTimeNsec := max(CreditBaseTimeNsec, NowNsec) + DebitNsec
+Delay (§9):   the exact time until NowNsec - CreditBaseTimeNsec >= DebitNsec(SizeBytes)
+               (§9 without a burst window; depends on SizeBytes)
 ```
 
-Следствия (обычный режим):
+Consequences (normal mode):
 
-- **Burst.** Накопленный кредит ограничен burst-окном: даже после
-  длительного простоя `NowNsec - EffectiveLastSendNsec <= BurstWindowNsec`,
-  поэтому разово разрешено не более `BurstWindowNsec * BandwidthBitsPerSecond / 8'000'000'000`
-  байт. Пока кредит не исчерпан, несколько отправок подряд допустимы —
-  каждая списывает ровно `BytesSent` байт (см. §10, инвариант списания).
-- **Забывание простоя.** Если с момента последнего списания прошло больше
-  `BurstWindowNsec`, `max(..., NowNsec - BurstWindowNsec)` возвращает
-  время-базу к «свежему» состоянию — доступен полный burst-бюджет.
-- **Установившийся ритм.** При дисциплинированных отправках по
-  `BytesSent` байт интервал между ними равен
-  `DebitNsec(BytesSent) / 1'000` мкс — т.е. средняя
-  скорость равна `Bandwidth` бит/с (проверяется тестом §32.10).
+- **Burst.** The accumulated credit is capped by the burst window: even
+  after a long idle `NowNsec - EffectiveLastSendNsec <= BurstWindowNsec`,
+  so at most `BurstWindowNsec * BandwidthBitsPerSecond / 8'000'000'000`
+  bytes are allowed at once. While the credit is not exhausted, several
+  sends in a row are permitted — each debits exactly `BytesSent` bytes (see
+  §10, the debiting invariant).
+- **Forgetting idle time.** If more than `BurstWindowNsec` has passed since
+  the last debit, `max(..., NowNsec - BurstWindowNsec)` returns the time
+  base to a "fresh" state — the full burst budget is available.
+- **Steady-state cadence.** With disciplined sends of `BytesSent` bytes
+  each, the interval between them is `DebitNsec(BytesSent) / 1'000` µs —
+  i.e. the average rate equals `Bandwidth` bit/s (verified by test §32.10).
 
-Следствия (строгий режим):
+Consequences (strict mode):
 
-- **Бинарность.** Чтение возвращает ровно 0 или ровно `Mtu` байт —
-  никаких промежуточных значений; «кредит» не накапливается сверх одного
-  пакета.
-- **Ритм.** После каждой отправки следующий пакет разрешён ровно через
-  `MtuDebitNsec / 1'000` мкс (для разрешённой отправки размера
-  `<= Mtu`); средняя скорость равна `Bandwidth` бит/с.
-- **Окно не участвует.** Любые
-  `0 <= BurstWindowUsec < ceil(Mtu * 8e6 / B)` эквивалентны для этого
-  `Mtu` (задают один и тот же строгий ритм); настроенное окно хранится и
-  возвращается как есть, на поведение не влияет. Один и тот же
-  вызов может вести себя по-разному при разных `Mtu`: вызывающий с большим
-  пакетом может попасть в строгий режим там, где вызывающий с меньшим —
-  нет (проверяется тестом §32.52).
-- **Долг.** Отправка бо́льшего размера (или отправка в долг) сдвигает
-  время-базу на `DebitNsec` — следующий пакет отодвигается честно
-  (§10).
+- **Binarity.** A read returns exactly 0 or exactly `Mtu` bytes — no
+  intermediate values; "credit" does not accumulate beyond one packet.
+- **Cadence.** After each send, the next packet is allowed exactly
+  `MtuDebitNsec / 1'000` µs later (for an allowed send of size `<= Mtu`);
+  the average rate equals `Bandwidth` bit/s.
+- **The window does not participate.** Any
+  `0 <= BurstWindowUsec < ceil(Mtu * 8e6 / B)` are equivalent for this
+  `Mtu` (they set the same strict cadence); the configured window is stored
+  and returned as is and does not affect the behavior. The same call can
+  behave differently with different `Mtu`: a caller with a larger packet
+  can land in strict mode where a caller with a smaller one does not
+  (verified by test §32.52).
+- **Debt.** A larger send (or a send into debt) advances the time base by
+  `DebitNsec` — the next packet is pushed back fairly (§10).
 
-Следствия (непрерывный режим):
+Consequences (continuous mode):
 
-- **Нет квантования.** Чтение возвращает произвольное число байт,
-  растущее со скоростью `Bandwidth` — никаких «прыжков» на размер пакета.
-- **Нет burst-клэмпа.** Кредит не ограничен окном: после долгого простоя
-  разрешена вся накопленная дельта (насыщается guard-ом §9 у
-  `UINT64_MAX`).
-- **Задержка точная и SizeBytes-зависимая** (в отличие от строгого
-  режима): ровно время передачи запрошенного размера.
+- **No quantization.** A read returns an arbitrary number of bytes growing
+  at the rate `Bandwidth` — no "jumps" by a packet size.
+- **No burst clamp.** The credit is not capped by the window: after a long
+  idle the entire accumulated delta is allowed (saturated by the §9 guard
+  at `UINT64_MAX`).
+- **The delay is exact and SizeBytes-dependent** (unlike strict mode):
+  exactly the transmission time of the requested size.
 
-Общие следствия:
+Common consequences:
 
-- **Долг при over-send.** Если вызывающий отправил больше, чем разрешал
-  `AllowedBytes`, `CreditBaseTimeNsec` оказывается в будущем
-  (`> NowNsec`): следующие отправки задержатся, пока долг не «выкупится»
-  накоплением кредита (в строгом режиме — до момента
+- **Debt on over-send.** If the caller sent more than `AllowedBytes`
+  allowed, `CreditBaseTimeNsec` ends up in the future (`> NowNsec`):
+  subsequent sends are delayed until the debt is "bought back" by credit
+  accrual (in strict mode — until the moment
   `CreditBaseTimeNsec + MtuDebitNsec`).
 
-### §3.3 Правила MTU
+### §3.3 MTU Rules
 
-Шейпер оперирует байтами. Решения о размере пакета принимает вызывающий код.
-Размер пакета — **per-call аргумент** математических функций, а не
-хранимое состояние: шейпер не хранит MTU (поле удалено), актуальность
-значения обеспечивает сам вызывающий — на пути отправки это `Path->Mtu`,
-который обновляется в точках его изменения (инициализация пути,
-DPLPMTUD, смена настроек; §21), родители передают `0` (§15.1).
+The shaper operates in bytes. Packet-size decisions are made by the calling
+code. The packet size is a **per-call argument** of the math functions, not
+stored state: the shaper does not store an MTU (the field was removed); the
+freshness of the value is ensured by the caller itself — on the send path
+this is `Path->Mtu`, which is updated at the points where it changes (path
+initialization, DPLPMTUD, settings changes; §21); parents pass `0` (§15.1).
 
-| Запрошено `SizeBytes` (uint64_t) | `Mtu` (uint16_t, per-call) | Допустимое к немедленной отправке                                       |
+| Requested `SizeBytes` (uint64_t) | `Mtu` (uint16_t, per-call) | Allowed to send immediately                                       |
 | ------------------------ | ------------------------ | ----------------------------------------------------------------------- |
-| `SizeBytes == 0`         | любое                    | `0` байт (no-op, задержка 0).                                           |
-| `0 < SizeBytes <= Mtu`   | `> 0`                    | Любое значение в `[1, min(SizeBytes, AllowedBytes)]`. Partial packet разрешён.   |
-| `SizeBytes > Mtu`        | `> 0`                    | `floor(AllowedBytes / Mtu) * Mtu` байт. Дробный пакет НЕ допустим.      |
-| `SizeBytes > 0`          | `0`                      | Любое значение в `[1, min(SizeBytes, AllowedBytes)]` (MTU chunking отключён).     |
+| `SizeBytes == 0`         | any                    | `0` bytes (no-op, delay 0).                                           |
+| `0 < SizeBytes <= Mtu`   | `> 0`                    | Any value in `[1, min(SizeBytes, AllowedBytes)]`. A partial packet is allowed.   |
+| `SizeBytes > Mtu`        | `> 0`                    | `floor(AllowedBytes / Mtu) * Mtu` bytes. A fractional packet is NOT allowed.      |
+| `SizeBytes > 0`          | `0`                      | Any value in `[1, min(SizeBytes, AllowedBytes)]` (MTU chunking disabled).     |
 
-Здесь `AllowedBytes = QuicBandwidthShaperGetAllowance(Shaper, /*SizeBytes=*/0, NowUsec, Mtu).AllowedBytes` (§9).
+Here `AllowedBytes = QuicBandwidthShaperGetAllowance(Shaper, /*SizeBytes=*/0, NowUsec, Mtu).AllowedBytes` (§9).
 
-Ветка `SizeBytes > Mtu` существует **только при `Mtu > 0`**: без размера
-пакета (`Mtu == 0`) округление не применяется вовсе.
+The `SizeBytes > Mtu` branch exists **only with `Mtu > 0`**: without a
+packet size (`Mtu == 0`) rounding is not applied at all.
 
-### §3.4 Диаграмма потока вызывающего кода
+### §3.4 Caller Code Flow Diagram
 
 ```
 Allowance    : QUIC_BANDWIDTH_SHAPER_ALLOWANCE
              := GetAllowance(Shaper, WantSize(Mtu), NowUsec, Mtu)
-             // ОДИН вызов — оба выхода сразу (§9): кредит и бэкофф
-             // для одного и того же want из одного вычисления
+             // ONE call — both outputs at once (§9): the credit and the
+             // backoff for the same want from a single computation
 AllowedBytes : uint64_t     := Allowance.AllowedBytes
 WantedSize   : uint64_t
-Mtu          : uint16_t     // per-call: Path->Mtu на пути отправки, 0 — без
-                            // chunking (§3.3); в шейпере не хранится
+Mtu          : uint16_t     // per-call: Path->Mtu on the send path, 0 — no
+                            // chunking (§3.3); not stored in the shaper
 ToSend       : uint64_t
 
 if AllowedBytes == 0 {
-    Schedule(Allowance.DelayUsec)   // бэкофф из того же вызова
+    Schedule(Allowance.DelayUsec)   // the backoff from the same call
     return
 }
 
 if Mtu == 0 || WantedSize <= Mtu {
     ToSend := min(WantedSize, AllowedBytes)   // partial OK; Mtu == 0 —
-                                              // chunking отключён (§3.3)
+                                              // chunking disabled (§3.3)
 } else {
     ToSend := (AllowedBytes / Mtu) * Mtu
 }
@@ -418,108 +420,109 @@ if ToSend > 0 {
     OnSend(Shaper, ToSend, NowUsec, Mtu)
 }
 if ToSend < WantedSize {
-    // Хвостовой остаток: отдельный вызов на новый размер want
-    // (SizeBytes = WantedSize - ToSend), тот же NowUsec.
+    // Tail remainder: a separate call with the new want size
+    // (SizeBytes = WantedSize - ToSend), the same NowUsec.
     DelayUsec := GetAllowance(Shaper, WantedSize - ToSend, NowUsec, Mtu).DelayUsec
     Schedule(Remaining, DelayUsec)
 }
 ```
 
-где `WantSize(Mtu) = (Mtu != 0 ? Mtu : 1)` — «хотимый» размер бэкоффа
-(один целый пакет или 1 байт; `QuicPathPacerGetWantSize`, `path.h`).
+where `WantSize(Mtu) = (Mtu != 0 ? Mtu : 1)` is the "wanted" backoff size
+(one whole packet or 1 byte; `QuicPathPacerGetWantSize`, `path.h`).
 
-Замечание о намеренном расхождении: обобщённый поток выше бэкоффит на
-хвостовом остатке (`SizeBytes − ToSend`), тогда как путь отправки msquic
-бэкоффит на want-размере (`QuicPathPacerGetWantSize`); оба варианта
-допустимы по §3.3 — выбор пути отправки меняет суб-пакетную задержку
-хвоста на простоту таймера (want не пересчитывается после каждого
-chunked-батча).
+A note on the intentional divergence: the generic flow above backs off on
+the tail remainder (`SizeBytes − ToSend`), whereas the msquic send path
+backs off on the want size (`QuicPathPacerGetWantSize`); both variants are
+allowed by §3.3 — the send path choice trades the sub-packet delay of the
+tail for timer simplicity (the want is not recomputed after every
+chunked batch).
 
-### §3.5 Арифметика (64-битная, с контролем переполнения)
+### §3.5 Arithmetic (64-bit, with Overflow Control)
 
-Все расчёты выполняются в беззнаковой 64-битной арифметике. Отсутствие
-переполнений — свойство конфигурации и контрактов вызовов, а не результат
-clamping-а или пооператорных guard-ов в точках умножения и вычитания:
+All computations are performed in unsigned 64-bit arithmetic. The absence
+of overflows is a property of the configuration and call contracts, not the
+result of clamping or per-operator guards at the multiplication and
+subtraction points:
 
-- **Чтение (`AllowedBytes` из `GetAllowance`, §9, обычный режим).** Произведение `DeltaNsec * BandwidthBitsPerSecond`
-  ограничено валидацией конфигурации (`QuicBandwidthShaperValidateConfig`,
-  §3.6): валидная конфигурация гарантирует `DeltaNsec <= BurstWindowNsec <=
-  UINT64_MAX / BandwidthBitsPerSecond`, т.е. `DeltaNsec * BandwidthBitsPerSecond <= UINT64_MAX`. Перед умножением
-  тем не менее оставлен **saturating guard** (`DeltaNsec > UINT64_MAX / BandwidthBitsPerSecond`
-  -> `Allowed = UINT64_MAX`) как defense in depth: для валидированного
-  состояния ветка недостижима, для состояния, записанного в структуру
-  в обход валидации, она исключает wrap (результат честно «насыщается»).
-- **Вычитание окна (`NowNsec - BurstWindowNsec`, §9/§10, обычный
-  режим).**
-  Безопасность вычитания — свойство конфигурации, а не per-call
-  проверок: **инвариант окна** (§3.6) требует
+- **Read (`AllowedBytes` from `GetAllowance`, §9, normal mode).** The product `DeltaNsec * BandwidthBitsPerSecond`
+  is bounded by configuration validation (`QuicBandwidthShaperValidateConfig`,
+  §3.6): a valid configuration guarantees `DeltaNsec <= BurstWindowNsec <=
+  UINT64_MAX / BandwidthBitsPerSecond`, i.e. `DeltaNsec * BandwidthBitsPerSecond <= UINT64_MAX`. Before the multiplication a
+  **saturating guard** is nevertheless kept (`DeltaNsec > UINT64_MAX / BandwidthBitsPerSecond`
+  -> `Allowed = UINT64_MAX`) as defense in depth: for validated state the
+  branch is unreachable; for state written into the structure bypassing
+  validation, it rules out a wrap (the result honestly "saturates").
+- **Window subtraction (`NowNsec - BurstWindowNsec`, §9/§10, normal
+  mode).**
+  The safety of the subtraction is a property of the configuration, not of
+  per-call checks: the **window invariant** (§3.6) requires
   `BurstWindowUsec < NowUsec`
-  в момент конфигурирования (`SetConfig`). Поскольку `NowUsec` монотонно
-  не убывает (§2.1, время всегда инъецируется вызывающим), для всех
-  последующих вызовов `NowNsec - BurstWindowNsec` гарантированно не
-  заимствует: конвертация `* 1'000` сохраняет строгое неравенство.
-  Saturating-вычитание и guard-ы в точках вычитания не применяются.
-  Поведение при убывающем `NowUsec` (нарушение монотонности на стороне
-  вызывающего) описано отдельно в §9/§10/§19.10 и от данного инварианта
-  не зависит.
-- **Строгий и непрерывный режимы — границы окна не нужны вовсе.** Окно
-  в их математике не участвует (строгий режим заменяет его одним
-  per-call интервалом дебита; непрерывный не использует вовсе), поэтому
-  ни ns-граница комбинации, ни инвариант окна к парам с `W == 0` не
-  применяются. Единственные вычитания: (а) `NowNsec -
-  CreditBaseTimeNsec` в чтении/задержке — вычисляется только при
-  `NowNsec >= CreditBaseTimeNsec` (время-база в будущем — долг —
-  означает 0 без вычитания); (б) `NowNsec - MtuDebitNsec` в клэмп-базе
-  строгой записи — защищено полом в 0 (в пределах первого интервала
-  дебита аптайма база просто 0); в непрерывной записи вычитания нет
-  (`max(CreditBaseTimeNsec, NowNsec)`). Числитель `MtuDebitNsec` —
-  `Mtu * 8'000'000'000 <= 65535 * 8e9 < 2^64` — не переполняется ни при
-  каком `BandwidthBitsPerSecond` и ни при каком `Mtu`. Произведение
-  чтения непрерывного режима ограничено только инъецированными часами —
-  его покрывает saturating guard §9 (для `W == 0` пары он не defense in
-  depth, а рабочая ветка). Поэтому пара с `W == 0` валидна при любом
-  `NowUsec`, включая `NowUsec == 0` (§3.6).
-- **Конвертация времени (`NowNsec = NowUsec * 1'000`).** Контракт
-  представимости: `NowUsec <= UINT64_MAX / 1'000` (§2.1); фиксируется
-  `CXPLAT_DBG_ASSERT`-ом на входе модуля, без runtime-clamping-а.
-- **Сравнения времени.** Все сравнения времени записываются без сложения:
-  `Window < Now − Last`. Форма `Last + Window < Now` запрещена
-  (переполнение `Last + Window`).
-- **Запись (`OnSend`, §10).** Контракт `BytesSent <= 2^31` ограничивает
-  промежуточное произведение `BytesSent * 8'000'000'000 <= 2^31 * 8e9 =
-  2^34 * 10^9 ~= 1,72e19 < 2^64 ~= 1,845e19` — переполнение невозможно
-  независимо от конфигурации. Вывод: знаменатель вырос в 1'000 раз
-  против µs-базы (`8e9` вместо `8e6`), поэтому прежняя безусловная
-  граница «весь `uint32_t`» (`2^32 * 8e6 < 2^55`) перестала покрывать
-  весь диапазон типа (`2^32 * 8e9 > 2^64`); контракт сужен до `2^31`,
-  что на порядки выше любых фактических размеров отправок в msquic
-  (per-packet длины). Runtime-clamping не добавляется — только
-  `CXPLAT_DBG_ASSERT` в точке дебита.
+  at the moment of configuration (`SetConfig`). Since `NowUsec` is
+  monotonically non-decreasing (§2.1, the time is always injected by the
+  caller), for all subsequent calls `NowNsec - BurstWindowNsec` is
+  guaranteed not to borrow: the `* 1'000` conversion preserves the strict
+  inequality.
+  Saturating subtraction and guards at subtraction points are not applied.
+  The behavior with a decreasing `NowUsec` (a monotonicity violation on the
+  caller's side) is described separately in §9/§10/§19.10 and does not
+  depend on this invariant.
+- **Strict and continuous modes — window bounds are not needed at all.** The
+  window does not participate in their math (strict mode replaces it with a
+  single per-call debit interval; continuous mode does not use it at all),
+  so neither the ns bound of the combination nor the window invariant
+  applies to pairs with `W == 0`. The only subtractions: (a)
+  `NowNsec - CreditBaseTimeNsec` in the read/delay — computed only when
+  `NowNsec >= CreditBaseTimeNsec` (a time base in the future — debt —
+  means 0 without subtraction); (b) `NowNsec - MtuDebitNsec` in the strict
+  write clamp base — protected by a floor at 0 (within the first debit
+  interval of uptime the base is simply 0); the continuous write has no
+  subtraction (`max(CreditBaseTimeNsec, NowNsec)`). The `MtuDebitNsec`
+  numerator — `Mtu * 8'000'000'000 <= 65535 * 8e9 < 2^64` — does not
+  overflow for any `BandwidthBitsPerSecond` and any `Mtu`. The product of
+  the continuous-mode read is bounded only by the injected clock — it is
+  covered by the saturating guard §9 (for a `W == 0` pair it is not defense
+  in depth but a working branch). Therefore a pair with `W == 0` is valid
+  for any `NowUsec`, including `NowUsec == 0` (§3.6).
+- **Time conversion (`NowNsec = NowUsec * 1'000`).** The representability
+  contract: `NowUsec <= UINT64_MAX / 1'000` (§2.1); enforced by a
+  `CXPLAT_DBG_ASSERT` at the module entry, without runtime clamping.
+- **Time comparisons.** All time comparisons are written without addition:
+  `Window < Now − Last`. The form `Last + Window < Now` is forbidden
+  (`Last + Window` overflow).
+- **Write (`OnSend`, §10).** The contract `BytesSent <= 2^31` bounds the
+  intermediate product `BytesSent * 8'000'000'000 <= 2^31 * 8e9 =
+  2^34 * 10^9 ~= 1.72e19 < 2^64 ~= 1.845e19` — overflow is impossible
+  regardless of the configuration. Corollary: the denominator grew
+  1'000-fold over the µs base (`8e9` instead of `8e6`), so the former
+  unconditional bound of "the whole `uint32_t`" (`2^32 * 8e6 < 2^55`)
+  stopped covering the whole range of the type (`2^32 * 8e9 > 2^64`);
+  the contract was narrowed to `2^31`, which is orders of magnitude above
+  any actual send sizes in msquic (per-packet lengths). No runtime clamping
+  is added — only a `CXPLAT_DBG_ASSERT` at the debit point.
 
-### §3.6 Валидация конфигурации
+### §3.6 Configuration Validation
 
-Пара (`BandwidthBitsPerSecond`, `BurstWindowUsec`) валидируется
-целиком, до записи в структуру, вместе с текущим моментом `NowUsec`
-вызывающего (инвариант окна, см. ниже). Строгий/непрерывный режим —
-**use-time свойство per-call `Mtu`** (§3.2), поэтому пара валидируется
-«на объединение всех своих использований»: любая пара может быть
-потреблена обычной математикой (достаточно большого per-call `Mtu` или
-`Mtu == 0` при `W > 0`), и её границы обязательны для каждой пары с
-`W > 0`; строгая (с per-call `Mtu > 0`) и непрерывная (`W == 0`)
-математики не требуют никаких границ — их единственные вычитания
-защищены (§3.5), чем и объясняется безусловная валидность пар с
-`W == 0`. Таблица истинности
-(`QuicBandwidthShaperValidateConfig`); никакой клэмп не применяется,
-границы вычисляются над окном, которое реально использует обычная
-математика, — самим настроенным `BurstWindowUsec`; пары с `W == 0`
-окна не используют и границ не требуют:
+The pair (`BandwidthBitsPerSecond`, `BurstWindowUsec`) is validated as a
+whole, before being written into the structure, together with the caller's
+current `NowUsec` (the window invariant, see below). Strict/continuous mode
+is a **use-time property of the per-call `Mtu`** (§3.2), so the pair is
+validated "for the union of all its uses": any pair can be consumed by the
+normal math (a sufficiently large per-call `Mtu`, or `Mtu == 0` with
+`W > 0`), and its bounds are mandatory for every pair with `W > 0`; the
+strict (with per-call `Mtu > 0`) and continuous (`W == 0`) math require no
+bounds — their only subtractions are protected (§3.5), which explains the
+unconditional validity of pairs with `W == 0`. Truth table
+(`QuicBandwidthShaperValidateConfig`); no clamp is applied, the bounds are
+computed over the window that the normal math actually uses — the
+configured `BurstWindowUsec` itself; pairs with `W == 0` do not use the
+window and require no bounds:
 
-| `BandwidthBitsPerSecond`    | `BurstWindowUsec`    | Результат                     | Комментарий                                                              |
+| `BandwidthBitsPerSecond`    | `BurstWindowUsec`    | Result                     | Comment                                                              |
 | -------------------------- | -------------------- | ----------------------------- | ------------------------------------------------------------------------ |
-| `BandwidthBitsPerSecond=0`  | `BurstWindowUsec=0`  | TRUE                          | безлимит.                                                                 |
-| `BandwidthBitsPerSecond=0`  | `BurstWindowUsec>0`  | FALSE                         | burst без ограничения скорости не имеет смысла, отвергается явно.         |
-| `BandwidthBitsPerSecond>0`  | `BurstWindowUsec == 0` | TRUE безусловно | окно никогда не входит в математику этой пары: строгий квантованный пейсинг «один пакет размера per-call `Mtu` на интервал дебита `MtuDebitNsec`» при `Mtu > 0`, непрерывный кредит при `Mtu == 0`; оба без заимствований при любом `NowUsec` (§3.5), поэтому ни ns-граница комбинации, ни инвариант окна не применяются. |
-| `BandwidthBitsPerSecond>0`  | `BurstWindowUsec > 0` | TRUE ⇔ **оба**: `BurstWindowUsec <= UINT64_MAX / BandwidthBitsPerSecond / 1'000` И `BurstWindowUsec < NowUsec` | (1) защита произведения `DeltaNsec * BandwidthBitsPerSecond` от переполнения во внутренней наносекундной базе (`BurstWindowUsec * 1'000 <= UINT64_MAX / BandwidthBitsPerSecond`, §3.5); (2) инвариант окна (§3.5). Обе границы вычисляются над самим настроенным окном (хранится и возвращается как есть); принятие может зависеть от `NowUsec` только через инвариант окна. Пара, у которой валидного окна не существует вовсе (ns-граница ниже окна, например `BandwidthBitsPerSecond == UINT64_MAX` при любом `W > 0`), отвергается условием (1); единственная валидная пара такого `BandwidthBitsPerSecond` — `(UINT64_MAX, 0)`. |
+| `BandwidthBitsPerSecond=0`  | `BurstWindowUsec=0`  | TRUE                          | unlimited.                                                                 |
+| `BandwidthBitsPerSecond=0`  | `BurstWindowUsec>0`  | FALSE                         | burst without a rate limit makes no sense, rejected explicitly.         |
+| `BandwidthBitsPerSecond>0`  | `BurstWindowUsec == 0` | TRUE unconditionally | the window never enters this pair's math: strict quantized pacing "one packet of per-call size `Mtu` per debit interval `MtuDebitNsec`" with `Mtu > 0`, continuous credit with `Mtu == 0`; both without borrowing for any `NowUsec` (§3.5), so neither the ns bound of the combination nor the window invariant applies. |
+| `BandwidthBitsPerSecond>0`  | `BurstWindowUsec > 0` | TRUE ⇔ **both**: `BurstWindowUsec <= UINT64_MAX / BandwidthBitsPerSecond / 1'000` AND `BurstWindowUsec < NowUsec` | (1) protection of the product `DeltaNsec * BandwidthBitsPerSecond` from overflow in the internal nanosecond base (`BurstWindowUsec * 1'000 <= UINT64_MAX / BandwidthBitsPerSecond`, §3.5); (2) the window invariant (§3.5). Both bounds are computed over the configured window itself (stored and returned as is); acceptance can depend on `NowUsec` only through the window invariant. A pair for which no valid window exists at all (the ns bound below the window, e.g. `BandwidthBitsPerSecond == UINT64_MAX` with any `W > 0`) is rejected by condition (1); the only valid pair for such a `BandwidthBitsPerSecond` is `(UINT64_MAX, 0)`. |
 
 ```c
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -532,137 +535,137 @@ QuicBandwidthShaperValidateConfig(
 {
     if (BandwidthBitsPerSecond == 0) {
         //
-        // BandwidthBitsPerSecond == 0 допустим только в паре с BurstWindowUsec == 0 (безлимит):
-        // "burst" без ограничения скорости смысла не имеет.
+        // BandwidthBitsPerSecond == 0 is allowed only in a pair with BurstWindowUsec == 0 (unlimited):
+        // "burst" without a rate limit makes no sense.
         //
         return BurstWindowUsec == 0;
     }
 
     if (BurstWindowUsec == 0) {
         //
-        // W == 0 (§3.6): окно никогда не входит в математику этой пары —
-        // строгий квантованный пейсинг при per-call Mtu > 0, непрерывный
-        // кредит при Mtu == 0; оба без заимствований при любом NowUsec
-        // (§3.5: единственные вычитания защищены). Ни ns-граница
-        // комбинации, ни инвариант окна не применяются.
+        // W == 0 (§3.6): the window never enters this pair's math —
+        // strict quantized pacing with per-call Mtu > 0, continuous
+        // credit with Mtu == 0; both without borrowing for any NowUsec
+        // (§3.5: the only subtractions are protected). Neither the ns
+        // bound of the combination nor the window invariant applies.
         //
         return TRUE;
     }
 
     if (BurstWindowUsec >= NowUsec) {
         //
-        // Инвариант окна (§3.5), пары с W > 0: любая такая пара может
-        // выполняться в обычном режиме (при достаточно большом per-call
-        // Mtu или Mtu == 0), а обычной математике требуется
-        // BurstWindowUsec < NowUsec на момент конфигурирования —
-        // гарантирует отсутствие заимствования в
-        // NowNsec - BurstWindowNsec при всех последующих вызовах
-        // (NowUsec монотонно не убывает; конвертация * 1'000
-        // сохраняет строгое неравенство).
+        // Window invariant (§3.5), pairs with W > 0: any such pair can
+        // execute in normal mode (with a sufficiently large per-call
+        // Mtu or Mtu == 0), and the normal math requires
+        // BurstWindowUsec < NowUsec at the moment of configuration —
+        // this guarantees no borrowing in
+        // NowNsec - BurstWindowNsec on all subsequent calls
+        // (NowUsec is monotonically non-decreasing; the * 1'000
+        // conversion preserves the strict inequality).
         //
         return FALSE;
     }
 
     //
-    // Единственный источник переполнения — комбинация параметров:
-    // произведение DeltaNsec * BandwidthBitsPerSecond должно помещаться в uint64_t при любом
-    // DeltaNsec <= BurstWindowNsec. BurstWindowNsec = BurstWindowUsec * 1'000, поэтому в мкс-единицах
-    // граница: BurstWindowUsec <= UINT64_MAX / BandwidthBitsPerSecond / 1'000 (вложенное деление нацело
-    // равно floor(UINT64_MAX / (BandwidthBitsPerSecond * 1'000)) и не переполняется).
+    // The only source of overflow is the combination of parameters:
+    // the product DeltaNsec * BandwidthBitsPerSecond must fit in uint64_t for any
+    // DeltaNsec <= BurstWindowNsec. BurstWindowNsec = BurstWindowUsec * 1'000, so in µs units
+    // the bound is: BurstWindowUsec <= UINT64_MAX / BandwidthBitsPerSecond / 1'000 (the nested floor division
+    // equals floor(UINT64_MAX / (BandwidthBitsPerSecond * 1'000)) and does not overflow).
     //
     return BurstWindowUsec <=
         UINT64_MAX / BandwidthBitsPerSecond / QUIC_BANDWIDTH_SHAPER_NSEC_PER_USEC;
 }
 ```
 
-**Граница строгого/обычного режима (per-call).** Бюджет сравнивается с
-размером пакета, переданным **при вызове**: строгий режим — это
-`W * B / 8e6 < Mtu`, т.е. `W < ceil(Mtu * 8'000'000 / B)` для данного
-per-call `Mtu` (свободная от переполнения форма; `Mtu * 8e6 < 2^50`).
-Например, при `Mtu = 1500`:
-`BandwidthBitsPerSecond = 8 Мбит/с` -> граница `1'500 мкс`,
-`BandwidthBitsPerSecond = 100 Мбит/с` -> `120 мкс`,
-`BandwidthBitsPerSecond = 1 Гбит/с` -> `12 мкс`, `BandwidthBitsPerSecond >= 12 Гбит/с` -> `1 мкс`;
-при меньшем `Mtu` граница ниже (тот же
-`W = 1300` при 8 Мбит/с строг для `Mtu = 1500` и обычен для
-`Mtu = 1200` — проверяется тестом §32.52). Окно **равное** минимуму —
-обычный режим (бюджет ровно один пакет); строже минимума — строгий
-режим. Пара сама по себе режим не фиксирует: режим выбирается при
-каждом вызове.
+**The strict/normal mode boundary (per-call).** The budget is compared
+against the packet size passed **at the call**: strict mode is
+`W * B / 8e6 < Mtu`, i.e. `W < ceil(Mtu * 8'000'000 / B)` for the given
+per-call `Mtu` (the overflow-free form; `Mtu * 8e6 < 2^50`).
+For example, with `Mtu = 1500`:
+`BandwidthBitsPerSecond = 8 Mbit/s` -> the boundary `1'500 µs`,
+`BandwidthBitsPerSecond = 100 Mbit/s` -> `120 µs`,
+`BandwidthBitsPerSecond = 1 Gbit/s` -> `12 µs`, `BandwidthBitsPerSecond >= 12 Gbit/s` -> `1 µs`;
+with a smaller `Mtu` the boundary is lower (the same
+`W = 1300` at 8 Mbit/s is strict for `Mtu = 1500` and normal for
+`Mtu = 1200` — verified by test §32.52). A window **equal** to the minimum
+is normal mode (a budget of exactly one packet); stricter than the minimum
+is strict mode. The pair by itself does not fix the mode: the mode is
+selected on every call.
 
-**Ничто не переписывается (raw storage).** Хранится и возвращается
-«сырое» сконфигурированное значение; поведение выбирается парой и
-per-call `Mtu` внутри математики.
+**Nothing is rewritten (raw storage).** The "raw" configured value is
+stored and returned; the behavior is selected by the pair and the per-call
+`Mtu` inside the math.
 
 `QuicBandwidthShaperInit` (§6), `QuicBandwidthShaperSetConfig` (§7),
-`QuicBandwidthShaperParentSetConfig` (§16.1) и conn-обработчик
-`QUIC_PARAM_CONN_BANDWIDTH_SHAPER` (§22) записывают `BurstWindowUsec`
-**в точности как сконфигурировано** — значения, включая `0`, не
-переписываются. GET-пути всех трёх параметров возвращают настроенное
-значение как есть: `GET` эхом воспроизводит `SET` (в том числе `0`).
-Принятие повторного `SET` пары с `W > 0` по-прежнему зависит от
-текущего `NowUsec` через инвариант окна; пара с `W == 0` от `NowUsec`
-не зависит. Для `BandwidthBitsPerSecond == 0` (unlimited) валидна только
-пара `(0, 0)`, контракт no-op не меняется.
+`QuicBandwidthShaperParentSetConfig` (§16.1), and the conn handler
+`QUIC_PARAM_CONN_BANDWIDTH_SHAPER` (§22) write `BurstWindowUsec`
+**exactly as configured** — values, including `0`, are not rewritten. The
+GET paths of all three parameters return the configured value as is: `GET`
+echoes `SET` (including `0`).
+Acceptance of a repeated `SET` of a pair with `W > 0` still depends on the
+current `NowUsec` through the window invariant; a pair with `W == 0` does
+not depend on `NowUsec`. For `BandwidthBitsPerSecond == 0` (unlimited) only
+the pair `(0, 0)` is valid; the no-op contract does not change.
 
-**Живучесть (liveness) и строгий режим.** Шейпер никогда не блокирует
-отправку жёстко. Запрос размером больше `AllowedBytes` не отвергается —
-по контракту `OnSend` (§10) он разрешён overlimit и порождает долг
-(`CreditBaseTimeNsec` уходит в будущее), задерживая последующие
-отправки; а запросы `SizeBytes <= Mtu` (§3.3) проходят без задержки,
-пока `SizeBytes <= AllowedBytes`, — суб-MTU отправки текут даже при
-нулевом чтении. Поэтому бюджет
-`BurstWindowUsec * BandwidthBitsPerSecond / 8'000'000` ниже дебита одного
-пакета не останавливает отправителя сам по себе:
-MTU-размерные отправки идут overlimit с накоплением долга, sub-MTU
-отправки — без задержки, пока вписываются в бюджет. Постоянный stall
-возможен только как свойство конкретной стратегии вызывающего: (а) он
-запрашивает только размеры `> Mtu`, (б) не отправляет ничего, пока
-`floor(AllowedBytes / Mtu) * Mtu` меньше одного пакета, и (в) никогда
-не отправляет overlimit, — это не свойство шейпера. Бюджет ниже одного
-пакета задаёт для такого вызывающего (с per-call `Mtu > 0`) **явный
-строгий режим**: чтения бинарны — ровно один пакет размера `Mtu`
-разрешён, далее 0 до истечения `MtuDebitNsec`, затем снова один пакет, —
-детерминированный ритм «один пакет на интервал дебита»: даже
-дисциплинированный MTU-округляющий вызывающий получает ровно один
-пакет на каждое истечение интервала. Любые
-`0 <= BurstWindowUsec < ceil(Mtu * 8e6 / B)` ведут себя
-для этого `Mtu` одинаково (эквивалентно `BurstWindowUsec = 0`):
-суб-пакетный бюджет всё равно не может профинансировать целый пакет за
-одно чтение, и окно в математике не участвует. Потребитель без размера
-пакета (`Mtu == 0`) при `W == 0` получает непрерывный режим — кредит
-растёт без квантования и без burst-клэмпа (§3.2).
+**Liveness and strict mode.** The shaper never hard-blocks sends. A request
+larger than `AllowedBytes` is not rejected — per the `OnSend` contract
+(§10) it is allowed overlimit and creates debt (`CreditBaseTimeNsec` moves
+into the future), delaying subsequent sends; and requests with
+`SizeBytes <= Mtu` (§3.3) pass without delay while
+`SizeBytes <= AllowedBytes` — sub-MTU sends flow even at a zero read.
+Therefore a budget of
+`BurstWindowUsec * BandwidthBitsPerSecond / 8'000'000` below one packet's
+debit does not stop the sender by itself: MTU-sized sends go overlimit with
+debt accumulating, sub-MTU sends — without delay as long as they fit the
+budget. A permanent stall is possible only as a property of a particular
+caller strategy: (a) it requests only sizes `> Mtu`, (b) sends nothing
+while `floor(AllowedBytes / Mtu) * Mtu` is less than one packet, and (c)
+never sends overlimit — this is not a property of the shaper. A budget
+below one packet sets, for such a caller (with per-call `Mtu > 0`), the
+**explicit strict mode**: reads are binary — exactly one packet of size
+`Mtu` is allowed, then 0 until `MtuDebitNsec` expires, then one packet
+again — a deterministic "one packet per debit interval" cadence: even a
+disciplined MTU-rounding caller gets exactly one packet per interval
+expiry. Any `0 <= BurstWindowUsec < ceil(Mtu * 8e6 / B)` behave the same
+for this `Mtu` (equivalent to `BurstWindowUsec = 0`): a sub-packet budget
+still cannot finance a whole packet in a single read, and the window does
+not participate in the math. A consumer without a packet size (`Mtu == 0`)
+with `W == 0` gets continuous mode — the credit grows without quantization
+and without a burst clamp (§3.2).
 
-**Инвариант окна (только пары с `W > 0`).** Окно `BurstWindowUsec` должно быть меньше текущего
-`NowUsec` на момент конфигурирования; поскольку `NowUsec` монотонно
-не убывает, для всех последующих вызовов гарантировано
-`NowNsec - BurstWindowNsec` без заимствования (§3.5). Практическое
-следствие: пара с `W > 0` и `BurstWindowUsec >= NowUsec` в момент
-вызова отклоняется с `QUIC_STATUS_INVALID_PARAMETER` (либо
-конфигурирование повторяется позже, при большем `NowUsec`); это
-приемлемо, поскольку burst-окна малы относительно времени жизни
-соединения (типичные значения — порядка миллисекунд). Пара с
-`W == 0` инварианта окна не требует вовсе: окно в её математике не
-участвует при любом per-call `Mtu`, а единственные вычитания защищены
-(§3.5), поэтому она принимается при любом `NowUsec`, включая
-`NowUsec == 0`. Текущий `NowUsec` передаётся
-вызывающим в `QuicBandwidthShaperValidateConfig` и
-`QuicBandwidthShaperSetConfig` — время всегда инъецируется (§2.1).
+**Window invariant (only pairs with `W > 0`).** The window `BurstWindowUsec` must be smaller than the current
+`NowUsec` at the moment of configuration; since `NowUsec` is monotonically
+non-decreasing, all subsequent calls are guaranteed
+`NowNsec - BurstWindowNsec` without borrowing (§3.5). A practical
+consequence: a pair with `W > 0` and `BurstWindowUsec >= NowUsec` at the
+moment of the call is rejected with `QUIC_STATUS_INVALID_PARAMETER`
+(either configuration is retried later, at a larger `NowUsec`); this is
+acceptable because burst windows are small relative to the connection's
+lifetime (typical values are on the order of milliseconds). A pair with
+`W == 0` does not require the window invariant at all: the window does not
+participate in its math for any per-call `Mtu`, and its only subtractions
+are protected (§3.5), so it is accepted for any `NowUsec`, including
+`NowUsec == 0`. The current `NowUsec` is passed by the caller to
+`QuicBandwidthShaperValidateConfig` and
+`QuicBandwidthShaperSetConfig` — the time is always injected (§2.1).
 
-**Обоснование.** Переполнение возможно только от комбинации параметров
-(`DeltaNsec * BandwidthBitsPerSecond > UINT64_MAX` при `DeltaNsec <= BurstWindowNsec`), поэтому
-валидируется именно комбинация, а не каждый параметр по отдельности.
-По-параметровые пределы (`MAX_BANDWIDTH`/`MAX_BURST_WINDOW`) не вводятся.
+**Rationale.** Overflow is possible only from the combination of
+parameters (`DeltaNsec * BandwidthBitsPerSecond > UINT64_MAX` with
+`DeltaNsec <= BurstWindowNsec`), so exactly the combination is validated,
+not each parameter separately. Per-parameter limits
+(`MAX_BANDWIDTH`/`MAX_BURST_WINDOW`) are not introduced.
 
-`QuicBandwidthShaperInit` (§6) и `QuicBandwidthShaperSetConfig` (§7) при
-результате FALSE не изменяют состояние и возвращают
+`QuicBandwidthShaperInit` (§6) and `QuicBandwidthShaperSetConfig` (§7) on
+a FALSE result do not modify state and return
 `QUIC_STATUS_INVALID_PARAMETER`.
 
-Неактивный шейпер — валидная пара `(0, 0)` (unlimited): любые вызовы
-debit/allowance-функций (§10, §13, §14) при `BandwidthBitsPerSecond == 0`
-— no-op (см. «No-op контракт неактивного шейпера», §10).
+An inactive shaper is the valid pair `(0, 0)` (unlimited): any calls to
+the debit/allowance functions (§10, §13, §14) with
+`BandwidthBitsPerSecond == 0` are no-ops (see "No-op contract of the
+inactive shaper", §10).
 
-## §4 Структура `QUIC_BANDWIDTH_SHAPER`
+## §4 Structure of `QUIC_BANDWIDTH_SHAPER`
 
 ```c
 typedef struct QUIC_BANDWIDTH_SHAPER {
@@ -710,20 +713,20 @@ typedef struct QUIC_BANDWIDTH_SHAPER {
 } QUIC_BANDWIDTH_SHAPER;
 ```
 
-Структура предназначена для хранения в статической/стековой памяти; не
-содержит владеющих указателей. Размер ≤ 32 байта (24 байта фактически) —
-подходит для хранения в `QUIC_PATH` и `QUIC_CONGESTION_CONTROL`.
-Поля `Mtu` (и паддинга `Reserved`) в структуре **нет**: размер пакета —
-per-call аргумент математических функций (§3.3), хранимое состояние
-шейпера от MTU не зависит, и платформенная константа MTU в модуле не
-используется вовсе. Внутренняя арифметика времени — в наносекундах
-(§2.1); окно хранится в публичных микросекундах и конвертируется в нс
-(`BurstWindowUsec * 1'000`) при каждом использовании в обычном режиме
-(§3.2) — в строгом и непрерывном режимах окно не используется вовсе.
+The structure is intended for storage in static/stack memory; it contains
+no owning pointers. Size ≤ 32 bytes (24 bytes in practice) — suitable for
+storage in `QUIC_PATH` and `QUIC_CONGESTION_CONTROL`. There is **no**
+`Mtu` field (nor a `Reserved` padding field) in the structure: the packet
+size is a per-call argument of the math functions (§3.3), the shaper's
+stored state does not depend on the MTU, and no platform MTU constant is
+used in the module at all. The internal time arithmetic is in
+nanoseconds (§2.1); the window is stored in public microseconds and
+converted to ns (`BurstWindowUsec * 1'000`) at every use in normal mode
+(§3.2) — in strict and continuous modes the window is not used at all.
 
-## §5 Перечень публичных функций
+## §5 List of public functions
 
-| # | Сигнатура                                                                                                                  | Возвращает |
+| # | Signature                                                                                                                   | Returns |
 | - | -------------------------------------------------------------------------------------------------------------------------- | ---------- |
 | §3.6 | `_IRQL_requires_max_(DISPATCH_LEVEL) BOOLEAN QuicBandwidthShaperValidateConfig(_In_ uint64_t BandwidthBitsPerSecond, _In_ uint64_t BurstWindowUsec, _In_ uint64_t NowUsec);` | `BOOLEAN` |
 | §6  | `_IRQL_requires_max_(DISPATCH_LEVEL) QUIC_STATUS QuicBandwidthShaperInit(_Inout_ QUIC_BANDWIDTH_SHAPER* Shaper, _In_ uint64_t BandwidthBitsPerSecond, _In_ uint64_t BurstWindowUsec);` | `QUIC_STATUS` |
@@ -736,75 +739,79 @@ per-call аргумент математических функций (§3.3), �
 
 ## §6 `QuicBandwidthShaperInit`
 
-**Назначение:** полная инициализация шейпера.
+**Purpose:** full initialization of the shaper.
 
-**Аргументы:**
+**Arguments:**
 
-- `Shaper` : `_Inout_ QUIC_BANDWIDTH_SHAPER*` — обязателен, не `NULL`.
-- `BandwidthBitsPerSecond` : `_In_ uint64_t` — целевая bandwidth, **бит/с**;
-  `0` = unlimited.
-- `BurstWindowUsec` : `_In_ uint64_t` — окно в микросекундах. Шейпер не
-  хранит MTU: размер пакета — per-call аргумент математических функций
-  (§3.3).
+- `Shaper` : `_Inout_ QUIC_BANDWIDTH_SHAPER*` — required, not `NULL`.
+- `BandwidthBitsPerSecond` : `_In_ uint64_t` — the target bandwidth,
+  **bit/s**; `0` = unlimited.
+- `BurstWindowUsec` : `_In_ uint64_t` — the window in microseconds. The
+  shaper does not store the MTU: the packet size is a per-call argument
+  of the math functions (§3.3).
 
-**Возвращает:** `QUIC_STATUS` — `QUIC_STATUS_SUCCESS` или
+**Returns:** `QUIC_STATUS` — `QUIC_STATUS_SUCCESS` or
 `QUIC_STATUS_INVALID_PARAMETER`.
 
-**Контракт:**
+**Contract:**
 
-1. Пара (`BandwidthBitsPerSecond`, `BurstWindowUsec`) валидируется
-   (§3.6). При невалидной паре состояние не изменяется, возвращается
-   `QUIC_STATUS_INVALID_PARAMETER`; структура никогда не существует
-   в невалидном состоянии.
-2. При успехе:
+1. The pair (`BandwidthBitsPerSecond`, `BurstWindowUsec`) is validated
+   (§3.6). On an invalid pair the state is not changed and
+   `QUIC_STATUS_INVALID_PARAMETER` is returned; the structure never
+   exists in an invalid state.
+2. On success:
    1. `Shaper->BandwidthBitsPerSecond := BandwidthBitsPerSecond`.
-   2. `Shaper->BurstWindowUsec := BurstWindowUsec` — **в точности как
-      сконфигурировано** (в мкс; ничто не переписывается: значения,
-      включая `0`, записываются как есть; поведение выбирается парой и
-      per-call `Mtu` внутри математики §3.2; при
-      `BandwidthBitsPerSecond == 0` валидно только `BurstWindowUsec == 0`).
+   2. `Shaper->BurstWindowUsec := BurstWindowUsec` — **exactly as
+      configured** (in µs; nothing is rewritten: values, including `0`,
+      are stored as-is; the behavior is selected by the pair and the
+      per-call `Mtu` inside the §3.2 math; with
+      `BandwidthBitsPerSecond == 0` only `BurstWindowUsec == 0` is
+      valid).
    3. `Shaper->CreditBaseTimeNsec := 0`.
-3. Вызов эквивалентен `QuicBandwidthShaperSetConfig` с той же парой
-   (для дефолтной пары `(0, 0)` инвариант окна тривиален — см. ниже)
-   и последующему `QuicBandwidthShaperReset`.
+3. The call is equivalent to `QuicBandwidthShaperSetConfig` with the
+   same pair (for the default pair `(0, 0)` the window invariant is
+   trivial — see below) followed by `QuicBandwidthShaperReset`.
 
-**Инвариант окна и дефолтная пара.** `Init` применяется к дефолтной
-паре `(0, 0)` (§17), для которой инвариант окна (§3.6) выполняется
-тривиально: при `BurstWindowUsec == 0` и `BandwidthBitsPerSecond == 0` вычитаемое в `NowNsec - BurstWindowNsec`
-не существует как источник заимствования (окно не участвует в `max`:
-пара `(0, 0)` означает unlimited — чтение возвращает `UINT64_MAX` до
-всякой арифметики), поэтому `Init` не принимает `NowUsec`.
-Конфигурации с `BandwidthBitsPerSecond > 0` задаются только через
-`QuicBandwidthShaperSetConfig` (§7), где инвариант окна проверяется
-с переданным `NowUsec`. `Init` проверяет Now-независимую часть таблицы
-§3.6: `BandwidthBitsPerSecond == 0` требует `BurstWindowUsec == 0`;
-пара с `BurstWindowUsec == 0` принимается безусловно (окно в её
-математике не участвует при любом per-call `Mtu`); пара с
-`BandwidthBitsPerSecond > 0, BurstWindowUsec > 0` требует
-`BurstWindowUsec <= UINT64_MAX / BandwidthBitsPerSecond /
-1'000` (ns-граница комбинации). Ранее валидированная парой
-§3.6 конфигурация проходит эти проверки гарантированно (обе границы
-Now-независимы) — вызов `Init` из `QuicPathInit` не может отказать (§21).
+**Window invariant and the default pair.** `Init` is applied to the
+default pair `(0, 0)` (§17), for which the window invariant (§3.6) holds
+trivially: with `BurstWindowUsec == 0` and
+`BandwidthBitsPerSecond == 0` the subtrahend in
+`NowNsec - BurstWindowNsec` does not exist as a source of borrowing
+(the window does not participate in the `max`: the pair `(0, 0)` means
+unlimited — the read returns `UINT64_MAX` before any arithmetic),
+which is why `Init` does not take `NowUsec`. Configurations with
+`BandwidthBitsPerSecond > 0` are set only through
+`QuicBandwidthShaperSetConfig` (§7), where the window invariant is
+checked with the passed `NowUsec`. `Init` checks the Now-independent
+part of the §3.6 table: `BandwidthBitsPerSecond == 0` requires
+`BurstWindowUsec == 0`; a pair with `BurstWindowUsec == 0` is accepted
+unconditionally (the window plays no part in its math under any
+per-call `Mtu`); a pair with `BandwidthBitsPerSecond > 0,
+BurstWindowUsec > 0` requires `BurstWindowUsec <= UINT64_MAX /
+BandwidthBitsPerSecond / 1'000` (the ns bound of the combination). A
+configuration previously validated by the §3.6 pair passes these checks
+guaranteed (both bounds are Now-independent) — the `Init` call from
+`QuicPathInit` cannot fail (§21).
 
 ## §7 `QuicBandwidthShaperSetConfig`
 
-**Назначение:** атомарно изменить конфигурацию (пару «скорость + окно»)
-в любой момент. Объединяет прежние отдельные сценарии изменения
-bandwidth и burst-окна: пара применяется целиком либо не применяется
-вообще.
+**Purpose:** atomically change the configuration (the "rate + window"
+pair) at any moment. It merges the former separate change scenarios for
+bandwidth and the burst window: the pair is applied in full or not
+applied at all.
 
-**Аргументы:**
+**Arguments:**
 
-- `Shaper` : `_Inout_ QUIC_BANDWIDTH_SHAPER*` — обязателен, не `NULL`.
-- `BandwidthBitsPerSecond` : `_In_ uint64_t` — новое значение, **бит/с**.
-- `BurstWindowUsec` : `_In_ uint64_t` — новое окно, мкс.
-- `NowUsec` : `_In_ uint64_t` — текущий момент времени вызывающего, мкс
-  (для проверки инварианта окна, §3.6; время инъецируется, §2.1).
+- `Shaper` : `_Inout_ QUIC_BANDWIDTH_SHAPER*` — required, not `NULL`.
+- `BandwidthBitsPerSecond` : `_In_ uint64_t` — the new value, **bit/s**.
+- `BurstWindowUsec` : `_In_ uint64_t` — the new window, µs.
+- `NowUsec` : `_In_ uint64_t` — the caller's current point in time, µs
+  (for checking the window invariant, §3.6; time is injected, §2.1).
 
-**Возвращает:** `QUIC_STATUS` — `QUIC_STATUS_SUCCESS` или
+**Returns:** `QUIC_STATUS` — `QUIC_STATUS_SUCCESS` or
 `QUIC_STATUS_INVALID_PARAMETER`.
 
-**Реализация:**
+**Implementation:**
 
 ```c
 _IRQL_requires_max_(DISPATCH_LEVEL)
@@ -821,129 +828,132 @@ QuicBandwidthShaperSetConfig(
     }
     Shaper->BandwidthBitsPerSecond = BandwidthBitsPerSecond;
     //
-    // Хранится «сырое» сконфигурированное значение (§3.2: ничто не
-    // переписывается; режим выбирается парой внутри математики),
-    // поэтому GET-пути сообщают ровно то, что было задано.
+    // The "raw" configured value is stored (§3.2: nothing is
+    // rewritten; the mode is selected by the pair inside the math),
+    // so GET paths report exactly what was set.
     //
     Shaper->BurstWindowUsec = BurstWindowUsec;
     return QUIC_STATUS_SUCCESS;
 }
 ```
 
-**Контракт:**
+**Contract:**
 
-1. Атомарность: пара применяется целиком или не применяется вовсе.
-   При невалидной паре (§3.6) состояние не изменяется, возвращается
-   `QUIC_STATUS_INVALID_PARAMETER`. При успехе хранится «сырое»
-   сконфигурированное окно `BurstWindowUsec` как есть: пара с
-   `W == 0` — не ошибка, а явный строгий (при per-call `Mtu > 0`) или
-   непрерывный (при `Mtu == 0`) режим; поведение выбирается парой и
-   per-call `Mtu` внутри математики §3.2, а GET-пути, читающие
-   сохранённое состояние, возвращают настроенное значение без изменений.
-2. **Инвариант окна (§3.6, только пары с `W > 0`):** окно `BurstWindowUsec` должно быть меньше
-   текущего `NowUsec` на момент конфигурирования; поскольку `NowUsec`
-   монотонно не убывает, для всех последующих вызовов гарантировано
-   `NowUsec - BurstWindowUsec` без заимствования (§3.5). Пара
-   с `W > 0` и `BurstWindowUsec >= NowUsec` отклоняется с
-   `QUIC_STATUS_INVALID_PARAMETER` либо повторяется позже; это
-   приемлемо, поскольку burst-окна малы относительно времени жизни
-   соединения (типичные значения — порядка миллисекунд). Пара с
-   `W == 0` инварианта окна не требует и принимается при любом
+1. Atomicity: the pair is applied in full or not applied at all. On an
+   invalid pair (§3.6) the state is not changed and
+   `QUIC_STATUS_INVALID_PARAMETER` is returned. On success the "raw"
+   configured window `BurstWindowUsec` is stored as-is: a pair with
+   `W == 0` is not an error but an explicit strict (with per-call
+   `Mtu > 0`) or continuous (with `Mtu == 0`) mode; the behavior is
+   selected by the pair and the per-call `Mtu` inside the §3.2 math,
+   while GET paths that read the stored state return the configured
+   value unchanged.
+2. **Window invariant (§3.6, only pairs with `W > 0`):** the window
+   `BurstWindowUsec` must be smaller than the current `NowUsec` at
+   configuration time; since `NowUsec` is monotonically non-decreasing,
+   all subsequent calls are guaranteed `NowUsec - BurstWindowUsec`
+   without borrowing (§3.5). A pair with `W > 0` and
+   `BurstWindowUsec >= NowUsec` is rejected with
+   `QUIC_STATUS_INVALID_PARAMETER` or retried later; this is acceptable
+   because burst windows are small relative to the connection lifetime
+   (typical values are on the order of milliseconds). A pair with
+   `W == 0` requires no window invariant and is accepted under any
    `NowUsec` (§3.5/§3.6).
-3. `Shaper->CreditBaseTimeNsec` **не** изменяется.
-4. Допустимо вызывать между операциями отправки без потери состояния.
-5. При увеличении окна прошлые отправки становятся «более старыми»
-   относительно нового окна — корректно, `EffectiveLastSendNsec`
-   вычисляется заново при каждом вызове §9. При уменьшении окна
-   аналогично.
-6. Burst-окно задаётся при инициализации (§6) и далее плагинами не
-   меняется: при обновлении rate передаётся текущее
-   `Shaper->BurstWindowUsec` (мкс, как сконфигурировано) (см. §25, §27).
+3. `Shaper->CreditBaseTimeNsec` is **not** changed.
+4. May be called between send operations without losing state.
+5. When the window grows, past sends become "older" relative to the new
+   window — this is correct, `EffectiveLastSendNsec` is recomputed on
+   every §9 call. Likewise when the window shrinks.
+6. The burst window is set at initialization (§6) and is not changed by
+   plugins afterwards: on a rate update the current
+   `Shaper->BurstWindowUsec` is passed (µs, as configured) (see §25,
+   §27).
 
 ## §8 `QuicBandwidthShaperReset`
 
-**Назначение:** сбросить в чистое состояние (timestamp), сохранив
-сконфигурированные `BandwidthBitsPerSecond` и `BurstWindowUsec`.
+**Purpose:** reset to a clean state (the timestamp), preserving the
+configured `BandwidthBitsPerSecond` and `BurstWindowUsec`.
 
-**Аргументы:**
+**Arguments:**
 
-- `Shaper` : `_Inout_ QUIC_BANDWIDTH_SHAPER*` — обязателен, не `NULL`.
+- `Shaper` : `_Inout_ QUIC_BANDWIDTH_SHAPER*` — required, not `NULL`.
 
-**Возвращает:** `void`.
+**Returns:** `void`.
 
-**Контракт:**
+**Contract:**
 
 1. `Shaper->CreditBaseTimeNsec := 0`.
-2. `BandwidthBitsPerSecond` и `BurstWindowUsec` сохраняются (MTU в
-   шейпере не хранится, §3.3).
-3. Используется при path-migration или graceful reinit, когда требуется
-   «забыть» прошлые отправки, но не конфигурацию.
+2. `BandwidthBitsPerSecond` and `BurstWindowUsec` are preserved (the
+   shaper stores no MTU, §3.3).
+3. Used on path-migration or graceful reinit, when past sends must be
+   "forgotten" but not the configuration.
 
 ## §9 `QuicBandwidthShaperGetAllowance`
 
-**Назначение:** вычислить в ОДНОМ проходе оба выходных значения чтения
-(решение владельца: бывшие `GetAllowedBytes` и
-`GetDelayUsec` объединены в одну функцию с двумя выходами, чтобы
-вызывающий, которому нужны оба значения, платил одним вычислением):
-сколько байт разрешено передать прямо сейчас (`AllowedBytes`) и через
-сколько микросекунд (от `NowUsec`) вызывающий сможет начать передачу
-`SizeBytes` (`DelayUsec`). Состояние не модифицируется.
+**Purpose:** compute BOTH output values of the read in a SINGLE pass
+(owner's decision: the former `GetAllowedBytes` and `GetDelayUsec` were
+merged into one function with two outputs, so that a caller needing
+both values pays with a single computation): how many bytes may be sent
+right now (`AllowedBytes`), and after how many microseconds (from
+`NowUsec`) the caller can start transmitting `SizeBytes` (`DelayUsec`).
+The state is not modified.
 
-**Аргументы:**
+**Arguments:**
 
-- `Shaper` : `_In_ const QUIC_BANDWIDTH_SHAPER*` — обязателен, не `NULL`.
-  Состояние не модифицируется.
-- `SizeBytes` : `_In_ uint64_t` — число байт, которое вызывающий намерен
-  передать; влияет ТОЛЬКО на выход `DelayUsec` (выход `AllowedBytes` от
-  него не зависит). `0` разрешён и всегда даёт `DelayUsec == 0`.
-  Вызывающему, которому нужен только один из двух выходов, рекомендуется
-  передавать `SizeBytes = 0`: задержка тогда тривиально `0`, и её
-  арифметика пропускается.
-- `NowUsec` : `_In_ uint64_t` — момент времени в микросекундах (монотонный).
-- `Mtu` : `_In_ uint16_t` — размер пакета вызывающей стороны на этот
-  вызов, байт; `0` — вызов без размера пакета (per-call, §3.3).
+- `Shaper` : `_In_ const QUIC_BANDWIDTH_SHAPER*` — required, not `NULL`.
+  The state is not modified.
+- `SizeBytes` : `_In_ uint64_t` — the number of bytes the caller
+  intends to transmit; it affects ONLY the `DelayUsec` output (the
+  `AllowedBytes` output does not depend on it). `0` is allowed and
+  always yields `DelayUsec == 0`. A caller that needs only one of the
+  two outputs is advised to pass `SizeBytes = 0`: the delay is then
+  trivially `0`, and its arithmetic is skipped.
+- `NowUsec` : `_In_ uint64_t` — the point in time in microseconds
+  (monotonic).
+- `Mtu` : `_In_ uint16_t` — the calling side's packet size for this
+  call, in bytes; `0` means a call without a packet size (per-call,
+  §3.3).
 
-**Возвращает:** `QUIC_BANDWIDTH_SHAPER_ALLOWANCE` — структура с двумя
-полями:
+**Returns:** `QUIC_BANDWIDTH_SHAPER_ALLOWANCE` — a structure with two
+fields:
 
-- `AllowedBytes` : `uint64_t` — количество байт, разрешённых к
-  немедленной отправке; `0`, если ни одного байта сейчас отправить
-  нельзя;
-- `DelayUsec` : `uint64_t` — задержка в микросекундах (округление
-  **вверх** до целых мкс — консервативно, ошибка < 1 мкс); `0`, если
-  передача `SizeBytes` может начаться немедленно — в частности всегда,
-  когда `AllowedBytes` уже покрывает `SizeBytes`, и всегда при
-  `SizeBytes == 0`.
+- `AllowedBytes` : `uint64_t` — the number of bytes allowed to be sent
+  immediately; `0` if not a single byte can be sent right now;
+- `DelayUsec` : `uint64_t` — the delay in microseconds (rounding
+  **up** to whole µs, i.e. ceiling — conservative, error < 1 µs); `0`
+  if the transmission of `SizeBytes` can start immediately — in
+  particular always when `AllowedBytes` already covers `SizeBytes`, and
+  always with `SizeBytes == 0`.
 
-**Контракт:**
+**Contract:**
 
 ```
-BandwidthBitsPerSecond  : uint64_t    = Shaper->BandwidthBitsPerSecond    (бит/с)
-BurstWindowNsec         : uint64_t    = BurstWindowUsec * 1'000           (нс; обычный режим,
-                                                                          конвертируется при вызове, §3.2)
-CreditBaseTimeNsec      : uint64_t    = Shaper->CreditBaseTimeNsec        (нс)
-SizeBytes               : uint64_t                                        (байт; только DelayUsec)
-NowUsec                 : uint64_t                                        (мкс)
-NowNsec                 : uint64_t    = NowUsec * NSEC_PER_USEC           (нс)
+BandwidthBitsPerSecond  : uint64_t    = Shaper->BandwidthBitsPerSecond    (bit/s)
+BurstWindowNsec         : uint64_t    = BurstWindowUsec * 1'000           (ns; normal mode,
+                                                                          converted at call time, §3.2)
+CreditBaseTimeNsec      : uint64_t    = Shaper->CreditBaseTimeNsec        (ns)
+SizeBytes               : uint64_t                                        (bytes; DelayUsec only)
+NowUsec                 : uint64_t                                        (µs)
+NowNsec                 : uint64_t    = NowUsec * NSEC_PER_USEC           (ns)
 Mtu                     : uint16_t                                        (per-call, §3.3)
-EffectiveLastSendNsec   : uint64_t                                        (нс)
-DeltaNsec               : uint64_t                                        (нс)
-Allowed                 : uint64_t                                        (байт)
-TimeNeededNsec          : uint64_t                                        (нс)
-EarliestNsec            : uint64_t                                        (нс)
+EffectiveLastSendNsec   : uint64_t                                        (ns)
+DeltaNsec               : uint64_t                                        (ns)
+Allowed                 : uint64_t                                        (bytes)
+TimeNeededNsec          : uint64_t                                        (ns)
+EarliestNsec            : uint64_t                                        (ns)
 
 BITS_PER_BYTE  : uint64_t = 8
 NSEC_PER_USEC  : uint64_t = 1'000
-BITS_PER_NSEC_DENOM : uint64_t = 8'000'000'000 (см. §3.1)
+BITS_PER_NSEC_DENOM : uint64_t = 8'000'000'000 (see §3.1)
 
 1. if BandwidthBitsPerSecond == 0
        → return {AllowedBytes := UINT64_MAX, DelayUsec := 0}    // unlimited
-2. NowNsec     := NowUsec * 1'000            // контракт §2.1: без переполнения
+2. NowNsec     := NowUsec * 1'000            // §2.1 contract: no overflow
 
-   // СТРОГИЙ режим (QuicBandwidthShaperIsStrictMode, §3.2: Mtu > 0 и
+   // STRICT mode (QuicBandwidthShaperIsStrictMode, §3.2: Mtu > 0 and
    //   BurstWindowUsec * BandwidthBitsPerSecond / 8e6 < Mtu):
    //   MtuDebitNsec := Mtu * 8'000'000'000 / BandwidthBitsPerSecond
-   //   — общий для обоих выходов интервал:
+   //   — the interval shared by both outputs:
    //   if NowNsec >= CreditBaseTimeNsec and NowNsec - CreditBaseTimeNsec >= MtuDebitNsec
    //   → return {AllowedBytes := Mtu, DelayUsec := 0}
    //   AllowedBytes := 0
@@ -952,265 +962,279 @@ BITS_PER_NSEC_DENOM : uint64_t = 8'000'000'000 (см. §3.1)
    //   if EarliestNsec <= NowNsec → return {AllowedBytes, DelayUsec := 0}
    //   DelayUsec := ceil((EarliestNsec - NowNsec) / 1'000)
    //   → return {AllowedBytes, DelayUsec}
-   //   (разность вычисляется только при NowNsec >= CreditBaseTimeNsec:
-   //    долг означает 0 без вычитания; окно не участвует; строгий шейпер
-   //    не предлагает больше одного пакета, поэтому задержка не растёт
-   //    с SizeBytes)
+   //   (the difference is computed only when NowNsec >= CreditBaseTimeNsec:
+   //    debt means 0 without subtraction; the window does not participate;
+   //    the strict shaper never offers more than one packet, so the delay
+   //    does not grow with SizeBytes)
 
 3. EffectiveLastSendNsec :=
       BurstWindowUsec == 0   → CreditBaseTimeNsec
-                               // НЕПРЕРЫВНЫЙ режим (Mtu == 0, §3.2):
-                               // без burst-окна клэмпить нечем
-      иначе                  → max(CreditBaseTimeNsec, NowNsec - BurstWindowNsec)
+                               // CONTINUOUS mode (Mtu == 0, §3.2):
+                               // without a burst window there is nothing
+                               // to clamp by
+      otherwise              → max(CreditBaseTimeNsec, NowNsec - BurstWindowNsec)
 4. if NowNsec <= EffectiveLastSendNsec       → DeltaNsec := 0
    else                                       DeltaNsec := NowNsec - EffectiveLastSendNsec
 5. if DeltaNsec > UINT64_MAX / BandwidthBitsPerSecond             → Allowed := UINT64_MAX
-   // defense in depth (§3.5): для валидированного состояния
-   // недостижимо; для состояния, записанного в обход валидации,
-   // исключает wrap; в непрерывном режиме — рабочая ветка
+   // defense in depth (§3.5): unreachable for validated state;
+   // for state written bypassing validation it rules out wrap;
+   // in continuous mode it is the working branch
    else   Allowed := DeltaNsec * BandwidthBitsPerSecond / (BITS_PER_BYTE * NSEC_PER_SEC)
                  = DeltaNsec * BandwidthBitsPerSecond / 8'000'000'000   (uint64_t)
 6. if SizeBytes == 0                   → return {Allowed, DelayUsec := 0}
 7. if SizeBytes > UINT64_MAX / BITS_PER_NSEC_DENOM
-                                       → TimeNeededNsec := UINT64_MAX
-                                         // насыщение: аргумент SizeBytes не
-                                         // ограничен конфигурацией, «время
-                                         // передачи» практически бесконечно
-   else                                 TimeNeededNsec := SizeBytes * BITS_PER_NSEC_DENOM / BandwidthBitsPerSecond
-                                         = SizeBytes * 8'000'000'000 / BandwidthBitsPerSecond   (uint64_t)
+                                        → TimeNeededNsec := UINT64_MAX
+                                          // saturation: the SizeBytes argument
+                                          // is not bounded by configuration,
+                                          // the "transmission time" is practically
+                                          // infinite
+    else                                 TimeNeededNsec := SizeBytes * BITS_PER_NSEC_DENOM / BandwidthBitsPerSecond
+                                          = SizeBytes * 8'000'000'000 / BandwidthBitsPerSecond   (uint64_t)
 8. EarliestNsec := saturating_add(EffectiveLastSendNsec, TimeNeededNsec)
    if EffectiveLastSendNsec + TimeNeededNsec > UINT64_MAX    → EarliestNsec := UINT64_MAX
 9. if EarliestNsec <= NowNsec          → return {Allowed, DelayUsec := 0}
 10. DelayNsec := EarliestNsec - NowNsec
     return {Allowed, DelayUsec := DelayNsec / 1'000 + (DelayNsec % 1'000 != 0)}
-    // ceil до целых мкс на выходе (консервативно; без формы
-    // DelayNsec + 999 — не переполняется вблизи UINT64_MAX)
+    // ceil to whole µs at the output (conservative; without the
+    // DelayNsec + 999 form — no overflow near UINT64_MAX)
 ```
 
-Шаги 3–5 вычисляют `AllowedBytes` (обычный и непрерывный режимы; шаг 5 —
-единственное умножение на пути чтения); шаги 6–10 — `DelayUsec`.
-Шаг 5 безопасен по инварианту валидации
-(§3.5): `DeltaNsec <= BurstWindowNsec <=
-UINT64_MAX / BandwidthBitsPerSecond`, а `DeltaNsec <= BurstWindowNsec` по построению (шаги 3–4). Guard
-шага 5 — defense in depth в обычном режиме (см. §3.5) и рабочая ветка
-непрерывного режима. Вычитание `NowNsec - BurstWindowNsec` в
-шаге 3 безопасно по инварианту окна (§3.5/§3.6): `BurstWindowUsec < NowUsec` на момент
-конфигурирования, `NowUsec` монотонно не убывает — заимствование
-невозможно (конвертация `* 1'000` сохраняет строгое неравенство).
-Флор-деление шага 5 сохраняет суб-микросекундную точность: дебит
-предыдущих отправок с остатком < 1 мкс участвует в последующих чтениях.
-Насыщение на шаге 7 — реакция на
-неограниченный аргумент `SizeBytes` вызывающей стороны; умножения,
-зависящие от конфигурации, насыщения и guard-ов не требуют (§3.5).
+Steps 3–5 compute `AllowedBytes` (normal and continuous modes; step 5 is
+the only multiplication on the read path); steps 6–10 compute
+`DelayUsec`. Step 5 is safe by the validation invariant (§3.5):
+`DeltaNsec <= BurstWindowNsec <= UINT64_MAX / BandwidthBitsPerSecond`,
+and `DeltaNsec <= BurstWindowNsec` by construction (steps 3–4). The
+step 5 guard is defense in depth in normal mode (see §3.5) and the
+working branch of continuous mode. The subtraction
+`NowNsec - BurstWindowNsec` in step 3 is safe by the window invariant
+(§3.5/§3.6): `BurstWindowUsec < NowUsec` at configuration time, and
+`NowUsec` is monotonically non-decreasing — borrowing is impossible
+(the `* 1'000` conversion preserves the strict inequality). The floor
+division of step 5 preserves sub-microsecond precision: the debit of
+past sends with a remainder < 1 µs participates in subsequent reads.
+The saturation in step 7 is the reaction to the caller's unbounded
+`SizeBytes` argument; multiplications that depend on the configuration
+require no saturation and no guards (§3.5).
 
-Результат `AllowedBytes` **не округляется** до целых пакетов — MTU
-chunking выполняет вызывающий (§3.3). Выход `DelayUsec` **не
-используется** для определения MTU-rounding — это ответственность
-вызывающего (§3.3).
+The `AllowedBytes` result is **not rounded** to whole packets — MTU
+chunking is performed by the caller (§3.3). The `DelayUsec` output is
+**not used** to determine MTU rounding — that is the caller's
+responsibility (§3.3).
 
-`NowUsec` трактуется как монотонный счётчик. Если значение
-`NowUsec` убывает по сравнению с предыдущим вызовом, UB нет:
-шаг 4 при `NowNsec <= EffectiveLastSendNsec` кладёт `DeltaNsec := 0`, оба выхода
-равны значениям именно этого момента времени. Нулевой `AllowedBytes`
-гарантирован только при `NowNsec <= EffectiveLastSendNsec`:
-при `BurstWindowUsec > 0` и неиспользованном кредите чтение в более ранний момент
-`t-1` может вернуть положительный кредит, доступный на момент `t-1`.
-Все сравнения времени —
-в форме без сложения (§3.5).
+`NowUsec` is treated as a monotonic counter. If the `NowUsec` value
+decreases relative to the previous call, there is no UB: step 4 sets
+`DeltaNsec := 0` when `NowNsec <= EffectiveLastSendNsec`, and both
+outputs equal the values of exactly that point in time. A zero
+`AllowedBytes` is guaranteed only when
+`NowNsec <= EffectiveLastSendNsec`: with `BurstWindowUsec > 0` and
+unused credit, a read at an earlier moment `t-1` may return positive
+credit available at moment `t-1`. All time comparisons are in the
+addition-free form (§3.5).
 
 ## §10 `QuicBandwidthShaperOnSend`
 
-**Назначение:** списать фактически переданные байты из кредита шейпера.
-Вызывающий **обязан** вызвать эту функцию ровно один раз, сразу после
-фактической передачи (или не вызывать совсем, если передача не
-состоялась).
+**Purpose:** debit the bytes actually transmitted from the shaper's
+credit. The caller **MUST** call this function exactly once, immediately
+after the actual transmission (or not call it at all if the transmission
+did not happen).
 
-**Аргументы:**
+**Arguments:**
 
-- `Shaper` : `_Inout_ QUIC_BANDWIDTH_SHAPER*` — обязателен, не `NULL`.
-- `BytesSent` : `_In_ uint32_t` — суммарное количество байт, фактически
-  отправленных сетью. Тип `uint32_t` соответствует существующему
-  интерфейсу CC: `QuicCongestionControlOnDataSent` принимает
+- `Shaper` : `_Inout_ QUIC_BANDWIDTH_SHAPER*` — required, not `NULL`.
+- `BytesSent` : `_In_ uint32_t` — the total number of bytes actually
+  sent by the network. The `uint32_t` type matches the existing CC
+  interface: `QuicCongestionControlOnDataSent` takes
   `_In_ uint32_t NumRetransmittableBytes` (`congestion_control.h`).
-- `NowUsec` : `_In_ uint64_t` — момент времени, в который передача была
-  завершена.
-- `Mtu` : `_In_ uint16_t` — размер пакета вызывающей стороны на этот
-  вызов, байт (строгой клэмп-базе записи нужен `DebitNsec(Mtu)`);
-  `0` — без размера пакета (per-call, §3.3).
+- `NowUsec` : `_In_ uint64_t` — the point in time at which the
+  transmission completed.
+- `Mtu` : `_In_ uint16_t` — the calling side's packet size for this
+  call, in bytes (the write path's strict clamp base needs
+  `DebitNsec(Mtu)`); `0` means without a packet size (per-call, §3.3).
 
-**Возвращает:** `void`.
+**Returns:** `void`.
 
-**Контракт:**
+**Contract:**
 
 ```
-BandwidthBitsPerSecond  : uint64_t = Shaper->BandwidthBitsPerSecond              (бит/с)
-BurstWindowNsec         : uint64_t = BurstWindowUsec * 1'000                    (нс; обычный режим,
-                                                                                конвертируется при вызове, §3.2)
-CreditBaseTimeNsec      : uint64_t = Shaper->CreditBaseTimeNsec                 (нс)
-BytesSent  : uint32_t, контракт BytesSent <= 2^31 (см. ниже)
-NowUsec    : uint64_t                                               (мкс)
-NowNsec    : uint64_t = NowUsec * 1'000                             (нс)
+BandwidthBitsPerSecond  : uint64_t = Shaper->BandwidthBitsPerSecond              (bit/s)
+BurstWindowNsec         : uint64_t = BurstWindowUsec * 1'000                    (ns; normal mode,
+                                                                                converted at call time, §3.2)
+CreditBaseTimeNsec      : uint64_t = Shaper->CreditBaseTimeNsec                 (ns)
+BytesSent  : uint32_t, contract BytesSent <= 2^31 (see below)
+NowUsec    : uint64_t                                               (µs)
+NowNsec    : uint64_t = NowUsec * 1'000                             (ns)
 Mtu        : uint16_t                                               (per-call, §3.3)
-DebitNsec  : uint64_t                                               (нс)
+DebitNsec  : uint64_t                                               (ns)
 
 BITS_PER_BYTE : uint64_t = 8
 
 1. if BytesSent == 0   → return                    // no-op
-2. if BandwidthBitsPerSecond == 0           → return                    // unlimited: учёт не нужен
+2. if BandwidthBitsPerSecond == 0           → return                    // unlimited: no accounting needed
 3. DebitNsec := (uint64_t)BytesSent * BITS_PER_BYTE * 1'000'000'000 / BandwidthBitsPerSecond
-   // контракт BytesSent <= 2^31: промежуточное
-   // BytesSent * 8'000'000'000 <= 2^31 * 8e9 ~= 1,72e19 < 2^64 ~= 1,845e19:
-   // переполнение невозможно при любой конфигурации (§3.5; фиксируется
-   // CXPLAT_DBG_ASSERT-ом, без runtime-clamping-а)
+   // contract BytesSent <= 2^31: the intermediate
+   // BytesSent * 8'000'000'000 <= 2^31 * 8e9 ~= 1.72e19 < 2^64 ~= 1.845e19:
+   // overflow is impossible under any configuration (§3.5; asserted by
+   // CXPLAT_DBG_ASSERT, without runtime clamping)
 4. NowNsec    := NowUsec * 1'000
 
-   // СТРОГИЙ режим (QuicBandwidthShaperIsStrictMode, §3.2: Mtu > 0):
+   // STRICT mode (QuicBandwidthShaperIsStrictMode, §3.2: Mtu > 0):
    //   MtuDebitNsec := Mtu * 8'000'000'000 / BandwidthBitsPerSecond
    //   StrictBase := max(CreditBaseTimeNsec, NowNsec >= MtuDebitNsec ? NowNsec - MtuDebitNsec : 0)
    //   CreditBaseTimeNsec := saturating_add(StrictBase, max(DebitNsec, MtuDebitNsec))
-   //   (клэмп-база заменяет burst-окно ровно одним интервалом дебита —
-   //    минимальным окном, финансирующим один пакет размера Mtu; после
-   //    разрешённой отправки время-база в NowNsec или позже — следующий
-   //    пакет не раньше чем через полный интервал; наивная база
-   //    max(CreditBaseTimeNsec, NowNsec) уполовинивала строгую скорость)
+   //   (the clamp base replaces the burst window with exactly one debit
+   //    interval — the minimal window funding a single packet of size
+   //    Mtu; after an allowed send the time base is at NowNsec or
+   //    later — the next packet no sooner than after a full interval;
+   //    the naive base max(CreditBaseTimeNsec, NowNsec) would halve
+   //    the strict rate)
 
 5. EffectiveLastSendNsec :=
       BurstWindowUsec == 0   → max(CreditBaseTimeNsec, NowNsec)
-                               // НЕПРЕРЫВНЫЙ режим (Mtu == 0, §3.2): база
-                               // уходит от max(время-база, Now) — без окна
-      иначе                  → max(CreditBaseTimeNsec, NowNsec - BurstWindowNsec)
+                               // CONTINUOUS mode (Mtu == 0, §3.2): the
+                               // base departs from max(time base, Now) — no window
+      otherwise              → max(CreditBaseTimeNsec, NowNsec - BurstWindowNsec)
 6. Shaper->CreditBaseTimeNsec := saturating_add(EffectiveLastSendNsec, DebitNsec)
 ```
 
-Вычитание `NowNsec - BurstWindowNsec` в шаге 5 безопасно по инварианту окна
-(§3.5/§3.6, обычный режим): `BurstWindowUsec < NowUsec` на момент
-конфигурирования, `NowUsec` монотонно не убывает — заимствование
-невозможно. Saturating-add в
-шаге 6 — защита от долга, выходящего за `uint64_t`, к инварианту окна
-отношения не имеет. Флор-деление шага 3 сохраняет суб-микросекундный
-остаток дебита (в µs-базе он терялся: при `BandwidthBitsPerSecond >= 9,6 Гбит/с` дебит пакета
-уходил в `floor -> 0`).
+The subtraction `NowNsec - BurstWindowNsec` in step 5 is safe by the
+window invariant (§3.5/§3.6, normal mode): `BurstWindowUsec < NowUsec`
+at configuration time, and `NowUsec` is monotonically non-decreasing —
+borrowing is impossible. The saturating-add in step 6 is protection
+against debt overflowing `uint64_t`; it has no relation to the window
+invariant. The floor division of step 3 preserves the sub-microsecond
+debit remainder (in the µs base it was lost: at
+`BandwidthBitsPerSecond >= 9.6 Gbit/s` a packet's debit fell into
+`floor -> 0`).
 
-**Контракт `BytesSent <= 2^31` (вывод).** Знаменатель пути записи вырос
-в 1'000 раз против µs-базы, поэтому безусловная граница «весь диапазон
-`uint32_t`» перестала выполняться: `(2^32 - 1) * 8e9 ~= 3,4e19 > 2^64`.
-Суженный контракт `BytesSent <= 2^31` даёт `BytesSent * 8e9 <= 2^31 *
-8'000'000'000 = 17'179'869'184'000'000'000 ~= 1,72e19 < 18'446'744'073'
-709'551'615 = 2^64 - 1` — переполнение невозможно при любой
-конфигурации. Запас до фактических значений — огромный: per-send длины
-в msquic — это длины пакетов/батчей (`uint16_t`-около `SentPacket->PacketLength`)
-и байты CC-окна (`uint32_t`, но реальные cwnd << 2 ГБ); поведение при
-нарушении контракта — `CXPLAT_DBG_ASSERT` в отладке, в release —
-обёртывание по модулю 2^64 без UB памяти (по-прежнему без clamping-а).
+**Contract `BytesSent <= 2^31` (derivation).** The write path's
+denominator grew by a factor of 1'000 over the µs base, so the
+unconditional bound "the entire `uint32_t` range" no longer holds:
+`(2^32 - 1) * 8e9 ~= 3.4e19 > 2^64`. The narrowed contract
+`BytesSent <= 2^31` gives
+`BytesSent * 8e9 <= 2^31 * 8'000'000'000 = 17'179'869'184'000'000'000
+~= 1.72e19 < 18'446'744'073'709'551'615 = 2^64 - 1` — overflow is
+impossible under any configuration. The headroom relative to actual
+values is enormous: per-send lengths in msquic are packet/batch lengths
+(`uint16_t`, around `SentPacket->PacketLength`) and CC-window bytes
+(`uint32_t`, but real cwnd << 2 GB); behavior on contract violation is
+`CXPLAT_DBG_ASSERT` in debug, and in release wraparound modulo 2^64
+without memory UB (still without clamping).
 
-**Ключевой инвариант (списание кредита).** Пусть `AllowedBytes` — выход
-`AllowedBytes` вызова `QuicBandwidthShaperGetAllowance(Shaper, 0, NowUsec, Mtu)`
-(§9) непосредственно перед вызовом `OnSend(BytesSent, NowUsec)`. Тогда
-сразу после вызова (при том же `NowUsec`):
+**Key invariant (credit debiting).** Let `AllowedBytes` be the
+`AllowedBytes` output of the call
+`QuicBandwidthShaperGetAllowance(Shaper, 0, NowUsec, Mtu)` (§9)
+immediately before the call `OnSend(BytesSent, NowUsec)`. Then
+immediately after the call (at the same `NowUsec`):
 
 ```
 max(0, AllowedBytes - BytesSent) - 1 <= GetAllowance(Shaper, 0, NowUsec, Mtu).AllowedBytes
                                      <= max(0, AllowedBytes - BytesSent) + 1
 ```
 
-т.е. отправка списывает `BytesSent` байт из доступного кредита
-**с точностью до округления (± 1 байт)**: `Allowed` (§9, шаг 5) и
-`DebitNsec` (§10, шаг 3) округляются вниз независимо — двойной
-`floor`. В наносекундной базе остаток дебита < 1 мкс сохраняется, поэтому
-отклонения ± 1 байта возникают только от пола самого `Allowed`; пример:
-`BandwidthBitsPerSecond = 24'000'000` бит/с (`3` байта/мкс),
-`DeltaUsec = 1` мкс → `AllowedBytes = 3`;
-`OnSend(BytesSent = 1, Now)` даёт `DebitNsec = 1 * 8e9 / 24e6 = 333` нс
-(µs-база давала `floor(1/3) = 0` мкс), и повторное чтение возвращает
-ровно `AllowedBytes - BytesSent = 2`. Равенство точное, когда `Allowed` вычисляется без
-остатка — например, при `BandwidthBitsPerSecond`, кратном `8'000'000` (целое число байт/мкс),
-и `BytesSent`, кратном `BandwidthBitsPerSecond / 8'000'000`. Это свойство (с точностью до
-± 1 байт) делает возможными серийные (back-to-back) отправки в
-пределах burst-бюджета `BurstWindowNsec * BandwidthBitsPerSecond / 8'000'000'000`
-(обычный режим; строгий режим серийных отправок не даёт — один пакет
-на интервал дебита).
+that is, a send debits `BytesSent` bytes from the available credit
+**to within rounding (± 1 byte)**: `Allowed` (§9, step 5) and
+`DebitNsec` (§10, step 3) are rounded down independently — a double
+`floor`. In the nanosecond base the debit remainder < 1 µs is
+preserved, so ± 1 byte deviations arise only from the floor of
+`Allowed` itself; example:
+`BandwidthBitsPerSecond = 24'000'000` bit/s (`3` bytes/µs),
+`DeltaUsec = 1` µs → `AllowedBytes = 3`;
+`OnSend(BytesSent = 1, Now)` yields `DebitNsec = 1 * 8e9 / 24e6 = 333`
+ns (the µs base gave `floor(1/3) = 0` µs), and a repeat read returns
+exactly `AllowedBytes - BytesSent = 2`. The equality is exact when
+`Allowed` is computed without a remainder — for example, with
+`BandwidthBitsPerSecond` a multiple of `8'000'000` (a whole number of
+bytes/µs) and `BytesSent` a multiple of
+`BandwidthBitsPerSecond / 8'000'000`. This property (accurate to
+± 1 byte) makes back-to-back sends possible within the burst budget
+`BurstWindowNsec * BandwidthBitsPerSecond / 8'000'000'000` (normal
+mode; strict mode does not allow back-to-back sends — one packet per
+debit interval).
 
-Особенности:
+Notable details:
 
-1. `CreditBaseTimeNsec` **не** приравнивается к `NowNsec`. В обычном
-   режиме время-база
-   сдвигается вперёд на `DebitNsec` относительно
-   `max(CreditBaseTimeNsec, NowNsec - BurstWindowNsec)` — см. §3.2;
-   в строгом режиме клэмп-база —
-   `max(CreditBaseTimeNsec, NowNsec - MtuDebitNsec)` с продвижением
-   на `max(DebitNsec, MtuDebitNsec)` (per-call `Mtu`); в непрерывном
-   режиме — от `max(CreditBaseTimeNsec, NowNsec)` на `DebitNsec`.
-2. После списания `CreditBaseTimeNsec` может превышать `NowNsec`
-   (наступил «долг» — отправлено больше, чем разрешал кредит). Это
-   нормальное состояние: последующие чтения `GetAllowance`
-   корректно требуют выкупа долга накоплением кредита (в строгом
-   режиме чтение/задержка защищены сравнением
-   `NowNsec >= CreditBaseTimeNsec` — долг означает 0 без вычитания).
-3. `NowUsec` ожидается монотонным в рамках одного шейпера. Нарушение
-   обнаруживается на стороне чтения (§9, шаг 4: при
-   `NowNsec <= EffectiveLastSendNsec` положено `DeltaNsec := 0`), UB отсутствует;
-   чтение в убывший момент возвращает кредит, доступный на тот момент, —
-   нуль только при `NowNsec <= EffectiveLastSendNsec` (см. §9).
-4. Шаг 2 (`BandwidthBitsPerSecond == 0`) делает `OnSend` no-op в режиме unlimited: кредит
-   бесконечен, учёт списка не нужен, деления на ноль нет.
-5. Сравнения времени записываются без сложения (§3.5): `Window < Now − Last`;
-   форма `Last + Window < Now` запрещена.
+1. `CreditBaseTimeNsec` is **not** set equal to `NowNsec`. In normal
+   mode the time base moves forward by `DebitNsec` relative to
+   `max(CreditBaseTimeNsec, NowNsec - BurstWindowNsec)` — see §3.2; in
+   strict mode the clamp base is
+   `max(CreditBaseTimeNsec, NowNsec - MtuDebitNsec)` with an advance
+   of `max(DebitNsec, MtuDebitNsec)` (per-call `Mtu`); in continuous
+   mode — from `max(CreditBaseTimeNsec, NowNsec)` by `DebitNsec`.
+2. After a debit, `CreditBaseTimeNsec` may exceed `NowNsec` ("debt"
+   has set in — more was sent than the credit allowed). This is a
+   normal state: subsequent `GetAllowance` reads correctly require the
+   debt to be redeemed by accumulating credit (in strict mode the
+   read/delay are protected by the comparison
+   `NowNsec >= CreditBaseTimeNsec` — debt means 0 without subtraction).
+3. `NowUsec` is expected to be monotonic within a single shaper. A
+   violation is detected on the read side (§9, step 4: when
+   `NowNsec <= EffectiveLastSendNsec`, `DeltaNsec := 0` is set); there
+   is no UB; a read at a decreased moment returns the credit available
+   at that moment — zero only when
+   `NowNsec <= EffectiveLastSendNsec` (see §9).
+4. Step 2 (`BandwidthBitsPerSecond == 0`) makes `OnSend` a no-op in
+   unlimited mode: the credit is infinite, debit accounting is
+   unnecessary, and there is no division by zero.
+5. Time comparisons are written addition-free (§3.5):
+   `Window < Now − Last`; the form `Last + Window < Now` is forbidden.
 
-**No-op контракт неактивного шейпера.** Вызов с неактивным шейпером
-(`BandwidthBitsPerSecond == 0`) — no-op: debit не начисляется, состояние
-не меняется, allowance не ограничивает. Это относится ко всем
-debit/allowance-функциям: `OnSend` (шаг 2 выше), `RegisterSend` (§14 —
-наследует семантику §10) и `ComputeSendAllowance` (§13, шаг 2 —
-возвращает `CcWindowBytes - BytesInFlight`, не урезая его шейпером).
-Guard на стороне вызывающего (проверка `BandwidthBitsPerSecond` перед
-вызовом) опционален: ранний return внутри модуля делает вызов дешёвым;
-guard допустим как оптимизация на горячем пути.
+**No-op contract of the inactive shaper.** A call with an inactive
+shaper (`BandwidthBitsPerSecond == 0`) is a no-op: no debit is accrued,
+the state does not change, the allowance does not limit. This applies
+to all debit/allowance functions: `OnSend` (step 2 above),
+`RegisterSend` (§14 — inherits the semantics of §10) and
+`ComputeSendAllowance` (§13, step 2 — returns
+`CcWindowBytes - BytesInFlight` without the shaper trimming it). A
+guard on the caller side (checking `BandwidthBitsPerSecond` before the
+call) is optional: the early return inside the module makes the call
+cheap; a guard is admissible as a hot-path optimization.
 
-## §11 Потокобезопасность и уровень IRQL
+## §11 Thread safety and IRQL level
 
-Шейпер **не** обеспечивает внутренней синхронизации. Предполагается, что
-вызывающий сериализует доступ (например, через `QUIC_PATH` или
-`QUIC_CONGESTION_CONTROL`, доступ к которым синхронизирован на уровне
-QUIC connection state lock). Это совпадает с подходом, применяемым к
-`LastSendAllowance` в `cubic.c` и `LastFlushTime` в `send.h`.
+The shaper provides **no** internal synchronization. The caller is
+expected to serialize access (for example, via `QUIC_PATH` or
+`QUIC_CONGESTION_CONTROL`, whose access is synchronized at the level of
+the QUIC connection state lock). This matches the approach applied to
+`LastSendAllowance` in `cubic.c` and `LastFlushTime` in `send.h`.
 
-**IRQL-контракт.** Все публичные функции шейпера аннотированы
-`_IRQL_requires_max_(DISPATCH_LEVEL)`. Контракт сознательно поднят до
-DISPATCH, потому что именно в DISPATCH-совместимых контекстах выполняются
-потребители: CC-плагины и путь отправки —
-`QuicCongestionControlInitialize`/`QuicCongestionControlReset` вызываются,
-в частности, из DISPATCH-аннотированного `QuicConnAlloc`;
+**IRQL contract.** All public shaper functions are annotated
+`_IRQL_requires_max_(DISPATCH_LEVEL)`. The contract is deliberately
+raised to DISPATCH because that is exactly where the consumers run:
+CC plugins and the send path —
+`QuicCongestionControlInitialize`/`QuicCongestionControlReset` are
+called, in particular, from the DISPATCH-annotated `QuicConnAlloc`;
 `CubicCongestionControlGetSendAllowance`,
-`BbrCongestionControlUpdatePacer`/`BbrCongestionControlGetSendAllowance` и
-чтение кредита ребёнка с copy-out родителей в `QuicPacketBuilderInitialize`
-(`packet_builder.c`) выполняются на пути отправки, — и шейпер должен быть
-вызываем оттуда без поднятия IRQL. Модуль это право даёт по построению:
-lock-free «чистая математика» — ни часов, ни локов, ни аллокаций внутри;
-время всегда инъецируется вызывающим (§2.1), сериализация доступа —
-обязанность вызывающего (см. выше). Широкий контракт — подлинная гарантия
-модуля, а не послабление: вызывающие на `PASSIVE_LEVEL` покрыты им
-тривиально (вызов на более низком IRQL всегда допустим; в user-mode SAL
-инертен — на gcc/clang раскрывается в пустые макросы, `quic_sal_stub.h`).
+`BbrCongestionControlUpdatePacer`/`BbrCongestionControlGetSendAllowance`
+and the read of the child's credit with copy-out from the parents in
+`QuicPacketBuilderInitialize` (`packet_builder.c`) run on the send
+path — and the shaper must be callable from there without raising the
+IRQL. The module grants this right by construction: lock-free "pure
+math" — no clocks, no locks, no allocations inside; time is always
+injected by the caller (§2.1), access serialization is the caller's
+responsibility (see above). The broad contract is a genuine guarantee
+of the module, not a relaxation: `PASSIVE_LEVEL` callers are covered by
+it trivially (a call at a lower IRQL is always allowed; in user mode
+SAL is inert — on gcc/clang it expands to empty macros,
+`quic_sal_stub.h`).
 
-Указанное относится к lock-free шейперам (per-path
-`Path->PacerShaper`, §20, и CC-внутреннему `Cc->Pacer`, §17).
-Родительский runtime-объект
-(`QUIC_BANDWIDTH_SHAPER_PARENT`, §16.1) — обратный случай:
-он разделяется соединениями на разных воркерах и потому несёт
-**собственный** выделенный `CXPLAT_LOCK`; критические
-секции — листовые, без вложенности и без вызовов других подсистем
-(§16.4). Дебит каждого установленного родителя выполняется в точке
-отправки loss detection (`QuicLossDetectionOnPacketSent`) после
-lock-free дебитов `Cc->Pacer` и per-path ребёнка; при двух
-установленных уровнях родительские локи захватываются в фиксированном
-порядке library → configuration (§16.4).
+The above applies to the lock-free shapers (the per-path
+`Path->PacerShaper`, §20, and the CC-internal `Cc->Pacer`, §17). The
+parent runtime object (`QUIC_BANDWIDTH_SHAPER_PARENT`, §16.1) is the
+opposite case: it is shared by connections on different workers and
+therefore carries its **own** dedicated `CXPLAT_LOCK`; the critical
+sections are leaf, without nesting and without calls into other
+subsystems (§16.4). The debit of every installed parent is executed at
+the loss detection send point (`QuicLossDetectionOnPacketSent`) after
+the lock-free debits of `Cc->Pacer` and of the per-path child; with two
+levels installed, the parent locks are acquired in the fixed order
+library → configuration (§16.4).
 
-## §12 API для Congestion Control Plugin (CCP)
+## §12 API for the Congestion Control Plugin (CCP)
 
-Раздел описывает convenience-API, спроектированный так, чтобы плагин
-congestion control мог подключить шейпер без собственной арифметики
-по модулю времени и без чтения системных часов: время во все функции
-передаётся параметром (инъекция времени, §13–§14).
+This section describes the convenience API designed so that a
+congestion control plugin can wire up the shaper without its own
+modular time arithmetic and without reading system clocks: time is
+passed into every function as a parameter (time injection, §13–§14).
 
 ## §13 `QuicBandwidthShaperComputeSendAllowance`
 
@@ -1227,38 +1251,40 @@ QuicBandwidthShaperComputeSendAllowance(
 );
 ```
 
-**Назначение:** посчитать «сколько байт можно отправить прямо сейчас» как
-`min(GetAllowance(Shaper, /*SizeBytes=*/0, NowUsec, Mtu).AllowedBytes, CcWindowBytes - BytesInFlight)`, где
-`CcWindowBytes` — congestion window плагина.
+**Purpose:** compute "how many bytes can be sent right now" as
+`min(GetAllowance(Shaper, /*SizeBytes=*/0, NowUsec, Mtu).AllowedBytes, CcWindowBytes - BytesInFlight)`, where
+`CcWindowBytes` is the plugin's congestion window.
 
-**Аргументы:**
+**Arguments:**
 
-- `Shaper` : `_In_ const QUIC_BANDWIDTH_SHAPER*` — обязателен, не `NULL`.
-- `NowUsec` : `_In_ uint64_t` — текущий момент времени, мкс.
-- `CcWindowBytes` : `_In_ uint64_t` — congestion window плагина, байт.
-- `BytesInFlight` : `_In_ uint64_t` — байт в полёте, не превышающий `CcWindowBytes`.
-- `Mtu` : `_In_ uint16_t` — размер пакета вызывающей стороны на этот
-  вызов, байт; форвардится в `GetAllowance` (per-call, §3.3; на пути
-  отправки — `Path->Mtu`).
+- `Shaper` : `_In_ const QUIC_BANDWIDTH_SHAPER*` — required, not `NULL`.
+- `NowUsec` : `_In_ uint64_t` — the current point in time, µs.
+- `CcWindowBytes` : `_In_ uint64_t` — the plugin's congestion window, in
+  bytes.
+- `BytesInFlight` : `_In_ uint64_t` — bytes in flight, not exceeding
+  `CcWindowBytes`.
+- `Mtu` : `_In_ uint16_t` — the calling side's packet size for this
+  call, in bytes; forwarded to `GetAllowance` (per-call, §3.3; on the
+  send path — `Path->Mtu`).
 
-**Возвращает:** `uint32_t` — допустимое число байт для отправки.
+**Returns:** `uint32_t` — the allowed number of bytes to send.
 
-**Контракт:**
+**Contract:**
 
 ```
-BandwidthBitsPerSecond  : uint64_t = Shaper->BandwidthBitsPerSecond             (бит/с)
-Allowed     : uint64_t                                               (байт)
-Room        : uint64_t                                               (байт)
+BandwidthBitsPerSecond  : uint64_t = Shaper->BandwidthBitsPerSecond             (bit/s)
+Allowed     : uint64_t                                               (bytes)
+Room        : uint64_t                                               (bytes)
 
 1. if CcWindowBytes <= BytesInFlight  → return 0              // CC blocked
 2. if BandwidthBitsPerSecond == 0                          → return (uint32_t)(CcWindowBytes - BytesInFlight)
 3. Allowed := QuicBandwidthShaperGetAllowance(Shaper, /*SizeBytes=*/0, NowUsec, Mtu)
-     .AllowedBytes            // (§9; SizeBytes = 0: задержка не нужна)
+      .AllowedBytes            // (§9; SizeBytes = 0: no delay needed)
 4. Room    := CcWindowBytes - BytesInFlight
 5. return  (uint32_t)min(Allowed, Room)    // saturating cast
 ```
 
-Используется в стандартном pacing-флоу плагина:
+Used in the plugin's standard pacing flow:
 
 ```c
 uint32_t MyCcGetSendAllowance(QUIC_CONGESTION_CONTROL* Cc, ...) {
@@ -1281,24 +1307,24 @@ QuicBandwidthShaperRegisterSend(
     );
 ```
 
-**Назначение:** зарегистрировать факт отправки в шейпере. Время передаётся
-аргументом `NowUsec`: модуль никогда не читает системные часы — время
-всегда инъецируется вызывающим кодом, как и в §9–§10. `Mtu` — размер
-пакета вызывающей стороны на этот вызов (per-call, §3.3; строгой
-клэмп-базе записи нужен `DebitNsec(Mtu)`).
+**Purpose:** register the fact of a send with the shaper. Time is
+passed as the `NowUsec` argument: the module never reads system
+clocks — time is always injected by the calling code, as in §9–§10.
+`Mtu` is the calling side's packet size for this call (per-call, §3.3;
+the write path's strict clamp base needs `DebitNsec(Mtu)`).
 
-**Аргументы:**
+**Arguments:**
 
-- `Shaper` : `_Inout_ QUIC_BANDWIDTH_SHAPER*` — обязателен, не `NULL`.
-- `NumBytesSent` : `_In_ uint32_t` — фактически переданные байт; `0` —
-  no-op.
-- `NowUsec` : `_In_ uint64_t` — момент времени, инъецированный
-  вызывающим кодом.
-- `Mtu` : `_In_ uint16_t` — размер пакета, per-call (§3.3).
+- `Shaper` : `_Inout_ QUIC_BANDWIDTH_SHAPER*` — required, not `NULL`.
+- `NumBytesSent` : `_In_ uint32_t` — the bytes actually transmitted;
+  `0` is a no-op.
+- `NowUsec` : `_In_ uint64_t` — the point in time injected by the
+  calling code.
+- `Mtu` : `_In_ uint16_t` — the packet size, per-call (§3.3).
 
-**Возвращает:** `void`.
+**Returns:** `void`.
 
-**Контракт:**
+**Contract:**
 
 ```
 Bytes : uint64_t = (uint64_t)NumBytesSent
@@ -1306,14 +1332,14 @@ Bytes : uint64_t = (uint64_t)NumBytesSent
 1. QuicBandwidthShaperOnSend(Shaper, Bytes, NowUsec, Mtu)
 ```
 
-Т.е. `QuicBandwidthShaperRegisterSend` — тонкая обёртка над §10.
-Семантика списания кредита (включая `DebitNsec` и saturating-add)
-полностью наследуется от §10.
+That is, `QuicBandwidthShaperRegisterSend` is a thin wrapper over §10.
+The credit-debiting semantics (including `DebitNsec` and
+saturating-add) are fully inherited from §10.
 
-Предпочтительная точка вызова — внутри `QuicCongestionControlOnDataSent`
-inline-wrapper-а, рядом с уже выполняемой диспетчеризацией к плагину
-(`Mtu` — per-call размер пакета отправляющего пути, `Path->Mtu` в точке
-дебита loss detection):
+The preferred call site is inside the
+`QuicCongestionControlOnDataSent` inline wrapper, next to the dispatch
+to the plugin that already happens there (`Mtu` is the sending path's
+per-call packet size, `Path->Mtu` at the loss detection debit point):
 
 ```c
 QUIC_INLINE
@@ -1330,35 +1356,35 @@ QuicCongestionControlOnDataSent(
 }
 ```
 
-(Аннотация IRQL у реального wrapper-а — его собственный контракт
-вызывающего и в сниппет не выносится; IRQL-контракт вызываемых функций
-шейпера зафиксирован в §11.)
+(The IRQL annotation of the real wrapper is its own caller contract
+and is not carried into the snippet; the IRQL contract of the shaper
+functions it calls is fixed in §11.)
 
-`NowUsec` поступает от вызывающего кода пути отправки, который уже
-держит монотонное время; ни шейпер, ни CC-слой не читают системные часы.
-Расширение сигнатуры inline-wrapper-а (добавление `NowUsec`)
-согласуется с уже планируемым ABI bump (§28). Инъекция времени делает
-все тесты детерминированными без подмены таймера (§31).
-Дебит родителей в этот wrapper **не** входит: wrapper дебитирует только
-CC-внутренний `Cc->Pacer`; общий дебит родителей выполняется в точке
-отправки loss detection — см. §16.4.
+`NowUsec` comes from the send path's calling code, which already holds
+the monotonic time; neither the shaper nor the CC layer reads system
+clocks. Extending the inline wrapper's signature (adding `NowUsec`) is
+consistent with the already planned ABI bump (§28). Time injection
+makes all tests deterministic without timer substitution (§31). The
+parents' debit is **not** part of this wrapper: the wrapper debits only
+the CC-internal `Cc->Pacer`; the parents' shared debit is executed at
+the loss detection send point — see §16.4.
 
-## §15 Публичный API родительского шейпера (application-level)
+## §15 Public API of the parent shaper (application-level)
 
-Раздел описывает публичную (app-facing) часть API шейпера:
-родительский шейпер, устанавливаемый приложением на уровне библиотеки
-или на уровне `QUIC_CONFIGURATION` (§16). Это отдельный механизм от
-connection-level параметра `QUIC_PARAM_CONN_BANDWIDTH_SHAPER` (§22):
-параметр соединения задаёт собственный rate ребёнка, родительские
-уровни — общий потолок сверху (min, §16.3). Родитель никогда не
-выполняет MTU-chunking (§15.1); per-path настройка rate не вводится
-(§1).
+This section describes the public (app-facing) part of the shaper API:
+the parent shaper set by the application at the library level or at the
+`QUIC_CONFIGURATION` level (§16). It is a separate mechanism from the
+connection-level parameter `QUIC_PARAM_CONN_BANDWIDTH_SHAPER` (§22):
+the connection parameter sets the child's own rate, while the parent
+levels set a shared ceiling from above (min, §16.3). The parent never
+performs MTU-chunking (§15.1); per-path rate configuration is not
+introduced (§1).
 
-### §15.1 Публичная структура `QUIC_BANDWIDTH_SHAPER_CONFIG`
+### §15.1 Public structure `QUIC_BANDWIDTH_SHAPER_CONFIG`
 
-Вводится в `msquic.h` рядом с другими структурами параметров (стиль
-оформления — doc-комментарии на английском, как у остальных публичных
-структур; SAL-аннотации для структур не применяются):
+Introduced in `msquic.h` next to the other parameter structures (the
+formatting style — English doc comments, as in the other public
+structures; SAL annotations are not applied to structures):
 
 ```c
 typedef struct QUIC_BANDWIDTH_SHAPER_CONFIG {
@@ -1393,109 +1419,110 @@ typedef struct QUIC_BANDWIDTH_SHAPER_CONFIG {
 } QUIC_BANDWIDTH_SHAPER_CONFIG;
 ```
 
-Пара значений (`BandwidthBitsPerSecond`, `BurstWindowUsec`) валидируется
-той же таблицей истинности
-`QuicBandwidthShaperValidateConfig` (§3.6). Полностью нулевая
-конфигурация `(0, 0)` — дефолт и означает «без ограничений»
-(unlimited/отсутствует).
+The pair of values (`BandwidthBitsPerSecond`, `BurstWindowUsec`) is
+validated by the same truth table of
+`QuicBandwidthShaperValidateConfig` (§3.6). The fully zero
+configuration `(0, 0)` is the default and means "no limits"
+(unlimited/absent).
 
-Поле `Mtu` в публичной структуре **отсутствует**, и во всём публичном API
-шейпера размера пакета нет: MTU-chunking — concern per-connection пути
-отправки (§3.3, §4), родительский шейпер не выполняет округления до
-целых пакетов; runtime-родитель передаёт `Mtu = 0` в каждый
-математический вызов (§16.3), а per-path шейпер берёт актуальный
-`Path->Mtu` на каждом вызове — реализация отслеживает MTU сама, и
-приложению конфигурировать его не нужно.
+The `Mtu` field is **absent** from the public structure, and no packet
+size exists anywhere in the public shaper API: MTU-chunking is a
+per-connection send-path concern (§3.3, §4), the parent shaper performs
+no rounding to whole packets; the runtime parent passes `Mtu = 0` into
+every math call (§16.3), and the per-path shaper takes the current
+`Path->Mtu` on every call — the implementation tracks the MTU itself,
+and the application does not need to configure it.
 
-### §15.2 Новые параметры `QUIC_PARAM_*`
+### §15.2 New `QUIC_PARAM_*` parameters
 
-Номера выбраны как первые свободные в соответствующих семействах
-`src/inc/msquic.h` (проверено по фактическому файлу):
+The numbers are chosen as the first free ones in the corresponding
+families of `src/inc/msquic.h` (verified against the actual file):
 
-| Параметр                                   | Значение      | Структура                      | Уровень      |
+| Parameter                                   | Value      | Structure                      | Level      |
 | ------------------------------------------ | ------------- | ------------------------------ | ------------ |
-| `QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER`       | `0x0100000F`  | `QUIC_BANDWIDTH_SHAPER_CONFIG` | библиотека (`MsQuicSetParam(NULL, ...)`) |
+| `QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER`       | `0x0100000F`  | `QUIC_BANDWIDTH_SHAPER_CONFIG` | library (`MsQuicSetParam(NULL, ...)`) |
 | `QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER`| `0x03000004`  | `QUIC_BANDWIDTH_SHAPER_CONFIG` | `QUIC_CONFIGURATION` |
 
-Семейства: Global — `0x01000000`-префикс (`QUIC_PARAM_PREFIX_GLOBAL`),
-Configuration — `0x03000000`-префикс (`QUIC_PARAM_PREFIX_CONFIGURATION`).
-Занятые значения на момент выбора: Global — до `0x0100000E`
-(`QUIC_PARAM_GLOBAL_XDP_MAP_CONFIG`), Configuration — до `0x03000003`
+Families: Global — the `0x01000000` prefix
+(`QUIC_PARAM_PREFIX_GLOBAL`), Configuration — the `0x03000000` prefix
+(`QUIC_PARAM_PREFIX_CONFIGURATION`). Occupied values at the time of the
+choice: Global — up to `0x0100000E`
+(`QUIC_PARAM_GLOBAL_XDP_MAP_CONFIG`), Configuration — up to `0x03000003`
 (`QUIC_PARAM_CONFIGURATION_SCHANNEL_CREDENTIAL_ATTRIBUTE_W`).
 
-**GET** (оба уровня): `*BufferLength` должен быть равен
-`sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG)`; в буфер копируется текущая
-сохранённая пара — **в точности как задана при SET** (ничто не
-переписывается: SET с любым
-`BurstWindowUsec`, включая `0`, хранит и возвращает настроенное
-значение без изменений; поведение выбирается парой и per-call
-`Mtu` внутри математики §3.2). Дефолт —
-вся нулевая `(0, 0)`. Ошибка длины буфера —
+**GET** (both levels): `*BufferLength` must be equal to
+`sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG)`; the currently stored pair is
+copied into the buffer — **exactly as set by SET** (nothing is
+rewritten: a SET with any `BurstWindowUsec`, including `0`, stores and
+returns the configured value unchanged; the behavior is selected by the
+pair and the per-call `Mtu` inside the §3.2 math). The default is the
+all-zero `(0, 0)`. A buffer length error —
 `QUIC_STATUS_INVALID_PARAMETER`.
 
-**SET** (оба уровня): `BufferLength` должен быть равен
-`sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG)`; пара валидируется целиком
-(§3.6); при успехе применяется атомарно (семантика §7: «целиком или
-никак», `CreditBaseTimeNsec` не трогается; хранится настроенное окно
-как есть); при отказе —
-`QUIC_STATUS_INVALID_PARAMETER`, состояние не изменяется.
-`SET (0, 0)` — легальный способ снять ранее установленного родителя
-(uninstall): «родитель установлен» определяется инвариантом
-`BandwidthBitsPerSecond != 0` (§16.1), поэтому запись `(0, 0)`
-эквивалентна отсутствию родителя на этом уровне; поведение привязанных
-соединений на этом уровне при этом идентично passthrough (§16.3),
-другие установленные уровни иерархии продолжают действовать (§16.2).
+**SET** (both levels): `BufferLength` must be equal to
+`sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG)`; the pair is validated as a
+whole (§3.6); on success it is applied atomically (the §7 semantics:
+"all or nothing", `CreditBaseTimeNsec` is not touched; the configured
+window is stored as is); on failure —
+`QUIC_STATUS_INVALID_PARAMETER`, the state is not changed.
+`SET (0, 0)` is a legal way to uninstall a previously set parent:
+"parent installed" is defined by the invariant
+`BandwidthBitsPerSecond != 0` (§16.1), so writing `(0, 0)` is
+equivalent to having no parent at this level; the behavior of bound
+connections at this level then becomes identical to passthrough
+(§16.3), while the other installed hierarchy levels keep acting
+(§16.2).
 
-### §15.3 Исключение из правила инъекции времени на границе SetParam
+### §15.3 Exception to the time-injection rule at the SetParam boundary
 
-`MsQuicSetParam` выполняется на потоке вызывающего; обработчики обоих
-параметров читают текущее
-монотонное время внутри библиотеки (`CxPlatTimeUs64()`) и передают его
-в `QuicBandwidthShaperSetConfig` (§7) для проверки инварианта окна
-(§3.6). Правило «модуль не читает часы» (§2.1, §14) при этом
-**сохраняется**: `bandwidth_shaper.c` по-прежнему не вызывает
-платформенные часы; исключение — граница SetParam в
-library/configuration-слое, где время читается явно и *инъецируется*
-в функциональность модуля. Отправка выполняется на том же монотонном
-источнике (`CxPlatTimeUs64`), поэтому инвариант окна, проверенный в
-момент SET, гарантирует отсутствие заимствования в `NowUsec - BurstWindowUsec` и на
-пути отправки (§3.5).
+`MsQuicSetParam` runs on the caller's thread; the handlers of both
+parameters read the current monotonic time inside the library
+(`CxPlatTimeUs64()`) and pass it into `QuicBandwidthShaperSetConfig`
+(§7) to check the window invariant (§3.6). The rule "the module does
+not read the clock" (§2.1, §14) is thereby **preserved**:
+`bandwidth_shaper.c` still does not call platform clocks; the exception
+is the SetParam boundary in the library/configuration layer, where the
+time is read explicitly and *injected* into the module's functionality.
+Sends run on the same monotonic source (`CxPlatTimeUs64`), so the
+window invariant checked at SET time guarantees the absence of
+borrowing in `NowUsec - BurstWindowUsec` on the send path as well
+(§3.5).
 
-Практическое следствие: пара с большим `BurstWindowUsec` может быть отвергнута,
-если значение монотонных часов мало (ранний аптайм) —
-`QUIC_STATUS_INVALID_PARAMETER` с допустимым ретраем позже
-(§7, контракт 2). Это то же поведение, что и для per-connection
-`SetConfig`, но с чтением времени на границе API.
+A practical consequence: a pair with a large `BurstWindowUsec` may be
+rejected if the monotonic clock value is small (early uptime) —
+`QUIC_STATUS_INVALID_PARAMETER` with a legitimate retry later
+(§7, contract 2). This is the same behavior as for the per-connection
+`SetConfig`, except that the time is read at the API boundary.
 
-### §15.4 Момент привязки родителя (snapshot at bind)
+### §15.4 The moment of parent binding (snapshot at bind)
 
-Родительский параметр задаёт родителя **своего уровня** (library или
-configuration) для соединений, привязываемых **после** успешного SET;
-живые соединения не перепривязываются. Уровни независимы: каждый
-привязывается по собственному снапшоту (§16.2) и не влияет на
-привязку другого уровня:
+The parent parameter sets the parent of **its own level** (library or
+configuration) for connections bound **after** a successful SET; live
+connections are not rebound. The levels are independent: each is bound
+by its own snapshot (§16.2) and does not affect the binding of the
+other level:
 
-- Разрешение иерархии (§16.2) выполняется однократно при привязке
-  конфигурации к соединению (клиент — при создании соединения; сервер —
-  в `QuicConnSetConfiguration`) и никогда не переоценивается. Для
-  каждого уровня фиксируется свой указатель: родитель уровня,
-  установленный **после** привязки соединения, к нему не добавляется.
-- Повторный SET на уровне, к которому соединение уже привязано, — это
-  **не перепривязка**, а атомарное обновление состояния общего
-  родительского объекта (§16.6): обновление видно всем привязанным
-  соединениям и выполняется под родительским локом, без сериализации
-  воркеров.
-- Обоснование: перепривязка (смена/добавление/удаление указателя на
-  родителя уровня у живого соединения) требует сериализации каждого
-  соединения на его воркере — out of scope. Обновление состояния
-  общего объекта требует только родительского лока.
+- Hierarchy resolution (§16.2) is performed once, at the binding of the
+  configuration to the connection (the client — at connection creation;
+  the server — in `QuicConnSetConfiguration`), and is never
+  re-evaluated. Each level gets its own fixed pointer: a level's parent
+  installed **after** the connection is bound is not added to it.
+- A repeated SET on a level the connection is already bound to is
+  **not a rebinding**, but an atomic update of the shared parent
+  object's state (§16.6): the update is visible to all bound
+  connections and is performed under the parent lock, without
+  serializing workers.
+- Rationale: rebinding (changing/adding/removing a live connection's
+  pointer to a level's parent) requires serializing every connection on
+  its worker — out of scope. Updating the shared object's state
+  requires only the parent lock.
 
-## §16 Родительская иерархия: объектная модель, разрешение, интеграция
+## §16 Parent hierarchy: object model, resolution, integration
 
-### §16.1 Объектная модель
+### §16.1 Object model
 
-Runtime-состояние родителя на каждом уровне (библиотека,
-`QUIC_CONFIGURATION`) представлено одним и тем же типом:
+The parent's runtime state at each level (library,
+`QUIC_CONFIGURATION`) is represented by one and the same type:
 
 ```c
 typedef struct QUIC_BANDWIDTH_SHAPER_PARENT {
@@ -1520,45 +1547,45 @@ typedef struct QUIC_BANDWIDTH_SHAPER_PARENT {
 } QUIC_BANDWIDTH_SHAPER_PARENT;
 ```
 
-Инвариант «родитель установлен»: `Shaper.BandwidthBitsPerSecond != 0`.
-Пара `(0, 0)` — единственная валидная с `BandwidthBitsPerSecond == 0` (§3.6), поэтому
-отдельный флаг «installed» не нужен: дефолтная инициализация `(0, 0)`
-и uninstall через `SET (0, 0)` (§15.2) дают одно и то же состояние
-«не установлен».
+The "parent installed" invariant: `Shaper.BandwidthBitsPerSecond != 0`.
+The pair `(0, 0)` is the only valid one with
+`BandwidthBitsPerSecond == 0` (§3.6), so a separate "installed" flag is
+not needed: default initialization with `(0, 0)` and an uninstall via
+`SET (0, 0)` (§15.2) yield the same "not installed" state.
 
-Размещение:
+Placement:
 
-| Объект            | Поле                                    | Инициализация                                   | Время жизни |
+| Object            | Field                                    | Initialization                                   | Lifetime |
 | ----------------- | --------------------------------------- | ----------------------------------------------- | ----------- |
-| `MsQuicLib`       | `QUIC_BANDWIDTH_SHAPER_PARENT BandwidthShaper;` | при `MsQuicLibraryInitialize` с парой `(0, 0)` | весь срок жизни библиотеки («вечно» с точки зрения соединений) |
-| `QUIC_CONFIGURATION` | `QUIC_BANDWIDTH_SHAPER_PARENT BandwidthShaper;` | при `MsQuicConfigurationOpen` с парой `(0, 0)` | refcount конфигурации |
-| `QUIC_CONNECTION` | `QUIC_BANDWIDTH_SHAPER_PARENT* LibraryBandwidthShaperParent;` | разрешение иерархии (§16.2), `NULL` = library-уровень не установлен на момент привязки | фиксируется при привязке, не меняется до конца жизни соединения |
-| `QUIC_CONNECTION` | `QUIC_BANDWIDTH_SHAPER_PARENT* ConfigBandwidthShaperParent;` | разрешение иерархии (§16.2), `NULL` = configuration-уровень не установлен на момент привязки | фиксируется при привязке, не меняется до конца жизни соединения |
+| `MsQuicLib`       | `QUIC_BANDWIDTH_SHAPER_PARENT BandwidthShaper;` | at `MsQuicLibraryInitialize` with the pair `(0, 0)` | the library's entire lifetime ("forever" from the connections' point of view) |
+| `QUIC_CONFIGURATION` | `QUIC_BANDWIDTH_SHAPER_PARENT BandwidthShaper;` | at `MsQuicConfigurationOpen` with the pair `(0, 0)` | the configuration's refcount |
+| `QUIC_CONNECTION` | `QUIC_BANDWIDTH_SHAPER_PARENT* LibraryBandwidthShaperParent;` | hierarchy resolution (§16.2), `NULL` = the library level is not installed at bind time | fixed at bind, unchanged until the end of the connection's life |
+| `QUIC_CONNECTION` | `QUIC_BANDWIDTH_SHAPER_PARENT* ConfigBandwidthShaperParent;` | hierarchy resolution (§16.2), `NULL` = the configuration level is not installed at bind time | fixed at bind, unchanged until the end of the connection's life |
 
-Соединение держит **два независимых необязательных указателя** — по
-одному на уровень иерархии. Оба родителя могут быть установлены
-одновременно; ни один не замещает другой (§16.2). Runtime-состояние
-родителей (`QUIC_BANDWIDTH_SHAPER_PARENT`) на всех уровнях одинаково
-и не меняется.
+The connection holds **two independent optional pointers** — one per
+hierarchy level. Both parents can be installed simultaneously; neither
+displaces the other (§16.2). The parents' runtime state
+(`QUIC_BANDWIDTH_SHAPER_PARENT`) is identical at all levels and does
+not change.
 
-**Стратегия времени жизни указателя.** Соединение держит *простые
-указатели* на родительские runtime-объекты. Для library-уровня это
-безусловно безопасно (состояние библиотеки живёт вечно). Для
-configuration-уровня безопасность даёт существующий refcount
-конфигурации: соединение уже берёт ссылку
+**Pointer lifetime strategy.** The connection holds *plain pointers*
+to the parent runtime objects. For the library level this is
+unconditionally safe (the library's state lives forever). For the
+configuration level safety is provided by the configuration's existing
+refcount: the connection already takes the reference
 `QuicConfigurationAddRef(Configuration, QUIC_CONF_REF_CONNECTION)`
-(`src/core/connection.c`, точка привязки конфигурации) и отпускает её
-только в cleanup соединения (`QuicConfigurationRelease(...,
-QUIC_CONF_REF_CONNECTION)`; проверено по коду). Следствие: приложение
-может закрыть handle конфигурации раньше соединения — память
-конфигурации и её родительского шейпера остаётся валидной до
-завершения соединения, дебит родителя продолжается. Отдельного
-рефкаунтинга родительского объекта не требуется; обе связи
-(соединение → library-родитель, соединение → configuration-родитель)
-покрываются одной и той же схемой — ссылка на конфигурацию плюс «вечное»
-состояние библиотеки.
+(`src/core/connection.c`, the configuration bind point) and releases it
+only in the connection's cleanup (`QuicConfigurationRelease(...,
+QUIC_CONF_REF_CONNECTION)`; verified against the code). Consequence:
+the application may close the configuration handle before the
+connection — the configuration's memory and its parent shaper remain
+valid until the connection completes, and the parent's debit continues.
+No separate refcounting of the parent object is required; both links
+(connection → library parent, connection → configuration parent) are
+covered by one and the same scheme — the configuration reference plus
+the library's "eternal" state.
 
-### §16.2 Разрешение иерархии
+### §16.2 Hierarchy resolution
 
 ```
 ResolveParents(Configuration):
@@ -1569,39 +1596,37 @@ ResolveParents(Configuration):
     if Configuration != NULL
        and Configuration.BandwidthShaper.Shaper.BandwidthBitsPerSecond != 0:
         ConfigParent := &Configuration.BandwidthShaper
-    // оба указателя сохраняются в соединении независимо
+    // both pointers are stored in the connection independently
 ```
 
-- Иерархия — **трёхуровневая цепочка**: library (глобальный) →
-  configuration → connection (ребёнок). Уровни **стекуются**, а не
-  выбираются с fallback'ом: каждый установленный уровень сохраняется в
-  соединении отдельным указателем; оба уровня могут быть установлены
-  одновременно, и ни один не замещает другой. Все уровни отсутствуют →
-  родителя нет (оба указателя `NULL`).
-- Выполняется однократно в момент привязки конфигурации к соединению
-  (§15.4): клиент — при создании соединения; сервер — в
-  `QuicConnSetConfiguration` (конфигурация прикрепляется позже, чем
-  соединение принято; до привязки родителя нет — pre-handshake
-  отправки version negotiation/retry родителем не paced). Снапшот —
-  по уровню: уровень, установленный после привязки, к уже
-  привязанным соединениям не добавляется (§16.6).
-- Чтение признаков «установлен» обоих уровней выполняется под
-  соответствующими родительскими локами (две короткие критические
-  секции; фиксированный порядок захватов: library-лок, затем
-  configuration-лок — тот же глобальный порядок, что и на пути
-  отправки, §16.4).
-- Результат (оба указателя) фиксируется на всё время жизни соединения;
-  сбросы (`QuicCongestionControlReset`, path migration, `FullReset`)
-  указатели не изменяют (§16.5).
+- The hierarchy is a **three-level chain**: library (global) →
+  configuration → connection (child). The levels **stack**, rather
+  than being chosen with a fallback: every installed level is stored in
+  the connection as a separate pointer; both levels can be installed
+  simultaneously, and neither displaces the other. All levels absent →
+  no parent (both pointers `NULL`).
+- Performed once, at the moment the configuration is bound to the
+  connection (§15.4): the client — at connection creation; the server —
+  in `QuicConnSetConfiguration` (the configuration is attached later
+  than the connection is accepted; before binding there is no parent —
+  pre-handshake version negotiation/retry sends are not paced by the
+  parent). The snapshot is per level: a level installed after the
+  binding is not added to already-bound connections (§16.6).
+- Reading the "installed" flags of both levels is performed under the
+  corresponding parent locks (two short critical sections; a fixed
+  acquisition order: the library lock, then the configuration lock —
+  the same global order as on the send path, §16.4).
+- The result (both pointers) is fixed for the connection's entire
+  lifetime; resets (`QuicCongestionControlReset`, path migration,
+  `FullReset`) do not change the pointers (§16.5).
 
-### §16.3 Эффективный лимит: min(credits)
+### §16.3 Effective limit: min(credits)
 
-Эффективное разрешение к отправке для соединения вычисляется в один
-момент `NowUsec`, прочитанный однократно путём отправки (инъекция,
-§2.1):
+The connection's effective send allowance is computed at a single
+`NowUsec` moment, read once by the send path (injection, §2.1):
 
 ```
-NowUsec                 : uint64_t = время, уже удерживаемое путём отправки
+NowUsec                 : uint64_t = the time already held by the send path
 ChildAllowance          : uint64_t
 ParentsAllowance        : uint64_t
 Effective               : uint64_t
@@ -1609,85 +1634,91 @@ Effective               : uint64_t
 ChildAllowance        = QuicBandwidthShaperGetAllowance(
                           &Path->PacerShaper, 0, NowUsec,
                           Path->Mtu).AllowedBytes   // §9;
-                          // per-call Mtu = актуальный MTU пути (§3.3);
-                          // SizeBytes = 0: нужен только AllowedBytes
+                          // per-call Mtu = the path's current MTU (§3.3);
+                          // SizeBytes = 0: only AllowedBytes is needed
 ParentsAllowance      = QuicConnBandwidthShaperGetParentsAllowance(
                           Connection, NowUsec, WantSize, &ParentsDelay)
-                          // min по каждому установленному родителю:
+                          // min over each installed parent:
                           // (Parent == NULL or Parent.Shaper.BandwidthBitsPerSecond == 0)
                           //   ? UINT64_MAX
-                          //   : <§9 на снапшоте (BandwidthBitsPerSecond, BurstWindowUsec, CreditBaseTimeNsec),
-                          //      снятом под Parent->Lock, с per-call Mtu = 0 (§15.1):
-                          //      W == 0 — непрерывный режим, W > 0 — обычная
-                          //      пропорциональная модель без MTU-округления>
+                          //   : <§9 on the snapshot (BandwidthBitsPerSecond, BurstWindowUsec, CreditBaseTimeNsec),
+                          //      taken under Parent->Lock, with per-call Mtu = 0 (§15.1):
+                          //      W == 0 — continuous mode, W > 0 — the normal
+                          //      proportional model without MTU rounding>
 Effective             = min(ChildAllowance, ParentsAllowance)
-                        // минимум присоединяется на уровне кредита,
-                        // ДО MTU-округления (§3.3)
+                        // the minimum is applied at the credit level,
+                        // BEFORE MTU rounding (§3.3)
 ```
 
-**Две роли пейсера — не путать.** Ребёнком иерархии является per-path
-шейпер `QUIC_PATH.PacerShaper` (§20), хранящий кредит ограничения rate
-соединения и применяющий правила MTU (§3.3). CC-внутренний пейсер
-`Cc->Pacer` (§17, §24) — отдельная сущность (фазы 2–3): им плагин
-(Cubic/BBR, §25, §27) управляет собственным pacing-rate, и в min-цепочку
-иерархии он не входит. Полный лимит батча формируется в
-`QuicPacketBuilderInitialize` (`packet_builder.c`) так:
-`QuicCongestionControlGetSendAllowance` (min окна CC плагина и кредита
-`Cc->Pacer`, §13) → клэмп амплификационным `Path->Allowance` →
-`min` с `Effective` выше.
+**Two pacer roles — do not confuse.** The child of the hierarchy is the
+per-path shaper `QUIC_PATH.PacerShaper` (§20), which holds the
+connection's rate-limit credit and applies the MTU rules (§3.3). The
+CC-internal pacer `Cc->Pacer` (§17, §24) is a separate entity (phases
+2–3): the plugin (Cubic/BBR, §25, §27) uses it to control its own
+pacing rate, and it is not part of the hierarchy's min chain. The full
+batch limit is formed in `QuicPacketBuilderInitialize`
+(`packet_builder.c`) as follows:
+`QuicCongestionControlGetSendAllowance` (the min of the CC plugin's
+window and the `Cc->Pacer` credit, §13) → clamped by the
+anti-amplification `Path->Allowance` → `min` with the `Effective`
+above.
 
-**Точки реализации.** Оба слагаемых вычисляются в
-`QuicPacketBuilderInitialize` при одном `TimeNow = CxPlatTimeUs64()`:
+**Implementation points.** Both terms are computed in
+`QuicPacketBuilderInitialize` at a single `TimeNow = CxPlatTimeUs64()`:
 
 - `ParentsAllowance` — `QuicConnBandwidthShaperGetParentsAllowance`
-  (`connection.h`, `QUIC_INLINE`): фиксированный порядок library →
-  configuration, copy-out под листовым локом каждого родителя;
-   отсутствующие уровни дают тождество `UINT64_MAX`; когда не установлен
-   ни один родитель, функция возвращает `UINT64_MAX`, а NULL-проверки
-   в билдере исключают захваты локов с горячего пути.
-  Тот же вызов возвращает `ParentsDelay` — max §9-retry-delay
-  родителей (см. ниже);
+  (`connection.h`, `QUIC_INLINE`): a fixed order library →
+  configuration, copy-out under each parent's leaf lock; absent levels
+  yield the identity `UINT64_MAX`; when no parent is installed, the
+  function returns `UINT64_MAX`, and NULL checks in the builder keep
+  lock acquisitions off the hot path. The same call returns
+  `ParentsDelay` — the max of the parents' §9 retry delays (see
+  below);
 - `Effective` — `QuicPathPacerLimitSendAllowance` (`path.h`,
-  `QUIC_INLINE`): `min` кредита ребёнка (`Path->PacerShaper`) с
-  `ParentsAllowance` **до** MTU-округления, затем поток §3.4
-  вызывающего (partial-пакеты до одного `Mtu`, floor до целых пакетов
-  по MTU ребёнка; родитель chunking не выполняет, §15.1) и признак
-  `ShaperLimited` («шейпер, а не CC, ограничил батч»).
+  `QUIC_INLINE`): the `min` of the child's credit (`Path->PacerShaper`)
+  with `ParentsAllowance` **before** MTU rounding, then the caller's
+  §3.4 flow (partial packets down to one `Mtu`, a floor to whole
+  packets by the child's MTU; the parent performs no chunking, §15.1)
+  and the `ShaperLimited` flag ("the shaper, not CC, limited the
+  batch").
 
-- Уровень отсутствует (`NULL`) или безлимитен (`BandwidthBitsPerSecond == 0`) → `min` с
-  `UINT64_MAX` — тождество: passthrough этого уровня, поведение
-  побайтно совпадает с иерархией без него. No-op контракт неактивного
-  шейпера (§10) применяется на каждом уровне независимо.
-- Библиотечный потолок действует **и тогда, когда у конфигурации есть
-  собственный родитель**: оба установленных уровня участвуют в `min`
-  одновременно. Собственный rate-конфиг ребёнка также **не отключает**
-  наследование: любой родитель — безусловный потолок сверху (`min`),
-  даже когда у ребёнка задан собственный (более высокий) rate через
-  `SetConfig` (§7). Комбинация «ребёнок ниже родителя» даёт
-  `Effective == ChildAllowance`: родитель с более мягким лимитом не
-  ускоряет ребёнка.
+- A level is absent (`NULL`) or unlimited
+  (`BandwidthBitsPerSecond == 0`) → `min` with `UINT64_MAX` — the
+  identity: passthrough of this level, the behavior is byte-for-byte
+  identical to the hierarchy without it. The no-op contract of the
+  inactive shaper (§10) applies at every level independently.
+- The library ceiling acts **even when the configuration has its own
+  parent**: both installed levels participate in the `min`
+  simultaneously. The child's own rate configuration also does **not**
+  disable inheritance: any parent is an unconditional ceiling from
+  above (`min`), even when the child has its own (higher) rate set via
+  `SetConfig` (§7). The "child below parent" combination yields
+  `Effective == ChildAllowance`: a parent with a looser limit does not
+  speed the child up.
 
-**Backoff из того же снапшота.** Когда `Effective` ограничил батч
-(`ShaperLimited`), текущий chunk отправки завершается, и `QuicSendFlush`
-(`send.c`) заводит pacing-таймер на точный момент восполнения
-ограничившего уровня: `PacingDelayUs = max(child delay, parent delay)` —
-§9-retry-delay per-path шейпера на MTU-sized want
-(`QuicPathPacerGetDelayUsec`, `path.h`; per-call `Mtu = Path->Mtu`) и max
-§9-delay родителей (`ParentsDelay`), вычисленный
-`QuicConnBandwidthShaperGetParentsAllowance`
-из **того же** снапшота, что и `ParentsAllowance` (одна операция под
-локом на родителя — `QuicBandwidthShaperParentGetAllowedBytesAndDelay`,
-`bandwidth_shaper_parent.h`; want-size общий —
-`QuicPathPacerGetWantSize`). Родительская математика выполняется с
-per-call `Mtu = 0` (§15.1), поэтому для родителя с `W == 0` бэкофф —
-точное непрерывное время передачи переданного want (зависимость от
-`RetryDelaySizeBytes` — именно то, что даёт общий want). Задержка
-родителя доступна без повторного захвата локов: она запомнена в
-билдере (`Builder->PacingParentDelayUsec`) в момент вычисления лимита.
-Без родителей max вырождается в child delay — поведение не меняется.
+**Backoff from the same snapshot.** When `Effective` has limited the
+batch (`ShaperLimited`), the current send chunk completes, and
+`QuicSendFlush` (`send.c`) arms the pacing timer for the exact
+replenishment moment of the limiting level:
+`PacingDelayUs = max(child delay, parent delay)` — the per-path
+shaper's §9 retry delay on an MTU-sized want
+(`QuicPathPacerGetDelayUsec`, `path.h`; per-call `Mtu = Path->Mtu`) and
+the max of the parents' §9 delays (`ParentsDelay`), computed by
+`QuicConnBandwidthShaperGetParentsAllowance` from **the same** snapshot
+as `ParentsAllowance` (one operation under the lock per parent —
+`QuicBandwidthShaperParentGetAllowedBytesAndDelay`,
+`bandwidth_shaper_parent.h`; the want size is shared —
+`QuicPathPacerGetWantSize`). The parent math is executed with per-call
+`Mtu = 0` (§15.1), so for a parent with `W == 0` the backoff is the
+exact continuous transmission time of the passed want (the dependence
+on `RetryDelaySizeBytes` is exactly what the shared want provides). The
+parent's delay is available without re-acquiring locks: it is
+remembered in the builder (`Builder->PacingParentDelayUsec`) at the
+moment the limit is computed. Without parents the max degenerates into
+the child delay — the behavior does not change.
 
-Чтение родительского кредита — под локом, с копированием состояния
-(copy-out), для каждого родителя независимо:
+Reading the parent credit — under the lock, with state copying
+(copy-out), independently for each parent:
 
 ```
 QuicBandwidthShaperParentGetAllowedBytesAndDelay(
@@ -1698,411 +1729,427 @@ QuicBandwidthShaperParentGetAllowedBytesAndDelay(
     Shaper.BurstWindowUsec, Shaper.CreditBaseTimeNsec)
 3. CxPlatLockRelease(&Parent->Lock)
 4. if BandwidthBitsPerSecond == 0                → return UINT64_MAX   (DelayUsec := 0)
-5. DelayUsec := <§9, выход DelayUsec, на снапшоте для RetryDelaySizeBytes с per-call Mtu = 0>
-                 (при RetryDelaySizeBytes == 0 — 0)
-6. return <шаги §9, применённые к снапшоту (BandwidthBitsPerSecond, BurstWindowUsec, CreditBaseTimeNsec),
-   NowUsec и per-call Mtu = 0; W == 0 — непрерывный режим, W > 0 — обычная модель без округления>
+5. DelayUsec := <§9, the DelayUsec output, on the snapshot for RetryDelaySizeBytes with per-call Mtu = 0>
+                 (with RetryDelaySizeBytes == 0 — 0)
+6. return <the §9 steps applied to the snapshot (BandwidthBitsPerSecond, BurstWindowUsec, CreditBaseTimeNsec),
+   NowUsec, and per-call Mtu = 0; W == 0 — continuous mode, W > 0 — the normal model without rounding>
 ```
 
-(Используется именно вариант «allowance + delay из одного снапшота»,
-`bandwidth_shaper_parent.h`; простой `QuicBandwidthShaperParentGetAllowedBytes`
-— тот же copy-out без delay — остаётся для тестов и GET-путей.)
+(It is exactly the "allowance + delay from a single snapshot" variant
+that is used, `bandwidth_shaper_parent.h`; the plain
+`QuicBandwidthShaperParentGetAllowedBytes` — the same copy-out without
+the delay — remains for tests and GET paths.)
 
-**Почему copy-out под локом.** `GetAllowance` — чистая функция
-состояния, иммутабельного под локом; консистентного снапшота
-`(BandwidthBitsPerSecond, BurstWindowUsec, CreditBaseTimeNsec)` достаточно для корректного результата.
-Lock-free чтение не требуется: uncontended `CXPLAT_LOCK` стоит
-десятки наносекунд, критическая секция — три копирования; один захват
-на родителя обслуживает и лимит, и backoff. Безопасность арифметики
-на снапшоте та же, что в §9/§3.5:
-`BurstWindowUsec` валидирован в момент SET с монотонным временем (§15.3), поэтому
-вычитание `NowUsec - BurstWindowUsec` на пути отправки не заимствует; параллельный
-SET, сменивший `(BandwidthBitsPerSecond, BurstWindowUsec)` между шагами 2 и 5, безвреден — снапшот есть
-состояние на момент времени, и любая ранее валидированная пара
-остаётся безопасной при любом последующем `NowUsec`.
+**Why copy-out under the lock.** `GetAllowance` is a pure function of
+state that is immutable under the lock; a consistent snapshot of
+`(BandwidthBitsPerSecond, BurstWindowUsec, CreditBaseTimeNsec)` is
+sufficient for a correct result. Lock-free reading is not required: an
+uncontended `CXPLAT_LOCK` costs tens of nanoseconds, and the critical
+section is three copies; a single acquisition per parent serves both
+the limit and the backoff. The arithmetic safety on the snapshot is the
+same as in §9/§3.5:
+`BurstWindowUsec` was validated at SET time against the monotonic time
+(§15.3), so the subtraction `NowUsec - BurstWindowUsec` on the send
+path does not borrow; a concurrent SET that changed
+`(BandwidthBitsPerSecond, BurstWindowUsec)` between steps 2 and 5 is
+harmless — the snapshot is the state at a moment of time, and any
+previously validated pair remains safe under any subsequent `NowUsec`.
 
-### §16.4 Общий дебит родителя
+### §16.4 Shared debit of the parents
 
-Дебит выполняется в точке фактической отправки ack-eliciting пакета —
-`QuicLossDetectionOnPacketSent` (`loss_detection.c`) — последовательно
-для **ребёнка и каждого установленного родителя**:
+The debit is performed at the point of the actual send of an
+ack-eliciting packet — `QuicLossDetectionOnPacketSent`
+(`loss_detection.c`) — sequentially for **the child and every installed
+parent**:
 
 ```c
 //
-// Тело QuicLossDetectionOnPacketSent (loss_detection.c), ветка
-// ack-eliciting; SentPacket->PacketLength и SentPacket->SentTime —
-// те же байты и тот же инъецированный момент, что у всех дебитов.
+// The body of QuicLossDetectionOnPacketSent (loss_detection.c), the
+// ack-eliciting branch; SentPacket->PacketLength and
+// SentPacket->SentTime are the same bytes and the same injected moment
+// as for all the debits.
 //
 QuicCongestionControlOnDataSent(
     &Connection->CongestionControl,
     SentPacket->PacketLength,
     SentPacket->SentTime,
     Path->Mtu);
-// → внутри: дебит CC-внутреннего пейсера плагина (§14):
+// → inside: the debit of the plugin's CC-internal pacer (§14):
 //   QuicBandwidthShaperRegisterSend(&Cc->Pacer, ..., Path->Mtu)
 
 QuicBandwidthShaperOnSend(
     &Path->PacerShaper,
     SentPacket->PacketLength,
     SentPacket->SentTime,
-    Path->Mtu);                         // дебит per-path ребёнка (§10);
-                                        // per-call Mtu = актуальный MTU пути
+    Path->Mtu);                         // the debit of the per-path child (§10);
+                                        // per-call Mtu = the path's current MTU
 
 if (Connection->LibraryBandwidthShaperParent != NULL ||
     Connection->ConfigBandwidthShaperParent != NULL) {
     QuicConnBandwidthShaperDebitParents(
         Connection,
         SentPacket->PacketLength,
-        SentPacket->SentTime);          // общий дебит родителей;
-                                        // родители дебитируются с Mtu = 0
+        SentPacket->SentTime);          // the parents' shared debit;
+                                        // the parents are debited with Mtu = 0
 }
 ```
 
 `QuicConnBandwidthShaperDebitParents` (`connection.h`, `QUIC_INLINE`)
-дебитирует **каждого установленного родителя** через
+debits **every installed parent** via
 `QuicBandwidthShaperParentDebit` (`bandwidth_shaper_parent.h`):
-`CxPlatLockAcquire(&Parent->Lock)` → `QuicBandwidthShaperOnSend(&Parent->Shaper, ...)`
-(§10) → `CxPlatLockRelease`, фиксированный порядок library →
-configuration, каждый лок освобождается до захвата следующего.
+`CxPlatLockAcquire(&Parent->Lock)` →
+`QuicBandwidthShaperOnSend(&Parent->Shaper, ...)` (§10) →
+`CxPlatLockRelease`, a fixed order library → configuration, each lock
+released before the next is acquired.
 
-- Дебитируется **ребёнок и каждый установленный родитель**
-  (shared debit): одна отправка списывает `PacketLength`
-  из кредита CC-пейсера плагина, из кредита per-path ребёнка и из
-  кредита config-родителя и/или library-родителя — один дебит на
-  уровень, каждый родитель под **своим** локом. Вызов родительского
-  `OnSend` (§10) безусловен — включая over-send сверх эффективного
-  лимита: долг фиксируется в родителе тем же механизмом «выкупа»
-  (§3.2, §10).
-- no-op контракт (§10) делает вызов бесплатным при неактивном
-  родителе; guard `Parent != NULL` обязателен (любой из указателей
-  может быть `NULL`), guard на `BandwidthBitsPerSecond == 0` внутри `OnSend` уже есть.
-- `SentTime` — то же инъецированное время, что и для ребёнка: все
-  дебиты (оба ребёнка и оба родителя) согласованы по времени.
-- Дебит покрывает тот же класс байт, что и лимит §16.3:
-  ack-eliciting пакеты — ровно то, на что расходуется
-  `Builder->SendAllowance`.
+- **The child and every installed parent** are debited (shared debit):
+  one send deducts `PacketLength` from the plugin CC pacer's credit,
+  from the per-path child's credit, and from the config parent's and/or
+  library parent's credit — one debit per level, each parent under
+  **its own** lock. The parent `OnSend` call (§10) is unconditional —
+  including an over-send beyond the effective limit: the debt is
+  recorded in the parent by the same "buy-back" mechanism (§3.2, §10).
+- The no-op contract (§10) makes the call free for an inactive parent;
+  the `Parent != NULL` guard is mandatory (either pointer may be
+  `NULL`), and the `BandwidthBitsPerSecond == 0` guard inside `OnSend`
+  already exists.
+- `SentTime` — the same injected time as for the child: all the debits
+  (both children and both parents) are time-consistent.
+- The debit covers the same class of bytes as the §16.3 limit:
+  ack-eliciting packets — exactly what `Builder->SendAllowance` is
+  spent on.
 
-**Конкурентность.** Родительский шейпер разделяется соединениями на
-разных воркерах, поэтому его `CreditBaseTimeNsec` защищён выделенным
-`CXPLAT_LOCK`; лок — листовый (leaf):
+**Concurrency.** The parent shaper is shared by connections on
+different workers, so its `CreditBaseTimeNsec` is protected by a
+dedicated `CXPLAT_LOCK`; the lock is leaf:
 
-- критическая секция охватывает только операции над состоянием
-  родителя (`OnSend` §10, copy-out §16.3, SET/GET §15.2); никакие
-  другие подсистемы под этим локом не вызываются;
-- на одной отправке могут захватываться **два** родительских лока —
-  когда установлены оба уровня; захват выполняется в **фиксированном
-  глобальном порядке: library, затем configuration** (тот же порядок в
-  разрешении иерархии §16.2); в текущей реализации каждый лок
-  освобождается до захвата следующего, т.е. локи не вложены друг в
-  друга; фиксированный порядок дополнительно исключает любой цикл
-  захвата при будущих расширениях, где два лока могут удерживаться
-  одновременно. Каждый обработчик SET/GET берёт ровно один родительский
-  лок (global — `MsQuicLib.*`, configuration — свой);
-  `MsQuicLib.Lock` на горячем пути не участвует — порядок захватов не
-  создаёт циклов;
-- оба ребёнка (CC-внутренний `Cc->Pacer` и per-path `Path->PacerShaper`)
-  остаются lock-free — доступ сериализуется воркером соединения (§11).
+- the critical section covers only operations on the parent's state
+  (`OnSend` §10, copy-out §16.3, SET/GET §15.2); no other subsystems
+  are called under this lock;
+- a single send may acquire **two** parent locks — when both levels are
+  installed; the acquisition follows a **fixed global order: library,
+  then configuration** (the same order as in hierarchy resolution
+  §16.2); in the current implementation each lock is released before
+  the next is acquired, i.e. the locks are not nested within one
+  another; the fixed order additionally rules out any acquisition cycle
+  in future extensions where two locks may be held simultaneously. Each
+  SET/GET handler takes exactly one parent lock (global —
+  `MsQuicLib.*`, configuration — its own); `MsQuicLib.Lock` is not
+  involved on the hot path — the acquisition order creates no cycles;
+- both children (the CC-internal `Cc->Pacer` and the per-path
+  `Path->PacerShaper`) remain lock-free — access is serialized by the
+  connection's worker (§11).
 
-### §16.5 Сброс и миграция пути
+### §16.5 Reset and path migration
 
-Родительские указатели (`Connection->LibraryBandwidthShaperParent`,
-`Connection->ConfigBandwidthShaperParent`) не изменяются:
+The parent pointers (`Connection->LibraryBandwidthShaperParent`,
+`Connection->ConfigBandwidthShaperParent`) are not changed:
 
-- при `QuicCongestionControlReset` (любой `FullReset`, §17) — сброс
-  касается только кредита ребёнка (таблица §17);
-- при path migration и standalone-`QuicBandwidthShaperReset` (§8) —
-  сбрасывается кредит ребёнка на пути, родительские указатели и
-  родительский кредит не затрагиваются (родители — уровень соединения,
-  а не пути).
+- on `QuicCongestionControlReset` (any `FullReset`, §17) — the reset
+  concerns only the child's credit (the §17 table);
+- on path migration and a standalone `QuicBandwidthShaperReset` (§8) —
+  the child's credit on the path is reset; the parent pointers and the
+  parent credit are not affected (the parents are a level of the
+  connection, not of the path).
 
-### §16.6 Видимость повторных SET (сводная семантика)
+### §16.6 Visibility of repeated SETs (summary semantics)
 
-| Событие | Живое соединение (уже привязано) | Новые соединения |
+| Event | Live connection (already bound) | New connections |
 | ------- | -------------------------------- | ---------------- |
-| Первый SET на library-уровне | не привязывается к library-уровню (нет перепривязки, §15.4) | привязываются к library-родителю в дополнение к configuration-родителю, если тот установлен у их конфигурации |
-| Первый SET на configuration-уровне | не привязывается к configuration-уровню (нет перепривязки, §15.4); уже привязанный library-родитель сохраняется | привязываются к configuration-родителю в дополнение к library-родителю, если тот установлен |
-| SET новой валидной пары на уровне X, к которому соединение привязано | атомарное обновление общего объекта (§7: пара целиком, кредит сохраняется); видно всем привязанным соединениям | — |
-| SET `(0, 0)` (uninstall) на уровне X | привязанные к X сохраняют указатель; поведение этого уровня — passthrough (`BandwidthBitsPerSecond == 0` ⇒ `UINT64_MAX`); другие установленные уровни продолжают действовать | разрешают иерархию заново: уровень X пропускается, остальные установленные уровни привязываются как есть (§16.2) |
+| First SET at the library level | is not bound to the library level (no rebinding, §15.4) | are bound to the library parent in addition to the configuration parent, if the latter is installed on their configuration |
+| First SET at the configuration level | is not bound to the configuration level (no rebinding, §15.4); the already-bound library parent is kept | are bound to the configuration parent in addition to the library parent, if the latter is installed |
+| SET of a new valid pair on level X the connection is bound to | an atomic update of the shared object (§7: the pair as a whole, the credit is preserved); visible to all bound connections | — |
+| SET `(0, 0)` (uninstall) on level X | those bound to X keep the pointer; this level's behavior is passthrough (`BandwidthBitsPerSecond == 0` ⇒ `UINT64_MAX`); the other installed levels keep acting | resolve the hierarchy anew: level X is skipped, the remaining installed levels are bound as is (§16.2) |
 
-### §16.7 Стоимость
+### §16.7 Cost
 
-Все операции иерархии — O(1): разрешение — две проверки под двумя
-короткими критическими секциями один раз за жизнь соединения; на
-горячем пути — до двух uncontended lock copy-out (§16.3) и до двух
-контролируемых дебитов под коротким листовым локом (§16.4) — по одному
-на установленный уровень (типично ноль или один). Родительский лок не
-является узким местом сверх самого лимита: суммарная пропускная
-способность соединений ограничена `BandwidthBitsPerSecond` родителя, частота дебитов
-ограничена тем же потолком.
+All hierarchy operations are O(1): resolution — two checks under two
+short critical sections once per connection's life; on the hot path —
+up to two uncontended lock copy-outs (§16.3) and up to two controlled
+debits under a short leaf lock (§16.4) — one per installed level
+(typically zero or one). The parent lock is not a bottleneck beyond the
+limit itself: the connections' total throughput is bounded by the
+parent's `BandwidthBitsPerSecond`, and the debit frequency is bounded
+by the same ceiling.
 
-## §17 Жизненный цикл по умолчанию внутри `QUIC_CONGESTION_CONTROL`
+## §17 Default life cycle inside `QUIC_CONGESTION_CONTROL`
 
-`QUIC_CONGESTION_CONTROL` получает поле `QUIC_BANDWIDTH_SHAPER Pacer;`.
-Инициализация — в `QuicCongestionControlInitialize`:
+`QUIC_CONGESTION_CONTROL` gets the field `QUIC_BANDWIDTH_SHAPER Pacer;`.
+Initialization — in `QuicCongestionControlInitialize`:
 
 ```c
 QuicBandwidthShaperInit(
     &Cc->Pacer,
     /*BandwidthBitsPerSecond  =*/ (uint64_t)0,
-    /*BurstWindowUsec         =*/ (uint64_t)0);  // пара (0, 0): валидный безлимит
+    /*BurstWindowUsec         =*/ (uint64_t)0);  // the (0, 0) pair: a valid unlimited
 ```
 
-Пара `(0, 0)` всегда валидна (§3.6); окно burst задаётся позднее — вместе
-с первой настройкой ненулевого rate через `QuicBandwidthShaperSetConfig`
-(§7, §25) — и после этого плагинами не меняется.
+The pair `(0, 0)` is always valid (§3.6); the burst window is set later
+— together with the first configuration of a non-zero rate via
+`QuicBandwidthShaperSetConfig` (§7, §25) — and is not changed by
+plugins afterwards.
 
-Сброс — в `QuicCongestionControlReset`. Семантика единообразна для обоих
-значений `FullReset`: сброс обнуляет `CreditBaseTimeNsec` («забыть»
-прошлые отправки) и **сохраняет конфигурацию** — валидированную пару
-(`BandwidthBitsPerSecond`, `BurstWindowUsec`) (нет «нового» пути,
-на котором могла бы быть валидна старая отметка времени; конфигурация от
-времени пути не зависит):
+The reset — in `QuicCongestionControlReset`. The semantics are uniform
+for both values of `FullReset`: the reset zeroes `CreditBaseTimeNsec`
+("forget" past sends) and **preserves the configuration** — the
+validated pair (`BandwidthBitsPerSecond`, `BurstWindowUsec`) (there is
+no "new" path on which the old timestamp could be valid; the
+configuration does not depend on the path's time):
 
-| Действие                          | `FullReset = TRUE`            | `FullReset = FALSE`           |
+| Action                          | `FullReset = TRUE`            | `FullReset = FALSE`           |
 | --------------------------------- | ----------------------------- | ----------------------------- |
 | `Pacer.CreditBaseTimeNsec`        | `0`                           | `0`                           |
-| `Pacer.BandwidthBitsPerSecond`    | без изменений                 | без изменений                 |
-| `Pacer.BurstWindowUsec`           | без изменений                 | без изменений                 |
+| `Pacer.BandwidthBitsPerSecond`    | unchanged                 | unchanged                 |
+| `Pacer.BurstWindowUsec`           | unchanged                 | unchanged                 |
 
-Это согласуется с текущим поведением Cubic/BBR, в которых
-`LastSendAllowance` сбрасывается всегда.
+This is consistent with the current Cubic/BBR behavior, in which
+`LastSendAllowance` is always reset.
 
-`QUIC_DEFAULT_PACING_BURST_WINDOW_USEC` вводится в `quicdef.h` со
-значением по умолчанию, например, `2 * QUIC_SEND_PACING_INTERVAL`
-(2 миллисекунды). Значение используется при первой настройке rate:
-передаётся в `QuicBandwidthShaperSetConfig` в паре с ненулевым
-`BandwidthBitsPerSecond` и текущим `NowUsec` (инвариант окна, §3.6:
-`QUIC_DEFAULT_PACING_BURST_WINDOW_USEC` заведомо меньше времени,
-прошедшего с начала соединения).
+`QUIC_DEFAULT_PACING_BURST_WINDOW_USEC` is introduced in `quicdef.h`
+with a default value, for example, `2 * QUIC_SEND_PACING_INTERVAL`
+(2 milliseconds). The value is used at the first rate configuration:
+it is passed into `QuicBandwidthShaperSetConfig` paired with a non-zero
+`BandwidthBitsPerSecond` and the current `NowUsec` (the window
+invariant, §3.6: `QUIC_DEFAULT_PACING_BURST_WINDOW_USEC` is guaranteed
+to be smaller than the time elapsed since the start of the
+connection).
 
-## §18 MTU: per-call аргумент вместо хранимого состояния
+## §18 MTU: a per-call argument instead of stored state
 
-Шейпер **не хранит MTU** (решение владельца): размер
-пакета — per-call аргумент каждой математической функции (§3.3), поэтому
-никакой синхронизации копии MTU в шейпере не существует и точки
-синхронизации (§21 старой редакции) упразднены. На пути отправки каждый
-вызов передаёт актуальный `Path->Mtu`, который поддерживается самой
-QUIC-логикой в точках его изменения: при инициализации пути
-(`QuicPathInitialize`, `path.c`), по DPLPMTUD-обновлению
-(`mtu_discovery.c`) и при смене
-`Settings.MinimumMtu`/`Settings.MaximumMtu`
-(`QuicConnApplyNewSettings`, `connection.c`) — change в `Path->Mtu`
-мгновенно виден следующему вызову шейпера без каких-либо
-уведомлений. У CC-внутреннего `Cc->Pacer` вызовы также передают
-`Path->Mtu` (точки `cubic.c`/`bbr.c`/loss detection), а родители
-передают `0` (§15.1).
+The shaper **does not store the MTU** (the owner's decision): the
+packet size is a per-call argument of every math function (§3.3), so no
+synchronization of an MTU copy inside the shaper exists, and the
+synchronization points (§21 of the previous revision) have been
+abolished. On the send path, every call passes the current `Path->Mtu`,
+which is maintained by the QUIC logic itself at the points where it
+changes: at path initialization (`QuicPathInitialize`, `path.c`), on
+DPLPMTUD updates (`mtu_discovery.c`), and when
+`Settings.MinimumMtu`/`Settings.MaximumMtu` change
+(`QuicConnApplyNewSettings`, `connection.c`) — a change in `Path->Mtu`
+is instantly visible to the shaper's next call, without any
+notifications. For the CC-internal `Cc->Pacer`, the calls also pass
+`Path->Mtu` (the `cubic.c`/`bbr.c`/loss detection points), while the
+parents pass `0` (§15.1).
 
-## §19 Инварианты и граничные случаи
+## §19 Invariants and boundary cases
 
-1. `BandwidthBitsPerSecond == 0` — режим «без ограничений». Любая
-   отправка разрешена, задержка всегда 0. Это сознательное проектное
-   решение: значением по умолчанию (`0`) удобно помечать «шейпер не
-   сконфигурирован». Валидная комбинация — только `(0, 0)` (§3.6).
-2. `BandwidthBitsPerSecond == UINT64_MAX` — функционально эквивалентно
-    unlimited, но проверки на `0` его не ловят. Обычного (пропорционального)
-    окна для него не существует: ns-граница комбинации (§3.6) требует
-    `BurstWindowUsec <= UINT64_MAX / BandwidthBitsPerSecond / 1'000 == 0`, т.е. любое
-    `BurstWindowUsec > 0` отвергается (§3.6) — об этом свидетельствует тест таблицы
-    истинности (§32.11). Единственная валидная пара — `(UINT64_MAX, 0)`:
-    дебит даже большого пакета флорируется в 0 нс
-    (пакет передаётся быстрее наносекунды), строгий ритм вырождается в
-    «пакет всегда доступен» — честно для эфтобитной скорости.
-3. `BandwidthBitsPerSecond` интерпретируется как **бит/с**, не как
-   байт/с. Все формулы §3.1 учитывают это через `BITS_PER_BYTE = 8`.
-4. `BurstWindowUsec` хранится как сконфигурирован (GET возвращает
-    настроенное значение как есть, включая `0`; ничто не переписывается
-    и не выводится). Поведение выбирается **при вызове** парой и per-call
-    `Mtu` (§3.2): при `Mtu > 0` и бюджете
-    `BurstWindowUsec * BandwidthBitsPerSecond / 8'000'000 < Mtu` — явный
-    строгий режим: чтения бинарны (ровно один пакет размера `Mtu` на
-    интервал `MtuDebitNsec`, иначе 0), окно в математике не
-    участвует; при `Mtu == 0` и `W == 0` — непрерывный режим (сырой
-    кредит без квантования и клэмп-окна); иначе — обычная
-    пропорциональная модель. MTU-размерные отправки в строгом режиме
-    идут overlimit с накоплением долга, sub-MTU отправки проходят без
-    задержки, пока вписываются в бюджет (§3.3). Шейпер никогда не
-    блокирует отправку жёстко (§10): постоянный send stall возможен лишь
-    как свойство конкретной стратегии вызывающего («Живучесть» §3.6), а
-    строгий режим даёт дисциплинированному MTU-округляющему вызывающему
-    детерминированный ритм «один пакет на интервал дебита».
-5. `Mtu == 0` (per-call) — отключает MTU-rounding и строгую квантизацию;
-    вызывающий сам округляет, если нужно. Используется родителями (§15.1)
-    и в сценариях, где MTU неизвестен (например, при
-    standalone-использовании вне пути). Сам шейпер MTU не хранит —
-    аргумент передаётся при каждом вызове.
-6. `CreditBaseTimeNsec == 0` — начальное состояние «отправок не было».
-   Чтение при этом даёт полный burst-бюджет:
+1. `BandwidthBitsPerSecond == 0` — the "no limits" mode. Any send is
+   allowed, the delay is always 0. This is a deliberate design
+   decision: the default value (`0`) conveniently marks "shaper not
+   configured". The only valid combination is `(0, 0)` (§3.6).
+2. `BandwidthBitsPerSecond == UINT64_MAX` — functionally equivalent to
+    unlimited, but the checks for `0` do not catch it. No normal
+    (proportional) window exists for it: the ns bound of the
+    combination (§3.6) requires
+    `BurstWindowUsec <= UINT64_MAX / BandwidthBitsPerSecond / 1'000 == 0`, i.e. any
+    `BurstWindowUsec > 0` is rejected (§3.6) — as the truth-table test
+    attests (§32.11). The only valid pair is `(UINT64_MAX, 0)`: the
+    debit of even a large packet floors to 0 ns (the packet is
+    transmitted in less than a nanosecond), and the strict cadence
+    degenerates into "a packet is always available" — honest for an
+    exabit-per-second speed.
+3. `BandwidthBitsPerSecond` is interpreted as **bit/s**, not as
+   bytes/s. All §3.1 formulas account for this via `BITS_PER_BYTE = 8`.
+4. `BurstWindowUsec` is stored as configured (GET returns the
+   configured value as is, including `0`; nothing is rewritten or
+   derived). The behavior is selected **at call time** by the pair and
+   the per-call `Mtu` (§3.2): with `Mtu > 0` and a budget of
+   `BurstWindowUsec * BandwidthBitsPerSecond / 8'000'000 < Mtu` — the
+   explicit strict mode: reads are binary (exactly one packet of size
+   `Mtu` per `MtuDebitNsec` interval, otherwise 0), the window does not
+   participate in the math; with `Mtu == 0` and `W == 0` — continuous
+   mode (raw credit without quantization and without a clamp window);
+   otherwise — the normal proportional model. MTU-sized sends in strict
+   mode go overlimit with debt accumulating, sub-MTU sends pass without
+   delay as long as they fit the budget (§3.3). The shaper never
+   hard-blocks a send (§10): a permanent send stall is possible only as
+   a property of a particular caller strategy ("Liveness", §3.6), and
+   strict mode gives a disciplined MTU-rounding caller a deterministic
+   "one packet per debit interval" cadence.
+5. `Mtu == 0` (per-call) — disables MTU rounding and strict
+    quantization; the caller rounds by itself, if needed. Used by
+    parents (§15.1) and in scenarios where the MTU is unknown (for
+    example, in standalone use off the path). The shaper itself stores
+    no MTU — the argument is passed on every call.
+6. `CreditBaseTimeNsec == 0` — the initial state "no sends have
+   happened". A read then yields the full burst budget:
    `EffectiveLastSendNsec = max(0, NowNsec - BurstWindowNsec)`.
-7. `CreditBaseTimeNsec` — **виртуальное** время (нс), а не wall-clock
-   отправки. Легально может быть как в прошлом (`< NowNsec`, есть
-   накопленный кредит), так и в будущем (`> NowNsec`, долг после
-   over-send).
-8. **Инвариант списания**: `OnSend(BytesSent, Now)` уменьшает
-   чтение `AllowedBytes` (§9) на `BytesSent` байт с точностью до округления
-   (± 1 байт; floor 0 — см. §10). Следствие —
-   серия back-to-back отправок суммарно не превышает доступный кредит.
-9. **Средняя скорость**: при дисциплинированном использовании
-   (отправка только когда `AllowedBytes >= BytesSent`) установившийся интервал
-   между отправками по `BytesSent` байт равен `DebitNsec(BytesSent) / 1'000` мкс, т.е.
-   средняя скорость равна `BandwidthBitsPerSecond` бит/с и не превышает
-   её.
-10. Монотонность `NowUsec` — ожидается от вызывающего. Нарушение UB
-    не порождает: при `NowNsec <= EffectiveLastSendNsec` §9 кладёт
-    `DeltaNsec == 0`; чтение в убывший момент возвращает кредит,
-    доступный на тот момент (при `BurstWindowUsec > 0` и неиспользованном кредите —
-    положительный), а не обязательно `0`.
-11. Размер `QUIC_BANDWIDTH_SHAPER` не должен превышать 32 байт,
-    чтобы вписаться в бюджет памяти `QUIC_PATH` и `QUIC_CONGESTION_CONTROL`.
-12. **Родитель подчиняется тем же правилам валидации (на любом
-    уровне).** Пара родителя (`BandwidthBitsPerSecond`, `BurstWindowUsec`) — library или configuration —
-    валидируется таблицей истинности §3.6: пара с `W > 0` требует
-    `BurstWindowUsec < NowUsec` на момент SET, где `NowUsec` — монотонное
-    время, прочитанное библиотекой на границе SetParam (§15.3), и
-    `BurstWindowUsec <= UINT64_MAX / BandwidthBitsPerSecond / 1'000`;
-    пара с `W == 0` принимается безусловно (§3.5/§3.6).
-    Инвариант окна гарантирует отсутствие заимствования в
-    `NowNsec - BurstWindowNsec` и на пути отправки — тот же монотонный источник
-    времени (`CxPlatTimeUs64`), что и на границе SetParam.
-13. **Пара с `W == 0` на уровне родителя — непрерывный режим.** Пара
-    родителя с `BurstWindowUsec == 0` не отвергается и не требует
-    инварианта окна (§3.2/§3.6). Родитель выполняет математику с
-    per-call `Mtu = 0` (§15.1), поэтому квантизации «один пакет на
-    интервал» у родителей нет: `W == 0` даёт непрерывный кредит без
-    burst-клэмпа, `W > 0` — общие правила §9/§10 без MTU-округления.
-    Строгий квантованный режим существует только у потребителей с
-    per-call `Mtu > 0` (per-path/CC-шейперы).
-14. **Неактивный родитель — no-op на любом уровне.** «Не установлен»
-    и «установлен с `(0, 0)`» неразличимы поведенчески (§16.1):
-    `min` с `UINT64_MAX` — тождество, дебит — no-op (§10). Контракт
-    no-op неактивного шейпера (§10) применяется к каждому уровню
-    иерархии независимо: отсутствующий/безлимитный уровень —
-    passthrough этого уровня, остальные установленные уровни
-    действуют как раньше (§16.2, §16.3).
-15. **Эффективный лимит ограничен со всех сторон.** По построению
-    `min` (§16.3): `Effective <= ChildAllowance` и
-    `Effective <= <allowance каждого установленного родителя>` —
-    включая library-родитель при установленном configuration-родителе;
-    сумма отправок соединений одного родителя не превышает кредита
-    родителя (shared debit, §16.4) с точностью округления §10.
+7. `CreditBaseTimeNsec` is **virtual** time (ns), not the wall-clock
+   time of the send. It may legitimately be in the past (`< NowNsec`,
+   accumulated credit exists) as well as in the future (`> NowNsec`,
+   debt after an over-send).
+8. **Debiting invariant**: `OnSend(BytesSent, Now)` reduces the
+   `AllowedBytes` read (§9) by `BytesSent` bytes to within rounding
+   (± 1 byte; floor at 0 — see §10). A consequence — a series of
+   back-to-back sends does not exceed the available credit in total.
+9. **Average rate**: with disciplined use (sending only when
+   `AllowedBytes >= BytesSent`), the steady-state interval between
+   sends of `BytesSent` bytes equals `DebitNsec(BytesSent) / 1'000` µs,
+   i.e. the average rate equals `BandwidthBitsPerSecond` bit/s and
+   never exceeds it.
+10. Monotonicity of `NowUsec` — expected from the caller. A violation
+     creates no UB: when `NowNsec <= EffectiveLastSendNsec`, §9 sets
+    `DeltaNsec == 0`; a read at a decreased moment returns the credit
+    available at that moment (with `BurstWindowUsec > 0` and unused
+    credit — positive), not necessarily `0`.
+11. The size of `QUIC_BANDWIDTH_SHAPER` must not exceed 32 bytes, to
+    fit the memory budget of `QUIC_PATH` and `QUIC_CONGESTION_CONTROL`.
+12. **The parent obeys the same validation rules (at any level).** The
+     parent's pair (`BandwidthBitsPerSecond`, `BurstWindowUsec`) —
+     library or configuration — is validated by the §3.6 truth table:
+     a pair with `W > 0` requires `BurstWindowUsec < NowUsec` at the
+     moment of the SET, where `NowUsec` is the monotonic time read by
+     the library at the SetParam boundary (§15.3), and
+     `BurstWindowUsec <= UINT64_MAX / BandwidthBitsPerSecond / 1'000`;
+     a pair with `W == 0` is accepted unconditionally (§3.5/§3.6).
+     The window invariant guarantees the absence of borrowing in
+     `NowNsec - BurstWindowNsec` on the send path as well — the same
+     monotonic time source (`CxPlatTimeUs64`) as at the SetParam
+     boundary.
+13. **A pair with `W == 0` at the parent level — continuous mode.** A
+     parent pair with `BurstWindowUsec == 0` is not rejected and
+     requires no window invariant (§3.2/§3.6). The parent executes the
+     math with per-call `Mtu = 0` (§15.1), so parents have no "one
+     packet per interval" quantization: `W == 0` gives continuous
+     credit without a burst clamp, `W > 0` — the common §9/§10 rules
+     without MTU rounding. The strict quantized mode exists only for
+     consumers with per-call `Mtu > 0` (the per-path/CC shapers).
+14. **An inactive parent is a no-op at any level.** "Not installed"
+     and "installed with `(0, 0)`" are behaviorally indistinguishable
+     (§16.1): `min` with `UINT64_MAX` — the identity, the debit — a
+     no-op (§10). The inactive shaper's no-op contract (§10) applies
+     to every hierarchy level independently: an absent/unlimited level
+     is a passthrough of that level, and the other installed levels act
+     as before (§16.2, §16.3).
+15. **The effective limit is bounded from all sides.** By the `min`
+     construction (§16.3): `Effective <= ChildAllowance` and
+     `Effective <= <the allowance of every installed parent>` —
+     including the library parent when a configuration parent is
+     installed; the total of the sends of one parent's connections
+     does not exceed the parent's credit (shared debit, §16.4) to
+     within the §10 rounding.
 
-## §20 Хранение состояния (интеграция с `QUIC_PATH`)
+## §20 State storage (integration with `QUIC_PATH`)
 
-Шейпер подключён к коду отправки; ниже — реализованное размещение.
+The shaper is wired into the send code; below is the implemented
+placement.
 
-Поле `QUIC_BANDWIDTH_SHAPER PacerShaper;` добавлено в `QUIC_PATH`
-рядом с `Mtu` (`:uint16_t`), `LocalMtu` (`:uint16_t`),
-`MtuDiscovery` (`: QUIC_MTU_DISCOVERY`). Один шейпер на путь
-соответствует семантической модели «ограничение трафика на конкретный
-маршрут» (независимый кредит каждого маршрута при path migration).
+The field `QUIC_BANDWIDTH_SHAPER PacerShaper;` has been added to
+`QUIC_PATH` next to `Mtu` (`:uint16_t`), `LocalMtu` (`:uint16_t`),
+`MtuDiscovery` (`: QUIC_MTU_DISCOVERY`). One shaper per path matches
+the semantic model of "rate-limiting a specific route" (each route's
+independent credit across a path migration).
 
-Connection-scoped вариант (поле в `QUIC_CONNECTION::SendState`)
-отвергнут: rate конфигурируется на соединение (§22), но кредит
-ведётся per-path. CC-внутренний `Cc->Pacer` (§17, §24) — отдельная
-сущность для rate-плагина, к пути отправки отношения не имеет.
+The connection-scoped variant (a field in `QUIC_CONNECTION::SendState`)
+was rejected: the rate is configured per connection (§22), but the
+credit is kept per path. The CC-internal `Cc->Pacer` (§17, §24) is a
+separate entity for the rate plugin and has nothing to do with the send
+path.
 
-## §21 Точка вызова
+## §21 Call sites
 
-- Инициализация — в `QuicPathInit` (`path.c`): шейпер инициализируется
-  с connection-wide парой из `QUIC_PARAM_CONN_BANDWIDTH_SHAPER`
-  (дефолт `(0, 0)` — unlimited, §22); пара валидирована
-  в момент SET (§3.6), поэтому вызов не может отказать. MTU не
-  передаётся: `Path->Mtu` подставляется per-call в каждой математической
-  точке (§18).
-- Обновление `BandwidthBitsPerSecond`:
-  - при SET `QUIC_PARAM_CONN_BANDWIDTH_SHAPER` (§22) — пара
-    применяется ко всем существующим путям через `SetConfig`; новые
-    пути наследуют её в `QuicPathInit`;
-  - при изменении `Settings->MaximumMtu` или `Settings->MinimumMtu`
-    (`QuicConnApplyNewSettings`) и при DPLPMTUD-обновлении MTU
-    (`mtu_discovery.c`) — обновляется `Path->Mtu`; никакого
-    шейперного уведомления не требуется: следующий вызов шейпера читает
-    актуальный `Path->Mtu` per-call (§18);
-  - изменение Bandwidth через `QUIC_SETTINGS_BANDWIDTH_*` параметр
-    (если такой будет добавлен) — по-прежнему за пределами реализованного;
-    значение было бы **бит/с**, обновление парой через `SetConfig`
-    с текущим `BurstWindowUsec` и текущим `NowUsec` (инвариант
-    окна, §3.6).
-- Лимит батча — в `QuicPacketBuilderInitialize` (`packet_builder.c`):
-  allowance CC (включая кредит `Cc->Pacer`, §13) клэмпится
-  эффективным кредитом через `QuicPathPacerLimitSendAllowance`
-  (`path.h`) — `AllowedBytes` ребёнка (§9) с per-call `Path->Mtu`, `min`
-  с родителями (их math — с `Mtu = 0`) на
-  уровне кредита до MTU-округления, поток §3.3/§3.4, backoff-данные
-  для pacing-таймера (§16.3).
-- Дебит — в `QuicLossDetectionOnPacketSent` (`loss_detection.c`)
-  после фактической постановки ack-eliciting пакета в сеть, в том же
-  потоке, без асинхронных уведомлений: `Cc->Pacer` (через
-  `QuicCongestionControlOnDataSent`, §14, с `Path->Mtu`), per-path
-  ребёнок (`QuicBandwidthShaperOnSend`, §10, с `Path->Mtu`) и родители
-  (§16.4, с `Mtu = 0`) — теми же
-  байтами и в тот же инъецированный момент.
-- Backoff pacing-таймера — в `QuicSendFlush` (`send.c`):
-  `max(child delay, parent delay)` для want-размера (Path->Mtu или
-  1 байт) при `ShaperLimited` (§16.3).
+- Initialization — in `QuicPathInit` (`path.c`): the shaper is
+  initialized with the connection-wide pair from
+  `QUIC_PARAM_CONN_BANDWIDTH_SHAPER` (the default `(0, 0)` —
+  unlimited, §22); the pair was validated at SET time (§3.6), so the
+  call cannot fail. The MTU is not passed: `Path->Mtu` is substituted
+  per call at every math point (§18).
+- Updating `BandwidthBitsPerSecond`:
+  - on a SET of `QUIC_PARAM_CONN_BANDWIDTH_SHAPER` (§22) — the pair is
+    applied to all existing paths via `SetConfig`; new paths inherit
+    it in `QuicPathInit`;
+  - when `Settings->MaximumMtu` or `Settings->MinimumMtu` change
+    (`QuicConnApplyNewSettings`) and on a DPLPMTUD MTU update
+    (`mtu_discovery.c`) — `Path->Mtu` is updated; no shaper
+    notification is required: the shaper's next call reads the current
+    `Path->Mtu` per call (§18);
+  - changing the bandwidth via a `QUIC_SETTINGS_BANDWIDTH_*` parameter
+    (if one is ever added) — still outside what is implemented; the
+    value would be in **bit/s**, updated as a pair via `SetConfig` with
+    the current `BurstWindowUsec` and the current `NowUsec` (the
+    window invariant, §3.6).
+- The batch limit — in `QuicPacketBuilderInitialize`
+  (`packet_builder.c`): the CC allowance (including the `Cc->Pacer`
+  credit, §13) is clamped by the effective credit via
+  `QuicPathPacerLimitSendAllowance` (`path.h`) — the child's
+  `AllowedBytes` (§9) with per-call `Path->Mtu`, the `min` with the
+  parents (their math — with `Mtu = 0`) at the credit level before MTU
+  rounding, the §3.3/§3.4 flow, and the backoff data for the pacing
+  timer (§16.3).
+- The debit — in `QuicLossDetectionOnPacketSent` (`loss_detection.c`)
+  after an ack-eliciting packet is actually put on the wire, in the
+  same thread, without asynchronous notifications: `Cc->Pacer` (via
+  `QuicCongestionControlOnDataSent`, §14, with `Path->Mtu`), the
+  per-path child (`QuicBandwidthShaperOnSend`, §10, with `Path->Mtu`)
+  and the parents (§16.4, with `Mtu = 0`) — with the same bytes and at
+  the same injected moment.
+- The pacing-timer backoff — in `QuicSendFlush` (`send.c`):
+  `max(child delay, parent delay)` for the want size (Path->Mtu or
+  1 byte) when `ShaperLimited` (§16.3).
 
-## §22 Параметр `QUIC_PARAM_CONN_BANDWIDTH_SHAPER`
+## §22 The `QUIC_PARAM_CONN_BANDWIDTH_SHAPER` parameter
 
-Per-connection rate (бит/с + burst-окно) задаётся параметром
+The per-connection rate (bit/s + burst window) is set by the parameter
 `QUIC_PARAM_CONN_BANDWIDTH_SHAPER` (`0x05000021`, `src/inc/msquic.h`;
-обработчики — `QuicConnParamSet`/`QuicConnParamGet` в `connection.c`).
-Полезная нагрузка — `QUIC_BANDWIDTH_SHAPER_CONFIG` (§15.1) — та же
-структура, что у родительских уровней.
+the handlers — `QuicConnParamSet`/`QuicConnParamGet` in
+`connection.c`). The payload — `QUIC_BANDWIDTH_SHAPER_CONFIG` (§15.1) —
+the same structure as for the parent levels.
 
 **SET** (`QuicConnParamSet`):
 
-- `BufferLength != sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG)` или
+- `BufferLength != sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG)` or
   `Buffer == NULL` → `QUIC_STATUS_INVALID_PARAMETER`;
-- пара валидируется целиком (§3.6), включая инвариант окна:
-  монотонное `NowUsec` читается на границе SetParam
-  (`CxPlatTimeUs64()`) и инъецируется в
-  `QuicBandwidthShaperValidateConfig` (санкционированное исключение
-  из правила «модуль не читает часы», §15.3);
-- применение атомарно («целиком или никак»): пара запоминается в
-  соединении **как задана** (`BandwidthShaperBitsPerSecond`/
-  `BandwidthShaperBurstWindowUsec` — «сырое» окно, ничто не
-  переписывается) и применяется ко всем существующим путям
-  (`Paths[i].PacerShaper`) через `QuicBandwidthShaperSetConfig` (§7 —
-  повторный вызов с теми же валидированными входами не может отказать);
-  поведение выбирается парой и per-call `Mtu` (актуальный `Path->Mtu`)
-  внутри математики на каждом пути (§3.2); при
-  отказе валидации
-  ни хранимая пара, ни шейперы путей не изменяются;
-- `CreditBaseTimeNsec` шейперов не изменяется — кредит сохраняется
-  (§7, контракт 3);
-- `SET (0, 0)` — дефолт и легальный способ снять ограничение:
-  шейперы всех путей возвращаются в unlimited, кредит сохраняется;
-  пути, созданные позже (`QuicPathInit`), наследуют последнюю
-  записанную пару.
+- the pair is validated as a whole (§3.6), including the window
+  invariant: the monotonic `NowUsec` is read at the SetParam boundary
+  (`CxPlatTimeUs64()`) and injected into
+  `QuicBandwidthShaperValidateConfig` (a sanctioned exception from the
+  "the module does not read the clock" rule, §15.3);
+- the application is atomic ("all or nothing"): the pair is memorized
+  in the connection **as set**
+  (`BandwidthShaperBitsPerSecond`/
+  `BandwidthShaperBurstWindowUsec` — the "raw" window, nothing is
+  rewritten) and applied to all existing paths (`Paths[i].PacerShaper`)
+  through `QuicBandwidthShaperSetConfig` (§7 — a repeated call with
+  the same validated inputs cannot fail); the behavior is selected by
+  the pair and the per-call `Mtu` (the current `Path->Mtu`) inside the
+  math on every path (§3.2); on a validation failure neither the
+  stored pair nor the path shapers are changed;
+- the shapers' `CreditBaseTimeNsec` is not changed — the credit is
+  preserved (§7, contract 3);
+- `SET (0, 0)` — the default and a legal way to remove the limit:
+  all paths' shapers return to unlimited, the credit is preserved;
+  paths created later (`QuicPathInit`) inherit the last written pair.
 
 **GET** (`QuicConnParamGet`):
 
 - `*BufferLength < sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG)` →
-  `QUIC_STATUS_BUFFER_TOO_SMALL`, в `*BufferLength` возвращается
-  требуемый размер (файловое соглашение для conn-параметров);
+  `QUIC_STATUS_BUFFER_TOO_SMALL`, the required size is returned in
+  `*BufferLength` (the file's convention for conn parameters);
 - `Buffer == NULL` → `QUIC_STATUS_INVALID_PARAMETER`;
-- иначе в буфер копируется хранимая пара в точности как задана (по
-  умолчанию `(0, 0)`; окно возвращается как сконфигурировано —
-  поведение выбирается парой и per-call `Mtu` внутри математики §3.2 и
-  через API не сообщается),
-  `*BufferLength` устанавливается в точный размер структуры.
+- otherwise the stored pair is copied into the buffer exactly as set
+  (the default is `(0, 0)`; the window is returned as configured — the
+  behavior is selected by the pair and the per-call `Mtu` inside the
+  §3.2 math and is not reported through the API),
+  `*BufferLength` is set to the exact size of the structure.
 
-Application-level публичные параметры — `QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER`
-и `QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER` (§15.2) — не заменяют
-этот параметр: они задают родительский потолок (§16) поверх
-собственного rate соединения; установленные уровни суммируются через
-`min` (§16.3).
+The application-level public parameters —
+`QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER` and
+`QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER` (§15.2) — do not replace
+this parameter: they set the parent ceiling (§16) on top of the
+connection's own rate; the installed levels are combined through `min`
+(§16.3).
 
-## §23 Интеграция с Congestion Control Plugin (CCP)
+## §23 Integration with the Congestion Control Plugin (CCP)
 
-`QUIC_CONGESTION_CONTROL` — это текущий «протокол подключения» плагинов
-congestion control в ядре msquic (vtable с `~17` методами, заполняемый
-`Cubic` и `Bbr`). Шейпер интегрируется так, чтобы подключение
-свелось к минимуму нового кода и переиспользованию стандартного
-пайплайна инициализации/сброса.
+`QUIC_CONGESTION_CONTROL` is the current "plug-in protocol" for
+congestion control plugins in the msquic core (a vtable with `~17`
+methods, filled in by `Cubic` and `Bbr`). The shaper is integrated so
+that plugging in amounts to a minimum of new code and reuse of the
+standard initialization/reset pipeline.
 
-## §24 State внутри `QUIC_CONGESTION_CONTROL`
+## §24 State inside `QUIC_CONGESTION_CONTROL`
 
-Структура получает поле:
+The structure gets the field:
 
 ```c
 typedef struct QUIC_CONGESTION_CONTROL {
@@ -2111,30 +2158,30 @@ typedef struct QUIC_CONGESTION_CONTROL {
 } QUIC_CONGESTION_CONTROL;
 ```
 
-Инициализация/сброс — в `QuicCongestionControlInitialize`/
-`QuicCongestionControlReset` (см. §17). Плагин **не** обязан
-вызывать `QuicBandwidthShaperInit` сам; он получает готовый к
-использованию `Cc->Pacer` сразу после `QuicCongestionControlInitialize`.
+Initialization/reset — in `QuicCongestionControlInitialize`/
+`QuicCongestionControlReset` (see §17). The plugin is **not** obliged
+to call `QuicBandwidthShaperInit` itself; it receives a ready-to-use
+`Cc->Pacer` immediately after `QuicCongestionControlInitialize`.
 
-## §25 Удобная точка входа
+## §25 The convenience entry point
 
-Плагин работает со встроенным шейпером в три действия:
+The plugin works with the built-in shaper in three actions:
 
-1. **Сконфигурировать rate через `SetConfig`** перед каждым вызовом
-   `GetSendAllowance` или в `OnDataAcknowledged` (когда меняется
-   оценка пропускной способности). Burst-окно задаётся при первой
-   настройке (в паре с первым ненулевым rate) и далее не меняется:
-   плагин всегда передаёт текущее окно
-   `Cc->Pacer.BurstWindowUsec` (хранится в мкс как сконфигурировано,
-   §3.6) (§7).
+1. **Configure the rate via `SetConfig`** before every
+   `GetSendAllowance` call or in `OnDataAcknowledged` (when the
+   bandwidth estimate changes). The burst window is set at the first
+   configuration (paired with the first non-zero rate) and does not
+   change afterwards: the plugin always passes the current window
+   `Cc->Pacer.BurstWindowUsec` (stored in µs as configured, §3.6)
+   (§7).
 
    ```c
-   uint64_t EstimatedBandwidthBytesPerSec : uint64_t = ...;          // байт/с
+   uint64_t EstimatedBandwidthBytesPerSec : uint64_t = ...;          // bytes/s
    uint64_t PacingGain                     : uint64_t = ...;          // fixed-point
    uint64_t GAIN_UNIT                      : uint64_t = ...;          // scale denominator
-   uint64_t NowUsec                        : uint64_t = ...;          // текущий монотонный
-                                                                       // момент вызывающего (§2.1)
-   uint64_t PacingRateBitsPerSec           : uint64_t                  // бит/с
+   uint64_t NowUsec                        : uint64_t = ...;          // the caller's current
+                                                                       // monotonic moment (§2.1)
+   uint64_t PacingRateBitsPerSec           : uint64_t                  // bit/s
        = EstimatedBandwidthBytesPerSec
          * BITS_PER_BYTE
          * PacingGain / GAIN_UNIT;
@@ -2142,49 +2189,50 @@ typedef struct QUIC_CONGESTION_CONTROL {
        Cc->Pacer.BurstWindowUsec, NowUsec);
    ```
 
-   > Оценка bandwidth в плагине измеряется в **байт/с**, а не в бит/с
-   > (как у BBR: `BandwidthEst` хранится в виде `BW_UNIT` × байт/с,
-   > см. §27.2). На границе с шейпером перевод в бит/с для `SetConfig`
-   > выполняется как `BandwidthEst / BW_UNIT * BITS_PER_BYTE`:
-   > деление на `BW_UNIT` возвращает байт/с, умножение на 8
-   > (`BITS_PER_BYTE`) даёт бит/с.
+   > The bandwidth estimate inside the plugin is measured in
+   > **bytes/s**, not in bit/s (as in BBR: `BandwidthEst` is stored as
+   > `BW_UNIT` × bytes/s, see §27.2). At the boundary with the shaper,
+   > the conversion to bit/s for `SetConfig` is done as
+   > `BandwidthEst / BW_UNIT * BITS_PER_BYTE`: the division by
+   > `BW_UNIT` returns bytes/s, and the multiplication by 8
+   > (`BITS_PER_BYTE`) yields bit/s.
 
-2. **Получить allowance** через
+2. **Get the allowance** through
    `QuicBandwidthShaperComputeSendAllowance(&Cc->Pacer, NowUsec,
    CongestionWindow, BytesInFlight)` (§13).
 
-3. **Подтвердить отправку** через `OnDataSent` — вызывающий код
-   (внутри ядра) уже зовёт `QuicCongestionControlOnDataSent`, который
-   сам обновит шейпер через `QuicBandwidthShaperRegisterSend` (§14).
-   Плагину **не нужно** ничего вызывать дополнительно.
+3. **Confirm the send** through `OnDataSent` — the calling code (inside
+   the core) already calls `QuicCongestionControlOnDataSent`, which
+   updates the shaper itself through `QuicBandwidthShaperRegisterSend`
+   (§14). The plugin does **not** need to call anything additionally.
 
-Все три действия покрывают 100 % текущего pacing-поведения Cubic
-и BBR, без специальных полей вроде `LastSendAllowance` —
-оно заменяется на `CreditBaseTimeNsec` шейпера.
+All three actions cover 100 % of the current pacing behavior of Cubic
+and BBR, without special fields like `LastSendAllowance` — it is
+replaced by the shaper's `CreditBaseTimeNsec`.
 
-## §26 Точка входа для плагинов, не использующих встроенный шейпер
+## §26 Entry point for plugins that do not use the built-in shaper
 
-Плагин может полностью игнорировать `Cc->Pacer` и реализовать
-собственный pacing в `GetSendAllowance` (как приходится делать
-сейчас). В этом случае рекомендуется не звать
-`QuicBandwidthShaperRegisterSend` (его можно подавить, оставив
-`Pacer.BandwidthBitsPerSecond == 0` на всё время жизни алгоритма —
-это эквивалентно «unlimited» и не повлияет на остальной код).
+A plugin may ignore `Cc->Pacer` entirely and implement its own pacing
+in `GetSendAllowance` (as it has to do now). In that case it is
+recommended not to call `QuicBandwidthShaperRegisterSend` (it can be
+suppressed by keeping `Pacer.BandwidthBitsPerSecond == 0` for the
+algorithm's entire lifetime — this is equivalent to "unlimited" and
+will not affect the rest of the code).
 
-## §27 Миграция существующих плагинов
+## §27 Migration of existing plugins
 
-В рамках этой issue выполняется миграция `Cubic` и `Bbr`:
+As part of this issue, `Cubic` and `Bbr` are migrated:
 
 ### §27.1 Cubic
 
-- Заменить внутреннюю формулу
-  `(EstimatedWnd * TimeSinceLastSend) / SmoothedRtt` на:
+- Replace the internal formula
+  `(EstimatedWnd * TimeSinceLastSend) / SmoothedRtt` with:
   ```c
-  uint64_t EstimatedWnd    : uint64_t = ...;                              // байт
-  uint64_t SmoothedRtt     : uint64_t = Connection->Paths[0].SmoothedRtt;  // мкс
-  uint32_t CongestionWindow : uint32_t = Cubic->CongestionWindow;          // байт
-  uint32_t BytesInFlight   : uint32_t = Cubic->BytesInFlight;             // байт
-  uint64_t PacingRateBitsPerSec : uint64_t                                 // бит/с
+  uint64_t EstimatedWnd    : uint64_t = ...;                              // bytes
+  uint64_t SmoothedRtt     : uint64_t = Connection->Paths[0].SmoothedRtt;  // µs
+  uint32_t CongestionWindow : uint32_t = Cubic->CongestionWindow;          // bytes
+  uint32_t BytesInFlight   : uint32_t = Cubic->BytesInFlight;             // bytes
+  uint64_t PacingRateBitsPerSec : uint64_t                                 // bit/s
       = EstimatedWnd
         * BITS_PER_BYTE
         * QUIC_BANDWIDTH_SHAPER_USEC_PER_SEC
@@ -2195,39 +2243,38 @@ typedef struct QUIC_CONGESTION_CONTROL {
        = QuicBandwidthShaperComputeSendAllowance(
              &Cc->Pacer, NowUsec, CongestionWindow, BytesInFlight);
    ```
-   Окно (`Cc->Pacer.BurstWindowUsec`, мкс — хранится как сконфигурировано,
-   §3.6)
-   плагином не меняется — оно
-  задаётся один раз, вместе с первым ненулевым rate (см. §17, §25);
-  при инициализации плагина шейпер остаётся в `(0, 0)` (§17).
-- Поле `QUIC_CONGESTION_CONTROL_CUBIC::LastSendAllowance` (`: uint32_t`)
-  удаляется.
-- Тесты `CubicTest.cpp::Pacing_SlowStartWindowEstimation`,
+   The window (`Cc->Pacer.BurstWindowUsec`, µs — stored as configured,
+   §3.6) is not changed by the plugin — it is set once, together with
+   the first non-zero rate (see §17, §25); at plugin initialization the
+   shaper remains at `(0, 0)` (§17).
+- The field `QUIC_CONGESTION_CONTROL_CUBIC::LastSendAllowance`
+  (`: uint32_t`) is removed.
+- The tests `CubicTest.cpp::Pacing_SlowStartWindowEstimation`,
   `Pacing_CongestionAvoidanceEstimation`, `Pacing_LastSendAllowanceCarryover`
-  переписываются в терминах `Cc->Pacer.CreditBaseTimeNsec`
-  и чтений кредита `Cc->Pacer` через `QuicBandwidthShaperGetAllowance`.
+  are rewritten in terms of `Cc->Pacer.CreditBaseTimeNsec` and reads of
+  the `Cc->Pacer` credit through `QuicBandwidthShaperGetAllowance`.
 
 ### §27.2 BBR
 
-- Заменить формулу `BandwidthEst * PacingGain * TimeSinceLastSend /
-  GAIN_UNIT` на установку bandwidth в шейпере:
+- Replace the formula `BandwidthEst * PacingGain * TimeSinceLastSend /
+  GAIN_UNIT` with setting the bandwidth in the shaper:
   ```c
-  uint64_t BandwidthEst    : uint64_t = ...;       // BW_UNIT × байт/с
-                                                   // (масштаб фильтра
-                                                   // bandwidth из bbr.c;
-                                                   // BW_UNIT = 8, не 256)
+  uint64_t BandwidthEst    : uint64_t = ...;       // BW_UNIT × bytes/s
+                                                   // (the bandwidth filter's
+                                                   // scale from bbr.c;
+                                                   // BW_UNIT = 8, not 256)
   uint32_t PacingGain      : uint32_t = Bbr->PacingGain;
   uint64_t GAIN_UNIT       : uint64_t = 256;       // BBR gain scale
-  uint64_t BW_UNIT         : uint64_t = 8;         // масштаб фильтра
-                                                   // bandwidth (bbr.c)
-  uint32_t CongestionWindow : uint32_t = ...;       // байт
+  uint64_t BW_UNIT         : uint64_t = 8;         // the bandwidth filter's
+                                                   // scale (bbr.c)
+  uint32_t CongestionWindow : uint32_t = ...;       // bytes
   uint32_t BytesInFlight   : uint32_t = Bbr->BytesInFlight;
   uint32_t Quantum         : uint32_t = CongestionWindow >> 2;
   uint64_t ByCwnd          : uint64_t
       = (uint64_t)(CongestionWindow - BytesInFlight);
-  uint64_t PacingRateBitsPerSec : uint64_t          // бит/с
-      = BandwidthEst / BW_UNIT                      // → байт/с
-        * BITS_PER_BYTE                             // → бит/с
+  uint64_t PacingRateBitsPerSec : uint64_t          // bit/s
+      = BandwidthEst / BW_UNIT                      // → bytes/s
+        * BITS_PER_BYTE                             // → bit/s
         * (uint64_t)PacingGain / GAIN_UNIT;
   QuicBandwidthShaperSetConfig(&Cc->Pacer, PacingRateBitsPerSec,
       Cc->Pacer.BurstWindowUsec, NowUsec);
@@ -2236,630 +2283,688 @@ typedef struct QUIC_CONGESTION_CONTROL {
           &Cc->Pacer, /*SizeBytes=*/0, NowUsec, Mtu).AllowedBytes,
       CXPLAT_MIN((uint64_t)Quantum, ByCwnd));
   ```
-  Без деления на `BW_UNIT` формула завышает rate в 8 раз:
-  `BandwidthEst` — значение фильтра bandwidth (`BW_UNIT` × байт/с),
-  а не байт/с и не бит/с.
-  Окно (`Cc->Pacer.BurstWindowUsec`, мкс — хранится как сконфигурировано,
-  §3.6)
-  плагином не меняется — оно
-  задаётся один раз, вместе с первым ненулевым rate (см. §17, §25);
-  при инициализации плагина шейпер остаётся в `(0, 0)` (§17).
-- Тесты `BbrTest.cpp::GetSendAllowance_CcBlocked`,
+  Without the division by `BW_UNIT` the formula overstates the rate by
+  a factor of 8: `BandwidthEst` is the bandwidth filter's value
+  (`BW_UNIT` × bytes/s), not bytes/s and not bit/s.
+  The window (`Cc->Pacer.BurstWindowUsec`, µs — stored as configured,
+  §3.6) is not changed by the plugin — it is set once, together with
+  the first non-zero rate (see §17, §25); at plugin initialization the
+  shaper remains at `(0, 0)` (§17).
+- The tests `BbrTest.cpp::GetSendAllowance_CcBlocked`,
   `GetSendAllowance_NoPacing_TimeSinceLastSendInvalid`,
   `GetSendAllowance_PacingDisabled`, `SetSendQuantum_MediumPacingRate`,
-  `SetSendQuantum_HighPacingRate` обновляются под шейпер (теперь
-  проверяется `Cc->Pacer.BandwidthBitsPerSecond` и
-  `QuicBandwidthShaperGetAllowance` напрямую).
+  `SetSendQuantum_HighPacingRate` are updated for the shaper (now
+  `Cc->Pacer.BandwidthBitsPerSecond` and
+  `QuicBandwidthShaperGetAllowance` are checked directly).
 
-## §28 Совместимость с внешними плагинами
+## §28 Compatibility with external plugins
 
-Поскольку `QUIC_CONGESTION_CONTROL` уже содержит union
-`{Cubic, Bbr}`, добавление поля `Pacer` в основную структуру
-**не** ломает signature существующих функций и компоновку,
-но требует пересборки плагинов, использующих эту структуру
-(ABI bump в kernel-mode). User-mode DLL совместимы через
-forward-export-table; обновление делается в той же ревизии.
+Since `QUIC_CONGESTION_CONTROL` already contains the union
+`{Cubic, Bbr}`, adding the `Pacer` field to the main structure does
+**not** break the signatures of existing functions and the linking,
+but requires rebuilding the plugins that use this structure (an ABI
+bump in kernel mode). User-mode DLLs are compatible through the
+forward-export-table; the update is done in the same revision.
 
-Дополнения иерархии (§15, §16) ABI плагинов не затрагивают: поля
-`QUIC_BANDWIDTH_SHAPER_PARENT` в `MsQuicLib`/`QUIC_CONFIGURATION` и
-`LibraryBandwidthShaperParent`/`ConfigBandwidthShaperParent` в
-`QUIC_CONNECTION` — внутреннее состояние,
-невидимое для плагинов CC. Публичные дополнения `msquic.h`
-(`QUIC_BANDWIDTH_SHAPER_CONFIG`, два параметра, §15.1–§15.2) —
-аддитивные: новые константы и структура не меняют существующих
-объявлений; исходная и бинарная совместимость приложений сохраняется
-(новые параметры до своего SET не изменяют поведение).
+The hierarchy additions (§15, §16) do not touch the plugins' ABI: the
+`QUIC_BANDWIDTH_SHAPER_PARENT` fields in `MsQuicLib`/
+`QUIC_CONFIGURATION` and `LibraryBandwidthShaperParent`/
+`ConfigBandwidthShaperParent` in `QUIC_CONNECTION` are internal state,
+invisible to CC plugins. The public additions to `msquic.h`
+(`QUIC_BANDWIDTH_SHAPER_CONFIG`, the two parameters, §15.1–§15.2) are
+additive: the new constants and the structure change no existing
+declarations; the source and binary compatibility of applications is
+preserved (the new parameters do not change behavior until their
+SET).
 
-## §29 Требования к качеству
+## §29 Quality requirements
 
-### §30 Покрытие кода
+### §30 Code coverage
 
-100 % покрытие как минимум по линиям и branch coverage. Юнит-тесты
-размещаются в `src/core/unittest/BandwidthShaperTest.cpp` (параллельно
-стилю `CubicTest.cpp` / `BbrTest.cpp`). Иерархия (§15, §16) покрывается
-кейсами §36 (32–51): валидация параметров, разрешение иерархии
-(стекование уровней), min(credits) — вплоть до трёх уровней, общий
-дебит, потолок (включая library-потолок при собственном
-configuration-родителе), passthrough, снапшот при открытии,
-время жизни, конкурентный дебит.
+100 % coverage at least in lines and branch coverage. The unit tests
+live in `src/core/unittest/BandwidthShaperTest.cpp` (parallel to the
+style of `CubicTest.cpp` / `BbrTest.cpp`). The hierarchy (§15, §16) is
+covered by the cases of §36 (32–51): parameter validation, hierarchy
+resolution (stacking of levels), min(credits) — up to three levels, the
+shared debit, the ceiling (including the library ceiling in the presence
+of the connection's own configuration parent), passthrough, the
+snapshot at bind, the lifetime, the concurrent debit.
 
-### §31 Детерминизм тестов
+### §31 Test determinism
 
-Все тесты обязаны:
+All tests must:
 
-- принимать `NowUsec` параметром и не читать системные часы внутри
-  (для частей, тестирующих логику §9/§10); §14 (`RegisterSend`)
-  тестируется так же — время передаётся аргументом `NowUsec`,
-  подмена таймера не требуется (инъекция аргумента);
-- проверять конкретные численные значения, а не диапазоны;
-- проверять отсутствие гонок при вызове из одного потока без внешних
-  блокировок.
+- take `NowUsec` as a parameter and not read the system clock inside
+  (for the parts testing the logic of §9/§10); §14 (`RegisterSend`)
+  is tested the same way — the time is passed as the `NowUsec`
+  argument, no timer substitution is required (argument injection);
+- check concrete numeric values, not ranges;
+- verify the absence of races when called from a single thread without
+  external locks.
 
-Для иерархии (кейсы §36): логика `min`/copy-out (§16.3) тестируется с
-инъекцией `NowUsec` на уровне хелперов снапшота; многопоточный кейс
-47 (конкурентный дебит) использует детерминированную **финальную**
-проверку состояния родителя и не зависит от чередования потоков.
-Граничная точка SetParam (§15.3) читает реальные часы — её инвариант
-окна тестируется на уровне `QuicBandwidthShaperValidateConfig`
-(кейс 10 §32), без подмены часов.
+For the hierarchy (the cases of §36): the `min`/copy-out logic (§16.3)
+is tested with `NowUsec` injected at the level of the snapshot helpers;
+the multithreaded case 47 (concurrent debit) uses a deterministic
+**final** check of the parent state and does not depend on the
+interleaving of threads. The SetParam boundary (§15.3) reads the real
+clock — its window invariant is tested at the level of
+`QuicBandwidthShaperValidateConfig` (case 10 §32), without clock
+substitution.
 
-### §32 Набор обязательных кейсов
+### §32 The set of mandatory cases
 
-Минимальный список тестов шейпера. Во всех тестах имена величин
-совпадают с каноническими обозначениями §2.4 и именами аргументов
-публичных функций: `BandwidthBitsPerSecond` — это
-`Shaper->BandwidthBitsPerSecond` (бит/с), `SizeBytes` — размер
-передачи (байт), `BurstWindowUsec` — burst-окно (мкс). Общая константа:
-`BITS_PER_BYTE : uint64_t = 8`, `USEC_PER_SEC : uint64_t = 1'000'000`.
-Обозначение кейсов: `AllowedBytes(Now, Mtu)` и
-`DelayUsec(SizeBytes, Now, Mtu)` — соответствующие поля ОДНОГО вызова
+The minimal list of shaper tests. In all tests the names of the
+quantities coincide with the canonical notation of §2.4 and with the
+argument names of the public functions: `BandwidthBitsPerSecond` is
+`Shaper->BandwidthBitsPerSecond` (bit/s), `SizeBytes` is the transfer
+size (bytes), `BurstWindowUsec` is the burst window (µs). Shared
+constants: `BITS_PER_BYTE : uint64_t = 8`,
+`USEC_PER_SEC : uint64_t = 1'000'000`. Case notation:
+`AllowedBytes(Now, Mtu)` and `DelayUsec(SizeBytes, Now, Mtu)` are the
+corresponding fields of ONE call to
 `QuicBandwidthShaperGetAllowance(Shaper, SizeBytes, NowUsec, Mtu)`
-(§9; в кейсах, где проверяется только кредит, `SizeBytes = 0`).
+(§9; in the cases where only the credit is checked, `SizeBytes = 0`).
 
-1. `Init(BandwidthBitsPerSecond, BurstWindowUsec)` с валидной парой `(BandwidthBitsPerSecond, BurstWindowUsec)` (§3.6) возвращает
-   `QUIC_STATUS_SUCCESS` и оставляет `CreditBaseTimeNsec == 0`. `BandwidthBitsPerSecond`
-   и `BurstWindowUsec` сохраняются как есть (MTU в шейпере не хранится, §3.3).
+1. `Init(BandwidthBitsPerSecond, BurstWindowUsec)` with a valid pair `(BandwidthBitsPerSecond, BurstWindowUsec)` (§3.6) returns
+   `QUIC_STATUS_SUCCESS` and leaves `CreditBaseTimeNsec == 0`. `BandwidthBitsPerSecond`
+   and `BurstWindowUsec` are stored as is (the MTU is not stored in the shaper, §3.3).
 2. `BandwidthBitsPerSecond == 0` (unlimited):
-   `QuicBandwidthShaperGetAllowance` возвращает `AllowedBytes == UINT64_MAX`
-   при любом per-call `Mtu` и `DelayUsec == 0` для любого
+   `QuicBandwidthShaperGetAllowance` returns `AllowedBytes == UINT64_MAX`
+   for any per-call `Mtu`, and `DelayUsec == 0` for any
    `SizeBytes > 0`;
-   `OnSend(SizeBytes, Now, Mtu)` / `RegisterSend(SizeBytes, Now, Mtu)` при `BandwidthBitsPerSecond == 0` ведут себя как
-   no-op: `CreditBaseTimeNsec` остаётся неизменным (no-op контракт
-   неактивного шейпера, §10).
-3. **Строгий режим, живучесть (явная строгая ветвь, per-call Mtu):**
+   `OnSend(SizeBytes, Now, Mtu)` / `RegisterSend(SizeBytes, Now, Mtu)` with `BandwidthBitsPerSecond == 0` behave as
+   no-ops: `CreditBaseTimeNsec` remains unchanged (the no-op contract
+   of the inactive shaper, §10).
+3. **Strict mode, persistence (the explicit strict branch, per-call Mtu):**
    `BurstWindowUsec == 0`
-   при `BandwidthBitsPerSecond > 0` — валидная пара, строгая для
-   потребителя с per-call `Mtu > 0`
-   (бюджет ниже одного пакета размера `Mtu`; предикат
-   `QuicBandwidthShaperIsStrictMode` §3.2, тест передаёт `Mtu = 1500`).
-   Окно в математике не
-   участвует вовсе: чтения **бинарны** — ровно один пакет размера `Mtu`
-   (при `BandwidthBitsPerSecond = 8'000'000` и `Mtu = 1500` это
-   `1'500` байт) разрешён, когда `NowNsec - CreditBaseTimeNsec >=
-   MtuDebitNsec` (при 8 Мбит/с интервал `1'500'000` нс), иначе 0;
-   `Init(BandwidthBitsPerSecond, 0)` хранит
-   `BurstWindowUsec == 0` как задано.
-   Детерминированный бинарный ритм на инъецированном времени: свежий
-   шейпер разрешает ровно один пакет
-   (`AllowedBytes(t0, Mtu) == Mtu`); после отправки его
-   `AllowedBytes(t0, Mtu) == 0` и остаётся бинарным нулём
-   вплоть до истечения `DebitNsec(Mtu)`;
-   `AllowedBytes(t0 + DebitNsec(Mtu)/1'000, Mtu)` снова ровно один
-   пакет; ритм повторяется. Малая отправка списывает весь интервал:
-   после отправки `100` байт следующий пакет разрешён только через
-   `DebitNsec(1500)`, а не `DebitNsec(100)` (§3.2). Пара с `W == 0`
-   валидируется при любом `NowUsec` — `ValidateConfig(BandwidthBitsPerSecond, 0, Now) → TRUE`
-   безусловно (окно в математике не участвует при любом per-call `Mtu`, инвариант окна
-   к ней не применяется, §3.5/§3.6); `SetConfig(BandwidthBitsPerSecond, 0,
-   Now)` применяет пару атомарно, храня заданное `BurstWindowUsec == 0` (§3.6).
-4. После `OnSend(SizeBytes, Now, Mtu)`, где `SizeBytes` равен разрешённому количеству
-   `AllowedBytes(Shaper, Now, Mtu)` (с точностью ± 1 байт округления),
-   `AllowedBytes` на момент `Now` равно 0: списание полного кредита
-   сдвигает `EffectiveLastSendNsec` к `Now`.
-5. `EffectiveLastSendNsec` сдвигается на `NowNsec - BurstWindowNsec`
-   при глубоком простое: конфигурация (`BandwidthBitsPerSecond > 0`, `BurstWindowUsec`) в момент `t0`
-   тестовой шкалы с `BurstWindowUsec < t0` (инвариант окна, §3.6/§7 —
-   `SetConfig(BandwidthBitsPerSecond, BurstWindowUsec, t0)`), `OnSend` в `t0`, затем
-   `AllowedBytes(t = t0 + 10*BurstWindowUsec)` возвращает
-   `BurstWindowUsec * BandwidthBitsPerSecond / 8'000'000` (burst-бюджет: клэмп `max(...)` в §3.2
-   ограничивает `DeltaNsec` величиной `BurstWindowUsec`), а не накопленную дозу
+   with `BandwidthBitsPerSecond > 0` — a valid pair, strict for a
+   consumer with per-call `Mtu > 0`
+   (a budget below one packet of size `Mtu`; the predicate
+   `QuicBandwidthShaperIsStrictMode` §3.2, the test passes `Mtu = 1500`).
+   The window does not participate in the math
+   at all: reads are **binary** — exactly one packet of size `Mtu`
+   (with `BandwidthBitsPerSecond = 8'000'000` and `Mtu = 1500` that is
+   `1'500` bytes) is allowed when `NowNsec - CreditBaseTimeNsec >=
+   MtuDebitNsec` (at 8 Mbit/s the interval is `1'500'000` ns), otherwise 0;
+   `Init(BandwidthBitsPerSecond, 0)` stores
+   `BurstWindowUsec == 0` as given.
+   A deterministic binary cadence on injected time: a fresh
+   shaper allows exactly one packet
+   (`AllowedBytes(t0, Mtu) == Mtu`); after a send, its
+   `AllowedBytes(t0, Mtu) == 0` and it remains a binary zero
+   until `DebitNsec(Mtu)` expires;
+   `AllowedBytes(t0 + DebitNsec(Mtu)/1'000, Mtu)` is again exactly one
+   packet; the cadence repeats. A small send debits the whole interval:
+   after sending `100` bytes, the next packet is allowed only after
+   `DebitNsec(1500)`, not `DebitNsec(100)` (§3.2). A pair with `W == 0`
+   is validated for any `NowUsec` — `ValidateConfig(BandwidthBitsPerSecond, 0, Now) → TRUE`
+   unconditionally (the window does not participate in the math for any per-call `Mtu`; the window invariant
+   does not apply to it, §3.5/§3.6); `SetConfig(BandwidthBitsPerSecond, 0,
+   Now)` applies the pair atomically, storing the given `BurstWindowUsec == 0` (§3.6).
+4. After `OnSend(SizeBytes, Now, Mtu)`, where `SizeBytes` equals the allowed amount
+   `AllowedBytes(Shaper, Now, Mtu)` (to within ± 1 byte of rounding),
+   `AllowedBytes` at the moment `Now` is 0: debiting the full credit
+   moves `EffectiveLastSendNsec` to `Now`.
+5. `EffectiveLastSendNsec` moves to `NowNsec - BurstWindowNsec`
+   after a deep idle: the configuration (`BandwidthBitsPerSecond > 0`, `BurstWindowUsec`) at the moment `t0`
+   of the test scale with `BurstWindowUsec < t0` (the window invariant, §3.6/§7 —
+   `SetConfig(BandwidthBitsPerSecond, BurstWindowUsec, t0)`), an `OnSend` at `t0`, then
+   `AllowedBytes(t = t0 + 10*BurstWindowUsec)` returns
+   `BurstWindowUsec * BandwidthBitsPerSecond / 8'000'000` (the burst budget: the `max(...)` clamp in §3.2
+   bounds `DeltaNsec` by `BurstWindowUsec`), not the accumulated dose
    `10 * BurstWindowUsec * BandwidthBitsPerSecond / 8'000'000`.
-6. MTU rounding протоколируется в вызывающем коде; в самом шейпере
-   тестируется `AllowedBytes` без округления, как
+6. MTU rounding is the calling code's protocol; in the shaper itself,
+   `AllowedBytes` is tested without rounding, as
    `DeltaNsec * BandwidthBitsPerSecond / (BITS_PER_BYTE * NSEC_PER_SEC)`.
-7. Монотонное время: `OnSend` в `t` (списывающий полный кредит на
-   момент `t`, т.е. `SizeBytes == AllowedBytes(Shaper, t)` с точностью
-   ± 1 байт округления, так что `EffectiveLastSendNsec == t`), затем
-   `AllowedBytes(t-1)` возвращает 0, `AllowedBytes(t+delta)` возвращает
+7. Monotonic time: an `OnSend` at `t` (debiting the full credit at the
+   moment `t`, i.e. `SizeBytes == AllowedBytes(Shaper, t)` to within
+   ± 1 byte of rounding, so that `EffectiveLastSendNsec == t`), then
+   `AllowedBytes(t-1)` returns 0, `AllowedBytes(t+delta)` returns
    `delta * BandwidthBitsPerSecond / 8'000'000`.
-8. Экстремальные значения регулируются инвариантом валидации
-   (§3.5/§3.6) — 64-битная арифметика без переполнений. При
-   `BandwidthBitsPerSecond == 1` минимальное окно, покрывающее один
-   1500-байтный пакет, равно
-   `ceil(1500 * 8'000'000 / BandwidthBitsPerSecond) = 12'000'000'000` мкс (обычный режим на границе и для per-call `Mtu = 1500`); для конфигурации требуется также
-   `BurstWindowUsec < NowUsec` (инвариант окна, §3.6).
-   `DelayUsec(SizeBytes = UINT64_MAX)` возвращает
-   `ceil((UINT64_MAX - NowNsec) / 1'000)` без переполнения и без UB
-   (умножение `SizeBytes * 8'000'000'000` насыщается — шаг 7 §9);
-   `AllowedBytes` при `NowUsec = UINT64_MAX / 1'000`
-   (максимум ns-представимого `NowUsec`, §2.1) возвращает
-   корректное значение без UB (конвертация `* 1'000` не переполняется;
-   произведение ограничено инвариантом
-   `DeltaNsec * BandwidthBitsPerSecond <= UINT64_MAX`, шаг 5 §9); чтение на границе
-   ns-комбинации `BurstWindowUsec = UINT64_MAX / BandwidthBitsPerSecond / 1'000` возвращает ровно `BurstWindowUsec` байт.
-9. Multi-step pacing: 10 итераций «отправить `Mtu` байт, подождать
-   `Mtu * BITS_PER_BYTE * USEC_PER_SEC / BandwidthBitsPerSecond` мкс (т.е.
-   `Mtu * 8'000'000 / BandwidthBitsPerSecond`), проверить, что следующая отправка проходит
-   без задержки» сохраняет установившийся ритм ± 1 мкс (per-call `Mtu`).
-10. Валидация: таблица истинности §3.6 на прямых вызовах
+8. Extreme values are governed by the validation invariant
+   (§3.5/§3.6) — 64-bit arithmetic without overflows. With
+   `BandwidthBitsPerSecond == 1`, the minimal window covering one
+   1500-byte packet equals
+   `ceil(1500 * 8'000'000 / BandwidthBitsPerSecond) = 12'000'000'000` µs (normal mode on the boundary, also for per-call `Mtu = 1500`); the configuration additionally requires
+   `BurstWindowUsec < NowUsec` (the window invariant, §3.6).
+   `DelayUsec(SizeBytes = UINT64_MAX)` returns
+   `ceil((UINT64_MAX - NowNsec) / 1'000)` without overflow and without UB
+   (the multiplication `SizeBytes * 8'000'000'000` saturates — step 7 §9);
+   `AllowedBytes` at `NowUsec = UINT64_MAX / 1'000`
+   (the maximum ns-representable `NowUsec`, §2.1) returns a
+   correct value without UB (the `* 1'000` conversion does not overflow;
+   the product is bounded by the invariant
+   `DeltaNsec * BandwidthBitsPerSecond <= UINT64_MAX`, step 5 §9); a read at the boundary of the
+   ns combination `BurstWindowUsec = UINT64_MAX / BandwidthBitsPerSecond / 1'000` returns exactly `BurstWindowUsec` bytes.
+9. Multi-step pacing: 10 iterations of "send `Mtu` bytes, wait
+   `Mtu * BITS_PER_BYTE * USEC_PER_SEC / BandwidthBitsPerSecond` µs (i.e.
+   `Mtu * 8'000'000 / BandwidthBitsPerSecond`), check that the next send
+   goes through without delay" keep the steady-state cadence within
+   ± 1 µs (per-call `Mtu`).
+10. Validation: the truth table of §3.6 on direct calls to
     `QuicBandwidthShaperValidateConfig(BandwidthBitsPerSecond, BurstWindowUsec, Now)`:
-    `(0, 0)` → TRUE при любом `Now`;
+    `(0, 0)` → TRUE for any `Now`;
     `(0, BurstWindowUsec > 0)` → FALSE;
-    `(BandwidthBitsPerSecond > 0, BurstWindowUsec = 0)` → TRUE безусловно
-    (окно в математике не участвует при любом per-call `Mtu` — строгий
-    квантованный пейсинг при `Mtu > 0`, непрерывный кредит при
-    `Mtu == 0`; ни ns-граница, ни инвариант окна не применяются;
-    TRUE при любом `Now`, включая `Now = 0`);
-    `(BandwidthBitsPerSecond > 0, BurstWindowUsec > 0)` → TRUE ⇔ `BurstWindowUsec <= UINT64_MAX / BandwidthBitsPerSecond / 1'000` **и**
+    `(BandwidthBitsPerSecond > 0, BurstWindowUsec = 0)` → TRUE unconditionally
+    (the window does not participate in the math for any per-call `Mtu` — strict
+    quantized pacing with `Mtu > 0`, continuous credit with
+    `Mtu == 0`; neither the ns bound nor the window invariant applies;
+    TRUE for any `Now`, including `Now = 0`);
+    `(BandwidthBitsPerSecond > 0, BurstWindowUsec > 0)` → TRUE ⇔ `BurstWindowUsec <= UINT64_MAX / BandwidthBitsPerSecond / 1'000` **and**
     `BurstWindowUsec < Now`
-    (ns-граница комбинации и инвариант окна над самим настроенным окном:
-    любая пара с `W > 0` может быть потреблена обычной математикой,
-    §3.6);
-    в частности `(BandwidthBitsPerSecond = UINT64_MAX, BurstWindowUsec = 1)` →
+    (the ns bound of the combination and the window invariant over the
+    configured window itself: any pair with `W > 0` can be consumed by
+    the normal math, §3.6);
+    in particular `(BandwidthBitsPerSecond = UINT64_MAX, BurstWindowUsec = 1)` →
     FALSE
-    (ns-граница требует `BurstWindowUsec <= 0`), а
+    (the ns bound requires `BurstWindowUsec <= 0`), while
     `(BandwidthBitsPerSecond = UINT64_MAX, BurstWindowUsec = 0)` → TRUE
-    (единственная валидная при этом `BandwidthBitsPerSecond`).
-11. Границы комбинации: `(BandwidthBitsPerSecond > 0, BurstWindowUsec = UINT64_MAX / BandwidthBitsPerSecond / 1'000)` — валидно
-    (произведение `BurstWindowUsec * 1'000 * BandwidthBitsPerSecond` помещается в `uint64_t`);
-    `(BandwidthBitsPerSecond > 0, BurstWindowUsec = UINT64_MAX / BandwidthBitsPerSecond / 1'000 + 1)` — отвергается.
-12. Симметрия отвержения: для любой отвергнутой пары `(BandwidthBitsPerSecond, BurstWindowUsec)`
-    валидны пары `(BandwidthBitsPerSecond, UINT64_MAX / BandwidthBitsPerSecond / 1'000)` и
-    `(UINT64_MAX / BurstWindowUsec / 1'000, BurstWindowUsec)` —
-    отвержение определяется комбинацией параметров, а не отдельным
-    параметром; снижение любого из параметров до граничного значения
-    восстанавливает валидность.
-13. `Init` с невалидной парой (например, `(0, BurstWindowUsec > 0)` или
-    `(BandwidthBitsPerSecond > 0, BurstWindowUsec > UINT64_MAX / BandwidthBitsPerSecond / 1'000)` — пара,
-    нарушившая ns-границу комбинации) →
+    (the only valid pair for that `BandwidthBitsPerSecond`).
+11. Combination bounds: `(BandwidthBitsPerSecond > 0, BurstWindowUsec = UINT64_MAX / BandwidthBitsPerSecond / 1'000)` — valid
+    (the product `BurstWindowUsec * 1'000 * BandwidthBitsPerSecond` fits in `uint64_t`);
+    `(BandwidthBitsPerSecond > 0, BurstWindowUsec = UINT64_MAX / BandwidthBitsPerSecond / 1'000 + 1)` — rejected.
+12. Rejection symmetry: for any rejected pair `(BandwidthBitsPerSecond, BurstWindowUsec)`,
+    the pairs `(BandwidthBitsPerSecond, UINT64_MAX / BandwidthBitsPerSecond / 1'000)` and
+    `(UINT64_MAX / BurstWindowUsec / 1'000, BurstWindowUsec)` are valid —
+    rejection is determined by the combination of the parameters, not by
+    an individual parameter; lowering either parameter down to the
+    boundary value restores validity.
+13. `Init` with an invalid pair (for example, `(0, BurstWindowUsec > 0)` or
+    `(BandwidthBitsPerSecond > 0, BurstWindowUsec > UINT64_MAX / BandwidthBitsPerSecond / 1'000)` — a pair
+    violating the ns bound of the combination) →
     `QUIC_STATUS_INVALID_PARAMETER`;
-    состояние структуры не изменяется (структура никогда не существует
-    в невалидном состоянии, §6). Пары с `W == 0` невалидными не являются —
-    их математика (строгая/непрерывная, §3.2) принимается безусловно.
-14. Атомарность `SetConfig` (§7): при отвержении пары ни одно из полей
-    (`BandwidthBitsPerSecond`, `BurstWindowUsec`) не изменяется;
-    при успехе применяются оба поля целиком. Дополнительно: пара
-    `(B, 0)` на одном и том же состоянии читается по-разному при разных
-    per-call `Mtu` — строго-бинарно при `Mtu = 1500` и непрерывно при
-    `Mtu = 0` (§3.2 — use-time свойство).
-15. **Per-call Mtu (§3.3/§18).** Шейпер не хранит MTU: одно и то же
-    состояние (пара + кредит-база) обслуживает разные размеры пакета.
-    Чтение свежей пары `(8e6, 0)` в один момент даёт бинарный
-    `1500` при `Mtu = 1500` и непрерывные `1'000'000` байт при
-    `Mtu = 0`; запись `OnSend(1500, t0)` даёт строгий интервал-базовый
-    advance (`CreditBase == t0`) при `Mtu = 1500` и точный дебит-базовый
-    (`CreditBase == t0 + 1500` мкс) при `Mtu = 0`. Кредит
-    (`CreditBaseTimeNsec`) от per-call `Mtu` выбора ветки не зависит —
-    зависит только форма его чтения/записи.
-16. `Reset` (§8): standalone-кейс — после `Init(BandwidthBitsPerSecond, BurstWindowUsec)` и
-    отправок (ненулевое `CreditBaseTimeNsec`)
-    `QuicBandwidthShaperReset(Shaper)` обнуляет `CreditBaseTimeNsec`
-    и сохраняет конфигурацию (`BandwidthBitsPerSecond`,
-    `BurstWindowUsec`); при `Now >= BurstWindowUsec` после Reset
-    `AllowedBytes(Now, Mtu)` возвращает полный burst-бюджет
+    the state of the structure does not change (the structure never
+    exists in an invalid state, §6). Pairs with `W == 0` are not invalid —
+    their math (strict/continuous, §3.2) is accepted unconditionally.
+14. `SetConfig` atomicity (§7): when a pair is rejected, neither of the
+    fields (`BandwidthBitsPerSecond`, `BurstWindowUsec`) changes;
+    on success both fields are applied in full. Additionally: the pair
+    `(B, 0)` on one and the same state reads differently under different
+    per-call `Mtu` — strictly binary with `Mtu = 1500` and continuous
+    with `Mtu = 0` (§3.2 — a use-time property).
+15. **Per-call Mtu (§3.3/§18).** The shaper does not store an MTU: one and
+    the same state (the pair + the credit base) serves different packet
+    sizes. Reading the fresh pair `(8e6, 0)` at one moment gives the
+    binary `1500` with `Mtu = 1500` and the continuous `1'000'000` bytes
+    with `Mtu = 0`; the write `OnSend(1500, t0)` gives a strict
+    interval-based advance (`CreditBase == t0`) with `Mtu = 1500` and an
+    exact debit-based one (`CreditBase == t0 + 1500` µs) with `Mtu = 0`.
+    The credit (`CreditBaseTimeNsec`) does not depend on the per-call
+    `Mtu` choice of the branch — only the form of its read/write does.
+16. `Reset` (§8): the standalone case — after `Init(BandwidthBitsPerSecond, BurstWindowUsec)` and
+    sends (a non-zero `CreditBaseTimeNsec`),
+    `QuicBandwidthShaperReset(Shaper)` zeroes `CreditBaseTimeNsec`
+    and keeps the configuration (`BandwidthBitsPerSecond`,
+    `BurstWindowUsec`); with `Now >= BurstWindowUsec`, after the Reset
+    `AllowedBytes(Now, Mtu)` returns the full burst budget
     `BurstWindowUsec * BandwidthBitsPerSecond / 8'000'000`.
-17. Инвариант списания (§10): для последовательности
+17. The debiting invariant (§10): for the sequence
     `AllowedBytesBefore := AllowedBytes(Shaper, Now, Mtu)` →
-    `OnSend(SizeBytes, Now, Mtu)` → `AllowedBytesAfter := AllowedBytes(Shaper, Now, Mtu)`
-    выполняется `AllowedBytesAfter == max(0, AllowedBytesBefore - SizeBytes)` с точностью
-    ± 1 байт (двойной floor, §10); при `BandwidthBitsPerSecond`, кратном `8'000'000`, и
-    `SizeBytes`, кратном `BandwidthBitsPerSecond / 8'000'000`, — точное равенство.
-18. `SetConfig` (§7) сохраняет кредит при смене окна: после отправок
-    (ненулевое `CreditBaseTimeNsec`) `SetConfig(BandwidthBitsPerSecond, NewBurstWindowUsec, Now)` — с
-    `NewBurstWindowUsec < Now` по инварианту окна (§7, контракт 2) — обновляет
-    `Shaper->BurstWindowUsec` (мкс, как задано), не трогая `CreditBaseTimeNsec`
-    (§7, контракт 3); последующее чтение `AllowedBytes` вычисляется от
-    нового окна (§7, контракт 5), т.е. окно меняется, кредит
-    сохраняется.
-19. Инвариант окна (§3.6/§7): `SetConfig(BandwidthBitsPerSecond > 0, BurstWindowUsec, Now)` с `BurstWindowUsec > 0`
-    и `BurstWindowUsec >= Now` → `QUIC_STATUS_INVALID_PARAMETER`, состояние
-    шейпера не изменяется; та же пара, поданная позже с большим
-    `Now` (`BurstWindowUsec < Now`), принимается — ретрай конфигурирования
-    допустим (§7, контракт 2).
-20. Безопасность чтений после конфигурации: после `SetConfig`
-    в момент `t0` (`BurstWindowUsec < t0`) любые вызовы `GetAllowance`/
-    `OnSend` при `t >= t0` не порождают заимствования
-    в `NowNsec - BurstWindowNsec` (§3.5); вызовы при `t < BurstWindowUsec` (эквивалентно:
-    `t < t0`) по контракту не встречаются — `NowUsec` монотонно
-    не убывает.
+    `OnSend(SizeBytes, Now, Mtu)` → `AllowedBytesAfter := AllowedBytes(Shaper, Now, Mtu)`,
+    `AllowedBytesAfter == max(0, AllowedBytesBefore - SizeBytes)` holds to
+    within ± 1 byte (the double floor, §10); with `BandwidthBitsPerSecond`
+    divisible by `8'000'000` and `SizeBytes` divisible by
+    `BandwidthBitsPerSecond / 8'000'000` — exact equality.
+18. `SetConfig` (§7) preserves the credit across a window change: after
+    sends (a non-zero `CreditBaseTimeNsec`),
+    `SetConfig(BandwidthBitsPerSecond, NewBurstWindowUsec, Now)` — with
+    `NewBurstWindowUsec < Now` by the window invariant (§7, contract 2) —
+    updates `Shaper->BurstWindowUsec` (µs, as given) without touching
+    `CreditBaseTimeNsec` (§7, contract 3); a subsequent read of
+    `AllowedBytes` is computed from the new window (§7, contract 5),
+    i.e. the window changes, the credit is preserved.
+19. The window invariant (§3.6/§7):
+    `SetConfig(BandwidthBitsPerSecond > 0, BurstWindowUsec, Now)` with
+    `BurstWindowUsec > 0` and `BurstWindowUsec >= Now` →
+    `QUIC_STATUS_INVALID_PARAMETER`, the shaper's state does not change;
+    the same pair, submitted later with a larger `Now`
+    (`BurstWindowUsec < Now`), is accepted — a configuration retry is
+    permitted (§7, contract 2).
+20. Safety of reads after configuration: after a `SetConfig` at the
+    moment `t0` (`BurstWindowUsec < t0`), any `GetAllowance`/`OnSend`
+    calls at `t >= t0` produce no borrowing in
+    `NowNsec - BurstWindowNsec` (§3.5); calls at `t < BurstWindowUsec`
+    (equivalently: `t < t0`) do not occur by contract — `NowUsec` is
+    monotonically non-decreasing.
 
-Пост-ревью кейсы (52–53 добавлены фиксов F1/F2; 54 — решением владельца
-о «сыром» хранении окна; 55 — решением владельца о per-call Mtu и
-непрерывной семантике `Mtu == 0`; нумерация продолжает
-сквозной список кейсов §32–§36):
+Post-review cases (52–53 were added by the fixes F1/F2; 54 — by the
+owner's decision on the "raw" storage of the window; 55 — by the
+owner's decision on per-call Mtu and the continuous semantics of
+`Mtu == 0`; the numbering continues the running list of cases
+§32–§36):
 
-52. **Граница строгого/обычного режима — per-call свойство `Mtu` (F1,
-    ревизия per-call).** Один шейпер `(8'000'000, 1'300)` (1 байт/мкс,
-    бюджет окна 1'300 байт) читается двумя потребителями с разными
-    per-call `Mtu`: потребитель с `Mtu = 1500` — **строгий** режим
-    (бюджет 1'300 < 1500): свежее чтение `1'500`, после отправки пакета
-    бинарный ритм `0 … 0 → 1'500` ровно на границе `DebitNsec(1500)`,
-    задержка не зависит от `SizeBytes` (`1'500` мкс и для запроса
-    1'300, и для 3'000 байт); потребитель с `Mtu = 1200` на **том же
-    состоянии** — обычный режим (бюджет 1'300 >= 1200): байтовая
-    пропорциональная аккумуляция уже на `+1` мкс (`1` байт против
-    строгого `0`), задержка зависит от `SizeBytes` (1'300 мкс для
-    запроса 1'300, 3'000 мкс для 3'000). Предикат:
+52. **The strict/normal mode boundary — a per-call property of `Mtu`
+    (F1, the per-call revision).** One shaper `(8'000'000, 1'300)`
+    (1 byte/µs, a window budget of 1'300 bytes) is read by two consumers
+    with different per-call `Mtu`: the consumer with `Mtu = 1500` —
+    **strict** mode (the budget 1'300 < 1500): a fresh read of `1'500`;
+    after a packet is sent, the binary cadence `0 … 0 → 1'500` exactly
+    at the `DebitNsec(1500)` boundary, the delay does not depend on
+    `SizeBytes` (`1'500` µs both for a 1'300-byte and for a 3'000-byte
+    request); the consumer with `Mtu = 1200`, on **the same state** —
+    normal mode (the budget 1'300 >= 1200): byte-wise proportional
+    accumulation already at `+1` µs (`1` byte versus the strict `0`),
+    the delay depends on `SizeBytes` (1'300 µs for a 1'300 request,
+    3'000 µs for 3'000). The predicate:
     `IsStrictMode(8e6, 1300, 1500) == TRUE`,
     `IsStrictMode(8e6, 1300, 1200) == FALSE`,
     `IsStrictMode(8e6, 0, 1500) == TRUE`,
-    `IsStrictMode(8e6, 0, 0) == FALSE` (без размера пакета —
-    непрерывный режим),
-    `IsStrictMode(0, ·, ·) == FALSE` (unlimited — не строгий режим). Для
-    некратной границы при `Mtu = 1500`:
+    `IsStrictMode(8e6, 0, 0) == FALSE` (without a packet size —
+    continuous mode),
+    `IsStrictMode(0, ·, ·) == FALSE` (unlimited — not strict mode). For
+    a non-multiple boundary with `Mtu = 1500`:
     `ceil(1500 * 8e6 / 12'000'000) == 1'000`,
-    `BurstWindowUsec = 999` хранится как задано — строгие бинарные
-    чтения `1'500`; `BurstWindowUsec = 1000` — обычный режим на границе
-    (бюджет ровно 1'500 байт, пропорциональная аккумуляция после
-    полного дебита).
-53. **Наносекундная база не теряет суб-микросекундный дебит (F2).** При
-    `BandwidthBitsPerSecond = 19'200'000'000` (19,2 Гбит/с, `BurstWindowUsec = 1` мкс — валидный минимум,
-    бюджет 2'400 байт; для per-call `Mtu = 1500` — обычный режим)
-    отправка `SizeBytes = 1'200` байт даёт
-    `DebitNsec = 1'200 * 8e9 / 19,2e9 = 500` нс — µs-база floored этот
-    дебит в 0 и никогда не ограничивала. Проверки:
-    `CreditBaseTimeNsec == 999'999'500` после отправки;
-    `AllowedBytes(Now, 1500) == 1'200` (ровно половина бюджета списана
-    суб-микросекундным дебитом); `AllowedBytes(Now + 1, 1500) == 2'400`
-    (полный бюджет восстановлен).
-54. **Хранение и эхо «сырого» значения: пара и per-call Mtu выбирают
-    поведение.**
-    Пара хранится и возвращается в точности как задана, а поведение
-    (строгое/непрерывное/обычное) выбирается парой и per-call `Mtu`
-    внутри математики (§3.2). Для
-    `BandwidthBitsPerSecond = 8'000'000` и потребителя с `Mtu = 1500`
-    (граница 1'500 мкс):
-    `SetConfig(BandwidthBitsPerSecond, 0, Now)` → SUCCESS, поле
-    `Shaper->BurstWindowUsec == 0` (строгий режим), а свежий
-    `AllowedBytes(Now, 1500)` возвращает `1'500` — ровно один
-    пакет;
-    `SetConfig(BandwidthBitsPerSecond, 1'499, Now)` → SUCCESS, поле
-    `== 1'499` как задано, а `AllowedBytes(Now, 1500)` снова `1'500` —
-    чтения бинарны (эхо воспроизводится, режим строгий); после
-    `OnSend(1'500, Now, 1500)` ритм живучести отсчитывается от дебита одного
-    пакета (`AllowedBytes(Now + 1'499, 1500) == 0`,
-    `AllowedBytes(Now + 1'500, 1500) == 1'500` — ровно один пакет на
-    интервал дебита; строгая §9-задержка: `1'500` мкс сразу после
-    отправки, `0` по истечении интервала);
-    `SetConfig(BandwidthBitsPerSecond, 2'000, Now)` → SUCCESS, поле
-    `== 2'000` (обычный режим: над границей хранится и применяется одно и то же
-    значение).
-55. **`Mtu == 0`: непрерывный режим (continuous-rate), никакого
-    квантования.** При `Mtu == 0` и `BurstWindowUsec == 0` (8 Мбит/с,
-    1 байт/мкс) чтение свежего шейпера возвращает всю накопленную дельту
-    (`1'000'000` байт при `t0 = 1'000'000` мкс), растущую ровно на
-    `1` байт/мкс — без «прыжков» на размер пакета; задержка — точное
-    время передачи запроса без burst-клэмпа (для
-    `SizeBytes = 3000` при `Now = 0` — ровно `3000` мкс, при 64 Мбит/с —
-    `375` мкс); запись непрерывна: `OnSend(1000, t0)` при 64 Мбит/с
-    даёт `CreditBaseTimeNsec == t0*1'000 + 125'000` (точный дебит от
-    `max(CreditBaseTimeNsec, NowNsec)`, без интервального пола), чтение
-    `t0` — `0` (долг), `t0 + 126` — `8` байт.
+    `BurstWindowUsec = 999` is stored as given — strict binary reads of
+    `1'500`; `BurstWindowUsec = 1000` — normal mode on the boundary
+    (a budget of exactly 1'500 bytes, proportional accumulation after
+    a full debit).
+53. **The nanosecond base does not lose a sub-microsecond debit (F2).**
+    With `BandwidthBitsPerSecond = 19'200'000'000` (19.2 Gbit/s,
+    `BurstWindowUsec = 1` µs — the valid minimum, a budget of 2'400
+    bytes; for per-call `Mtu = 1500` — normal mode), sending
+    `SizeBytes = 1'200` bytes gives
+    `DebitNsec = 1'200 * 8e9 / 19,2e9 = 500` ns — a µs base floored
+    this debit to 0 and never limited. Checks:
+    `CreditBaseTimeNsec == 999'999'500` after the send;
+    `AllowedBytes(Now, 1500) == 1'200` (exactly half of the budget
+    debited by a sub-microsecond debit);
+    `AllowedBytes(Now + 1, 1500) == 2'400`
+    (the full budget restored).
+54. **Storage and echo of the "raw" value: the pair and the per-call Mtu
+    select the behavior.**
+    The pair is stored and returned exactly as given, while the
+    behavior (strict/continuous/normal) is selected by the pair and the
+    per-call `Mtu` inside the math (§3.2). For
+    `BandwidthBitsPerSecond = 8'000'000` and a consumer with
+    `Mtu = 1500` (the boundary 1'500 µs):
+    `SetConfig(BandwidthBitsPerSecond, 0, Now)` → SUCCESS, the field
+    `Shaper->BurstWindowUsec == 0` (strict mode), and a fresh
+    `AllowedBytes(Now, 1500)` returns `1'500` — exactly one packet;
+    `SetConfig(BandwidthBitsPerSecond, 1'499, Now)` → SUCCESS, the
+    field `== 1'499` as given, and `AllowedBytes(Now, 1500)` is again
+    `1'500` — the reads are binary (the echo reproduces, the mode is
+    strict); after `OnSend(1'500, Now, 1500)` the persistence cadence is
+    counted from the debit of one packet
+    (`AllowedBytes(Now + 1'499, 1500) == 0`,
+    `AllowedBytes(Now + 1'500, 1500) == 1'500` — exactly one packet per
+    debit interval; the strict §9 delay: `1'500` µs immediately after
+    the send, `0` once the interval has expired);
+    `SetConfig(BandwidthBitsPerSecond, 2'000, Now)` → SUCCESS, the
+    field `== 2'000` (normal mode: above the boundary, one and the same
+    value is stored and applied).
+55. **`Mtu == 0`: continuous mode (continuous-rate), no quantization.**
+    With `Mtu == 0` and `BurstWindowUsec == 0` (8 Mbit/s,
+    1 byte/µs), a read of a fresh shaper returns the entire accumulated
+    delta (`1'000'000` bytes at `t0 = 1'000'000` µs), growing at
+    exactly `1` byte/µs — without "jumps" by the packet size; the delay
+    is the exact transmission time of the request without a burst clamp
+    (for `SizeBytes = 3000` at `Now = 0` — exactly `3000` µs, at
+    64 Mbit/s — `375` µs); the write is continuous: `OnSend(1000, t0)`
+    at 64 Mbit/s gives `CreditBaseTimeNsec == t0*1'000 + 125'000` (the
+    exact debit from `max(CreditBaseTimeNsec, NowNsec)`, without an
+    interval floor); the read at `t0` — `0` (debt), at `t0 + 126` —
+    `8` bytes.
 
-### §33 Тесты CCP-convenience API (см. §13, §14)
+### §33 CCP-convenience API tests (see §13, §14)
 
-21. `QuicBandwidthShaperComputeSendAllowance` при
-    `CcWindowBytes <= BytesInFlight` возвращает `0`.
-22. `ComputeSendAllowance` при `BandwidthBitsPerSecond == 0` возвращает
-    `CcWindowBytes - BytesInFlight` без обращения к таймеру.
-23. `ComputeSendAllowance` при `BandwidthBitsPerSecond > 0`,
-    `CcWindowBytes > BytesInFlight` возвращает
+21. `QuicBandwidthShaperComputeSendAllowance` with
+    `CcWindowBytes <= BytesInFlight` returns `0`.
+22. `ComputeSendAllowance` with `BandwidthBitsPerSecond == 0` returns
+    `CcWindowBytes - BytesInFlight` without accessing the timer.
+23. `ComputeSendAllowance` with `BandwidthBitsPerSecond > 0`,
+    `CcWindowBytes > BytesInFlight` returns
     `min(GetAllowance(NowUsec, Mtu).AllowedBytes, CcWindowBytes - BytesInFlight)`.
-24. `QuicBandwidthShaperRegisterSend` обновляет `CreditBaseTimeNsec`;
-    время передаётся аргументом `NowUsec` (инъекция аргумента, §14) —
-    подмена таймера не требуется. Кредит предварительно обнуляется
-    дебитом полного burst-бюджета (свежий шейпер всегда стартует с
-    полным бюджетом; обнуление делает ожидания независимыми от окна).
+24. `QuicBandwidthShaperRegisterSend` updates `CreditBaseTimeNsec`;
+    the time is passed as the `NowUsec` argument (argument injection,
+    §14) — no timer substitution is required. The credit is
+    preliminarily zeroed by debiting the full burst budget (a fresh
+    shaper always starts with the full budget; the zeroing makes the
+    expectations independent of the window).
 
-### §34 Тесты embedded shaper внутри `QUIC_CONGESTION_CONTROL` (см. §17, §24)
+### §34 Embedded shaper tests inside `QUIC_CONGESTION_CONTROL` (see §17, §24)
 
-25. После `QuicCongestionControlInitialize`:
+25. After `QuicCongestionControlInitialize`:
     - `Cc->Pacer.CreditBaseTimeNsec == 0`;
     - `Cc->Pacer.BandwidthBitsPerSecond == 0`;
-    - `Cc->Pacer.BurstWindowUsec == 0` (валидная пара `(0, 0)`, §17);
-      burst-окно задаётся плагином позже, в паре с первым ненулевым
-      rate (например, `QUIC_DEFAULT_PACING_BURST_WINDOW_USEC`; хранится
-      как сконфигурировано, §3.6 —
-      плагин передаёт окно прямым чтением поля в мкс).
-26. `QuicCongestionControlReset(Cc, /*FullReset=*/TRUE)` обнуляет
-    `Pacer.CreditBaseTimeNsec` и сохраняет конфигурацию —
-    валидированную пару `Pacer.BandwidthBitsPerSecond`/
-    `Pacer.BurstWindowUsec` (согласовано с таблицей §17).
-27. `QuicCongestionControlReset(Cc, FALSE)` обнуляет
-    `Pacer.CreditBaseTimeNsec` и сохраняет ту же конфигурацию (пару);
-    режим `FullReset` не влияет на конфигурацию шейпера
-    (согласовано с таблицей §17).
+    - `Cc->Pacer.BurstWindowUsec == 0` (the valid pair `(0, 0)`, §17);
+      the burst window is set by the plugin later, in a pair with the
+      first non-zero rate (for example,
+      `QUIC_DEFAULT_PACING_BURST_WINDOW_USEC`; stored as configured,
+      §3.6 — the plugin passes the window as a direct read of the
+      field in µs).
+26. `QuicCongestionControlReset(Cc, /*FullReset=*/TRUE)` zeroes
+    `Pacer.CreditBaseTimeNsec` and keeps the configuration — the
+    validated pair `Pacer.BandwidthBitsPerSecond`/
+    `Pacer.BurstWindowUsec` (consistent with the table of §17).
+27. `QuicCongestionControlReset(Cc, FALSE)` zeroes
+    `Pacer.CreditBaseTimeNsec` and keeps the same configuration (the
+    pair); the `FullReset` mode does not affect the shaper's
+    configuration (consistent with the table of §17).
 28. `QuicCongestionControlOnDataSent(Cc, NumBytesSent, NowUsec, Mtu)`
-    обновляет `Pacer.CreditBaseTimeNsec` ровно один раз, и значение
-    соответствует переданному аргументу `NowUsec` (не реальным часам);
-    per-call `Mtu` передаётся из точки дебита (`Path->Mtu`, §14).
-29. Двойной вызов `OnDataSent(Cc, 0, NowUsec)` не меняет
+    updates `Pacer.CreditBaseTimeNsec` exactly once, and the value
+    corresponds to the passed `NowUsec` argument (not to the real
+    clock); the per-call `Mtu` is passed from the debit point
+    (`Path->Mtu`, §14).
+29. A double call of `OnDataSent(Cc, 0, NowUsec)` does not change
     `CreditBaseTimeNsec`.
 
-### §35 Тесты рефакторинга Cubic/BBR
+### §35 Cubic/BBR refactoring tests
 
-После миграции (§27) `CubicTest.cpp` и `BbrTest.cpp` содержат **те же**
-assertions, что и до миграции (coverage сохраняется), плюс новые тесты,
-проверяющие:
+After the migration (§27), `CubicTest.cpp` and `BbrTest.cpp` contain
+**the same** assertions as before the migration (the coverage is
+preserved), plus new tests verifying:
 
-30. `CubicCongestionControlGetSendAllowance` оставляет
-    `Cc->Pacer.CreditBaseTimeNsec == 0` (вызов не модифицирует
-    timestamp; модификацию делает только `OnDataSent`).
-31. После двух последовательных вызовов `GetSendAllowance + OnDataSent`
-    с интервалом `Cwnd * BITS_PER_BYTE * USEC_PER_SEC / BandwidthBitsPerSecond`
-    микросекунд (т.е. `8 * Cwnd * 1'000'000 / BandwidthBitsPerSecond`), алгоритм отдаёт
-    `Cwnd / 2` allowance без задержки на втором такте.
+30. `CubicCongestionControlGetSendAllowance` leaves
+    `Cc->Pacer.CreditBaseTimeNsec == 0` (the call does not modify the
+    timestamp; only `OnDataSent` does the modification).
+31. After two consecutive `GetSendAllowance + OnDataSent` calls with an
+    interval of `Cwnd * BITS_PER_BYTE * USEC_PER_SEC / BandwidthBitsPerSecond`
+    microseconds (i.e. `8 * Cwnd * 1'000'000 / BandwidthBitsPerSecond`),
+    the algorithm yields a `Cwnd / 2` allowance without delay on the
+    second tick.
 
-### §36 Тесты родительской иерархии (application-level, см. §15, §16)
+### §36 Parent hierarchy tests (application-level, see §15, §16)
 
-Во всех кейсах `ParentBandwidthBitsPerSecond`/`ParentBurstWindowUsec` — пара родителя, `ChildBandwidthBitsPerSecond`/`ChildBurstWindowUsec` —
-пара ребёнка (`Paths[0].PacerShaper` — per-path шейпер, §20). Уровни: Global = `MsQuicSetParam(NULL, ...)`,
-Config = `MsQuicSetParam(Configuration, ...)`. Уровни стекуются (§16.2):
-соединение имеет указатель на каждого установленного родителя; ниже
-`LibParent`/`CfgParent` обозначают `LibraryBandwidthShaperParent` /
-`ConfigBandwidthShaperParent` соединения.
+In all cases, `ParentBandwidthBitsPerSecond`/`ParentBurstWindowUsec` is
+the parent's pair, `ChildBandwidthBitsPerSecond`/`ChildBurstWindowUsec`
+is the child's pair (`Paths[0].PacerShaper` is the per-path shaper,
+§20). Levels: Global = `MsQuicSetParam(NULL, ...)`, Config =
+`MsQuicSetParam(Configuration, ...)`. The levels stack (§16.2): the
+connection has a pointer to each installed parent; below,
+`LibParent`/`CfgParent` denote the connection's
+`LibraryBandwidthShaperParent` / `ConfigBandwidthShaperParent`.
 
-32. **Валидация родительского параметра (оба уровня, §15.2).** SET
-    валидной пары → `QUIC_STATUS_SUCCESS`; в том числе пара
-    `(ParentBandwidthBitsPerSecond > 0, ParentBurstWindowUsec = 0)` — хранится и возвращается GET-ом
-    на обоих уровнях
-    заданное `ParentBurstWindowUsec = 0`; родители выполняют математику
-    с per-call `Mtu = 0` (§15.1), поэтому такая пара означает
-    непрерывный режим (сырой кредит без burst-клэмпа, §3.2);
-    SET `(0, ParentBurstWindowUsec > 0)` → `QUIC_STATUS_INVALID_PARAMETER` (§3.6);
-    SET пары `(ParentBandwidthBitsPerSecond > 0, ParentBurstWindowUsec > UINT64_MAX / ParentBandwidthBitsPerSecond / 1'000)` →
-    `QUIC_STATUS_INVALID_PARAMETER` (ns-граница комбинации над
-    настроенным окном, §3.6);
-    SET с `BufferLength !=
+32. **Validation of the parent parameter (both levels, §15.2).** A SET
+    of a valid pair → `QUIC_STATUS_SUCCESS`; including the pair
+    `(ParentBandwidthBitsPerSecond > 0, ParentBurstWindowUsec = 0)` —
+    stored and returned by the GET at both levels as the given
+    `ParentBurstWindowUsec = 0`; the parents perform the math with
+    per-call `Mtu = 0` (§15.1), therefore such a pair means continuous
+    mode (raw credit without a burst clamp, §3.2);
+    SET `(0, ParentBurstWindowUsec > 0)` →
+    `QUIC_STATUS_INVALID_PARAMETER` (§3.6);
+    SET of the pair `(ParentBandwidthBitsPerSecond > 0, ParentBurstWindowUsec > UINT64_MAX / ParentBandwidthBitsPerSecond / 1'000)` →
+    `QUIC_STATUS_INVALID_PARAMETER` (the ns bound of the combination
+    over the configured window, §3.6);
+    SET with `BufferLength !=
     sizeof(QUIC_BANDWIDTH_SHAPER_CONFIG)` → `QUIC_STATUS_INVALID_PARAMETER`.
-    Поведение идентично для Global и Config; состояние уровней
-    независимо (валидный SET на одном уровне не меняет другой).
-33. **GET/дефолт (§15.2).** Без SET: GET на обоих уровнях возвращает
-    `(0, 0)`; после SET `(BandwidthBitsPerSecond, BurstWindowUsec)` GET
-    возвращает точную копию пары (окно возвращается как задано —
-    ничего не переписывается; поведение выбирается парой и per-call
-    `Mtu` внутри математики §3.2);
-    после SET `(0, 0)` GET возвращает `(0, 0)` (uninstall, §16.1).
-34. **Инвариант окна на границе SetParam (§15.3).** Обработчик SET
-    валидирует пару с внутренним монотонным `NowUsec`; обычная пара, чьё
-    `BurstWindowUsec >= NowUsec`, отвергается — поведение эквивалентно кейсу 19
-    §32 (детерминированная часть проверяется на
-    `QuicBandwidthShaperValidateConfig`), ретрай позже допустим.
-    Строгая пара принимается безусловно (при любом `NowUsec`).
-35. **Разрешение иерархии: оба уровня установлены → стекуются (§16.2).**
-    Установлены оба уровня; соединение, созданное из конфигурации,
-    привязывается к **обоим** родителям одновременно:
-    `LibParent == &MsQuicLib.BandwidthShaper` и
-    `CfgParent == &Configuration.BandwidthShaper`; ни один указатель
-    не замещает другой (fallback отсутствует). Проверка:
-    эффективный allowance ограничен обоими родителями (кейс 48).
-36. **Разрешение иерархии: только Global (§16.2).** Config-уровень не
-    установлен, Global установлен → `LibParent == &MsQuicLib.BandwidthShaper`,
-    `CfgParent == NULL`; эффективный allowance = min(ребёнок,
-    library-родитель) — configuration-уровень ведёт себя как
-    passthrough, поведение остальных уровней как раньше (§19.14).
-37. **Разрешение иерархии: ничего не установлено → оба `NULL` (§16.2).**
-    `LibParent == NULL && CfgParent == NULL`; эффективный allowance
-    побайтно совпадает с «чистым» ребёнком (серия чтений
-    `QuicBandwidthShaperGetAllowance(&Path->PacerShaper, ...)`
-    §9 — идентичны расчётам §16.3 с `ParentsAllowance == UINT64_MAX`).
-38. **min(credits) при одном `NowUsec` (§16.3).** Числовой пример
-    (один установленный родитель; для двух — кейс 48):
-    `ChildBandwidthBitsPerSecond = 8'000'000` (1 байт/мкс), `ChildBurstWindowUsec = 10'000`, `ParentBandwidthBitsPerSecond =
-    16'000'000` (2 байта/мкс), `ParentBurstWindowUsec = 5'000`; после полного простоя
-    `Effective = min(10'000, 10'000) = 10'000` байт; после дебита
-    родителя до `ParentAllowance = 4` — `Effective = 4`.
-39. **Общий дебит (§16.4).** Отправка `SizeBytes` байт соединением уменьшает
-    кредит **ребёнка и каждого установленного родителя**: при одном
-    родителе — `AllowedBytes` ребёнка и родителя уменьшились на `SizeBytes`
-    с точностью ± 1 байт (§10, инвариант списания); при двух — дополнительно
-    кейс 49.
-40. **Два соединения одного родителя делят бюджет (§16.4).** Родитель
-    `(ParentBandwidthBitsPerSecond = 8'000'000, ParentBurstWindowUsec = 10'000)`; первое соединение отправляет
-    весь burst-бюджет родителя `10'000` байт → `Effective` второго
-    соединения равен 0 до накопления родительского кредита; сумма
-    отправок обоих ≤ кредита родителя (кейс 15 §19).
-41. **Родитель — потолок при собственном конфиге ребёнка (§16.3).**
-    `ChildBandwidthBitsPerSecond = 64'000'000`, `ParentBandwidthBitsPerSecond = 8'000'000` (ребёнок выше родителя):
-    установившийся интервал отправок равен родительскому
-    `DebitNsec`; эффективная скорость ≤ `ParentBandwidthBitsPerSecond` — наследование
-    не отключается собственным `SetConfig` ребёнка.
-    Дополнительно: `ChildBandwidthBitsPerSecond = 4'000'000`, `ParentBandwidthBitsPerSecond = 8'000'000`
-    (ребёнок ниже) → скорость ≤ `ChildBandwidthBitsPerSecond`; более мягкий родитель не
-    ускоряет ребёнка.
-42. **Passthrough и uninstall (§16.6).** (а) Родитель отсутствует —
-    поведение идентично «чистому» ребёнку (кейс 37). (б) После SET
-    `(0, 0)` на уровне, к которому соединение было привязано:
-    привязанные соединения продолжают работать, этот уровень —
-    passthrough (`BandwidthBitsPerSecond == 0` ⇒ `UINT64_MAX`, дебит — no-op §10), другие
-    установленные уровни продолжают действовать; новые соединения
-    разрешают иерархию заново: уровень X пропускается, остальные
-    установленные уровни привязываются как есть (§16.2).
-43. **Снапшот при открытии: SET после открытия не перепривязывает
-    (§15.4, §16.6).** Соединение создано без родителя → SET на обоих
-    уровнях не меняет `LibParent == NULL && CfgParent == NULL` и
-    поведение живого соединения; новое соединение получает родителей
-    обоих установленных уровней.
-    Симметрично: соединение с library-родителем + SET на
-    configuration-уровне → живое соединение остаётся только на
-    library-родителе (`CfgParent` остаётся `NULL` — уровень,
-    установленный позже, не добавляется задним числом).
-44. **Reconfiguration привязанного родителя (§16.6).** SET новой
-    валидной пары на уровень, к которому соединение привязано:
-    пара применяется атомарно (кейс 14 §32), `CreditBaseTimeNsec`
-    сохраняется (§7, контракт 3), новое окно/скорость видны соединению
-    в следующем `Effective`.
-45. **Время жизни: конфигурация закрыта при живом соединении (§16.1).**
-    `MsQuicConfigurationClose` до завершения соединения → соединение
-    продолжает отправку, дебит родителя продолжается (refcount
-    `QUIC_CONF_REF_CONNECTION` держит конфигурацию; проверено:
-    `connection.c` — `QuicConfigurationAddRef` при привязке,
-    `QuicConfigurationRelease` в cleanup соединения). Утечек нет:
-    память конфигурации освобождается после завершения соединения.
-46. **Reset/path migration не меняет родителей (§16.5).**
-    `QuicCongestionControlReset(Cc, TRUE/FALSE)` и смена пути
-    оставляют `LibParent` и `CfgParent` неизменными; кредиты
-    родителей сбросами не затрагиваются.
-47. **Конкурентный дебит (§16.4, детерминированная финальная проверка).**
-    N потоков выполняют общий дебит
-    `QuicConnBandwidthShaperDebitParents` через общий родительский
-    объект, все — с одним и тем же инъецированным `NowUsec = T0` (один
-    виртуальный момент, инъекция аргумента); после завершения всех
-    потоков `AllowedBytes` родителя на момент `T0` равен
-    `max(0, ParentBurstWindowUsec * ParentBandwidthBitsPerSecond / 8'000'000 - суммарный дебит)` с точностью
-    округления (§10) — без потерь и без задвоения дебита.
-48. **Три уровня одновременно: `Effective = min` из трёх (§16.3).**
-    Оба родителя установлены; числовой пример (library-родитель
-    `(4'000'000, ParentBurstWindowUsec = 3'000)` — обычный режим на границе,
-    бюджет 3'000 мкс * 4 Мбит/с / 8e6 = 1'500 байт):
-    `ChildBandwidthBitsPerSecond = 8'000'000` (1 байт/мкс), `ChildBurstWindowUsec = 10'000`; config-родитель
-    `(16'000'000, 5'000)` (бюджет `10'000` байт); library-родитель
-    `(4'000'000, 3'000)` (бюджет `1'500` байт). После полного простоя
-    `Effective = min(10'000, 10'000, 1'500) = 1'500` байт; после дебита
-    library-родителя до allowance `100` — `Effective = 100`; после
-    дебита config-родителя до allowance `50` — `Effective = 50`. Все
-    величины — при одном инъецированном `NowUsec`; каждый уровень
-    вносит независимый потолок.
-49. **Дебит обоих родителей на одной отправке (§16.4).** Оба уровня
-    установлены; отправка `SizeBytes` байт списывает `SizeBytes` из кредита ребёнка,
-    config-родителя и library-родителя — каждый под своим локом, в
-    фиксированном порядке library → configuration; после отправки
-    `AllowedBytes` всех трёх уменьшились на `SizeBytes` ± 1 байт (§10).
-    Отсутствующий уровень (любой из указателей `NULL`) дебита не
-    порождает (§19.14).
-50. **Library-потолок действует при собственном конфиг-родителе
-    (§16.2, §16.3).** Оба уровня установлены: `ConfigBandwidthBitsPerSecond = 16'000'000`,
-    `LibraryBandwidthBitsPerSecond = 4'000'000` (library ниже config), ребёнок выше обоих →
-    установившийся интервал отправок равен library-`DebitNsec` / 1'000 мкс;
-    эффективная скорость ≤ `LibraryBandwidthBitsPerSecond` — configuration-уровень не
-    отменяет библиотечный потолок (собственный родитель конфигурации
-    не «перекрывает» library-уровень).
-51. **Config-родитель управляет при неустановленном library-уровне
-    (§16.2).** Config-родитель установлен, Global не установлен →
-    `Effective = min(ребёнок, config-родитель)`, library-уровень —
-    тождество `UINT64_MAX`. Числовой контроль: `ChildBandwidthBitsPerSecond = 4'000'000`,
-    `ConfigBandwidthBitsPerSecond = 16'000'000` (ребёнок ниже config-родителя) → скорость
-    ≤ `ChildBandwidthBitsPerSecond`; более мягкий config-родитель не ускоряет ребёнка.
-    Поведение побайтно совпадает с однородительской схемой
-    (кейсы 38–39) — отсутствие одного из уровней ничего не меняет
-    для остальных (§19.14).
+    The behavior is identical for Global and Config; the state of the
+    levels is independent (a valid SET at one level does not change the
+    other).
+33. **GET/default (§15.2).** Without a SET: the GET at both levels
+    returns `(0, 0)`; after a SET of
+    `(BandwidthBitsPerSecond, BurstWindowUsec)`, the GET returns an
+    exact copy of the pair (the window is returned as given — nothing
+    is rewritten; the behavior is selected by the pair and the per-call
+    `Mtu` inside the math of §3.2);
+    after a SET of `(0, 0)` the GET returns `(0, 0)` (uninstall, §16.1).
+34. **The window invariant at the SetParam boundary (§15.3).** The SET
+    handler validates the pair with an internal monotonic `NowUsec`; a
+    normal pair whose `BurstWindowUsec >= NowUsec` is rejected — the
+    behavior is equivalent to case 19 §32 (the deterministic part is
+    checked on `QuicBandwidthShaperValidateConfig`), a retry later is
+    permitted. A strict pair is accepted unconditionally (for any
+    `NowUsec`).
+35. **Hierarchy resolution: both levels installed → they stack
+    (§16.2).** Both levels are installed; a connection created from the
+    configuration is bound to **both** parents simultaneously:
+    `LibParent == &MsQuicLib.BandwidthShaper` and
+    `CfgParent == &Configuration.BandwidthShaper`; neither pointer
+    replaces the other (there is no fallback). Check: the effective
+    allowance is bounded by both parents (case 48).
+36. **Hierarchy resolution: Global only (§16.2).** The Config level is
+    not installed, Global is installed →
+    `LibParent == &MsQuicLib.BandwidthShaper`, `CfgParent == NULL`; the
+    effective allowance = min(child, library parent) — the
+    configuration level behaves as passthrough, the behavior of the
+    remaining levels is as before (§19.14).
+37. **Hierarchy resolution: nothing installed → both `NULL` (§16.2).**
+    `LibParent == NULL && CfgParent == NULL`; the effective allowance
+    coincides byte-for-byte with the "clean" child (a series of reads
+    `QuicBandwidthShaperGetAllowance(&Path->PacerShaper, ...)` of §9 —
+    identical to the computations of §16.3 with
+    `ParentsAllowance == UINT64_MAX`).
+38. **min(credits) at a single `NowUsec` (§16.3).** A numeric example
+    (one installed parent; for two — case 48):
+    `ChildBandwidthBitsPerSecond = 8'000'000` (1 byte/µs),
+    `ChildBurstWindowUsec = 10'000`, `ParentBandwidthBitsPerSecond =
+    16'000'000` (2 bytes/µs), `ParentBurstWindowUsec = 5'000`; after a
+    full idle `Effective = min(10'000, 10'000) = 10'000` bytes; after
+    the parent is debited down to `ParentAllowance = 4` —
+    `Effective = 4`.
+39. **The shared debit (§16.4).** A send of `SizeBytes` bytes by the
+    connection decreases the credit of **the child and of every
+    installed parent**: with one parent — the `AllowedBytes` of the
+    child and of the parent have decreased by `SizeBytes` to within
+    ± 1 byte (§10, the debiting invariant); with two — additionally
+    case 49.
+40. **Two connections of one parent share the budget (§16.4).** Parent
+    `(ParentBandwidthBitsPerSecond = 8'000'000, ParentBurstWindowUsec = 10'000)`;
+    the first connection sends the parent's entire burst budget of
+    `10'000` bytes → the `Effective` of the second connection is 0
+    until the parent credit accrues; the sum of both connections' sends
+    ≤ the parent's credit (case 15 §19).
+41. **The parent is a ceiling above the child's own config (§16.3).**
+    `ChildBandwidthBitsPerSecond = 64'000'000`,
+    `ParentBandwidthBitsPerSecond = 8'000'000` (the child above the
+    parent): the steady-state send interval equals the parent's
+    `DebitNsec`; the effective rate ≤ `ParentBandwidthBitsPerSecond` —
+    the inheritance is not disabled by the child's own `SetConfig`.
+    Additionally: `ChildBandwidthBitsPerSecond = 4'000'000`,
+    `ParentBandwidthBitsPerSecond = 8'000'000` (the child below) → the
+    rate ≤ `ChildBandwidthBitsPerSecond`; a softer parent does not
+    speed the child up.
+42. **Passthrough and uninstall (§16.6).** (a) No parent — the behavior
+    is identical to the "clean" child (case 37). (b) After a SET of
+    `(0, 0)` at a level the connection was bound to: the bound
+    connections keep working, this level is passthrough
+    (`BandwidthBitsPerSecond == 0` ⇒ `UINT64_MAX`, the debit is a
+    no-op, §10), the other installed levels keep acting; new
+    connections resolve the hierarchy anew: level X is skipped, the
+    remaining installed levels are bound as is (§16.2).
+43. **Snapshot at bind: a SET after the connection is opened does not
+    rebind (§15.4, §16.6).** The connection was created without a
+    parent → a SET at both levels does not change
+    `LibParent == NULL && CfgParent == NULL` or the live connection's
+    behavior; a new connection gets the parents of both installed
+    levels. Symmetrically: a connection with a library parent + a SET
+    at the configuration level → the live connection remains bound only
+    to the library parent (`CfgParent` remains `NULL` — a level
+    installed later is not added retroactively).
+44. **Reconfiguration of a bound parent (§16.6).** A SET of a new valid
+    pair at a level the connection is bound to: the pair is applied
+    atomically (case 14 §32), `CreditBaseTimeNsec` is preserved (§7,
+    contract 3), the new window/rate becomes visible to the connection
+    in the next `Effective`.
+45. **Lifetime: the configuration is closed while the connection is
+    alive (§16.1).** `MsQuicConfigurationClose` before the connection
+    completes → the connection keeps sending, the parent's debit
+    continues (the refcount `QUIC_CONF_REF_CONNECTION` holds the
+    configuration; verified: `connection.c` — `QuicConfigurationAddRef`
+    at bind, `QuicConfigurationRelease` in the connection's cleanup).
+    No leaks: the configuration's memory is freed after the connection
+    completes.
+46. **Reset/path migration does not change the parents (§16.5).**
+    `QuicCongestionControlReset(Cc, TRUE/FALSE)` and a path change
+    leave `LibParent` and `CfgParent` unchanged; the parents' credits
+    are not touched by the resets.
+47. **Concurrent debit (§16.4, a deterministic final check).** N
+    threads perform the shared debit
+    `QuicConnBandwidthShaperDebitParents` through a shared parent
+    object, all with one and the same injected `NowUsec = T0` (a single
+    virtual moment, argument injection); after all the threads have
+    completed, the parent's `AllowedBytes` at the moment `T0` equals
+    `max(0, ParentBurstWindowUsec * ParentBandwidthBitsPerSecond / 8'000'000 - total debit)`
+    to within rounding (§10) — without losses and without double
+    debiting.
+48. **Three levels at once: `Effective = min` of the three (§16.3).**
+    Both parents are installed; a numeric example (the library parent
+    `(4'000'000, ParentBurstWindowUsec = 3'000)` — normal mode on the
+    boundary, the budget 3'000 µs * 4 Mbit/s / 8e6 = 1'500 bytes):
+    `ChildBandwidthBitsPerSecond = 8'000'000` (1 byte/µs),
+    `ChildBurstWindowUsec = 10'000`; the config parent
+    `(16'000'000, 5'000)` (a budget of `10'000` bytes); the library
+    parent `(4'000'000, 3'000)` (a budget of `1'500` bytes). After a
+    full idle `Effective = min(10'000, 10'000, 1'500) = 1'500` bytes;
+    after the library parent is debited down to an allowance of `100` —
+    `Effective = 100`; after the config parent is debited down to an
+    allowance of `50` — `Effective = 50`. All the quantities — at a
+    single injected `NowUsec`; each level contributes an independent
+    ceiling.
+49. **Debit of both parents on a single send (§16.4).** Both levels are
+    installed; a send of `SizeBytes` bytes debits `SizeBytes` from the
+    child's credit, the config parent's, and the library parent's —
+    each under its own lock, in the fixed order
+    library → configuration; after the send, the `AllowedBytes` of all
+    three have decreased by `SizeBytes` ± 1 byte (§10). An absent level
+    (either of the pointers `NULL`) produces no debit (§19.14).
+50. **The library ceiling acts in the presence of the connection's own
+    config parent (§16.2, §16.3).** Both levels are installed:
+    `ConfigBandwidthBitsPerSecond = 16'000'000`,
+    `LibraryBandwidthBitsPerSecond = 4'000'000` (library below config),
+    the child above both → the steady-state send interval equals the
+    library `DebitNsec` / 1'000 µs; the effective rate ≤
+    `LibraryBandwidthBitsPerSecond` — the configuration level does not
+    cancel the library ceiling (the configuration's own parent does not
+    "override" the library level).
+51. **The config parent governs when the library level is not installed
+    (§16.2).** The config parent is installed, Global is not →
+    `Effective = min(child, config parent)`, the library level is the
+    identity `UINT64_MAX`. A numeric check:
+    `ChildBandwidthBitsPerSecond = 4'000'000`,
+    `ConfigBandwidthBitsPerSecond = 16'000'000` (the child below the
+    config parent) → the rate ≤ `ChildBandwidthBitsPerSecond`; a softer
+    config parent does not speed the child up. The behavior coincides
+    byte-for-byte with the single-parent scheme (cases 38–39) — the
+    absence of one of the levels changes nothing for the others
+    (§19.14).
 
-### §37 Стиль
+### §37 Style
 
-- Без аллокаций в hot-path: шейпер не вызывает `malloc/new`,
-  не открывает файлы, не блокируется.
-- Sal-аннотации (`_In_`, `_Out_`, `_IRQL_requires_max_(DISPATCH_LEVEL)`)
-  на всех публичных функциях.
-- Имена функций с префиксом `QuicBandwidthShaper*` для консистентности
-  с остальным ядром.
-- Заголовок — `bandwidth_shaper.h`. Имя файла — `bandwidth_shaper.c`.
+- No allocations in the hot path: the shaper does not call `malloc/new`,
+  does not open files, does not block.
+- SAL annotations (`_In_`, `_Out_`, `_IRQL_requires_max_(DISPATCH_LEVEL)`)
+  on all public functions.
+- Function names with the `QuicBandwidthShaper*` prefix, for
+  consistency with the rest of the core.
+- The header is `bandwidth_shaper.h`. The file name is
+  `bandwidth_shaper.c`.
 
-## §38 Подсчёт сложности
+## §38 Complexity accounting
 
-Все операции — O(1), без циклов, без аллокаций. Сложность как по
-времени, так и по памяти константна на вызов и не зависит от
-`SizeBytes` или `BandwidthBitsPerSecond`. Это держит hot-path вызов
-шейпера в пределах нескольких десятков наносекунд и совместимо с
-пакетной передачей на скоростях 10 Гбит/с и выше.
+All operations are O(1), no loops, no allocations. The complexity, both
+in time and in memory, is constant per call and does not depend on
+`SizeBytes` or `BandwidthBitsPerSecond`. This keeps the shaper's
+hot-path call within a few tens of nanoseconds and is compatible with
+packet transmission at rates of 10 Gbit/s and above.
 
-Дополнения иерархии (§16.7) сохраняют константную сложность: на
-горячем пути добавляются до двух uncontended lock copy-out и до двух
-дебитов под коротким листовым локом — по одному на установленный
-уровень; разрешение иерархии — двукратная
-проверка под локами, один раз за жизнь соединения.
+The hierarchy additions (§16.7) preserve the constant complexity: on
+the hot path, up to two uncontended lock copy-outs and up to two debits
+under a short leaf lock are added — one per installed level; hierarchy
+resolution is a twofold check under locks, once in the connection's
+lifetime.
 
-## §39 Открытые вопросы и риски
+## §39 Open questions and risks
 
-| # | Вопрос                                                                                                                  | Резолюция |
-| - | ----------------------------------------------------------------------------------------------------------------------- | --------- |
-| 1 | Стоит ли объединять шейпер с `QuicCongestionControlGetSendAllowance`?                                                   | Нет. Это разные слои: congestion control решает, сколько *можно* отправить (cwnd), шейпер решает, *когда* (rate). Совмещение ломает существующие тесты и снижает модульность. |
-| 2 | Что делать с обратной зависимостью (acks приходят не в том порядке)?                                                   | Шейпер не зависит от acks — только от времени и фактических отправок. Обратный порядок acks не влияет на его состояние. |
-| 3 | Как шейпер взаимодействует с packet builder, если `NowUsec` меньше реального монотонного времени (тестовая инъекция)?    | Шейпер работает исключительно с переданным `NowUsec`; реальное время не запрашивается ни одной функцией модуля, включая `QuicBandwidthShaperRegisterSend` (§14) — время всегда инъецируется вызывающим кодом. |
-| 4 | Нужен ли отдельный тип «BandwidthLimiter» с обратной связью?                                                            | Нет, не в этой итерации. |
-| 5 | Ломает ли добавление `Pacer` в `QUIC_CONGESTION_CONTROL` ABI kernel-mode плагинов?                                       | Да. Решение: рефакторинг делается в один коммит, синхронно с релизом msquic, который уже требует пересборки плагинов. Альтернатива — extension-структура — отвергнута: дополнительный indirection без выигрыша. |
-| 6 | Контеншн родительского лока при большом числе соединений на одном родителе?                                             | Риск принят: критические секции — O(1) (три копирования / одна формула §10), uncontended-стоимость — десятки нс; сам родительский лимит `BandwidthBitsPerSecond` ограничивает частоту дебитов. Lock-free/sharded варианты — out of scope (§16.3, §16.7). |
-| 7 | Видимость повторных SET: перепривязывать ли живые соединения?                                                            | Нет (§15.4, §16.6): привязка — снапшот при создании; обновление уже привязанного уровня — атомарное под родительским локом; перепривязка требует сериализации воркеров каждого соединения — отвергнута как несоразмерная. |
+| # | Question                                                                                                                    | Resolution                                                                                                                                                                                                                                                     |
+| - |-----------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 1 | Should the shaper be merged with `QuicCongestionControlGetSendAllowance`?                                                   | No. These are different layers: congestion control decides how much *may* be sent (cwnd), the shaper decides *when* (rate). Merging breaks the existing tests and reduces modularity.                                                                          |
+| 2 | What to do about the reverse dependency (acks arriving out of order)?                                                       | The shaper does not depend on acks — only on time and the actual sends. The reverse order of acks does not affect its state.                                                                                                                                   |
+| 3 | How does the shaper interact with the packet builder if `NowUsec` is less than the real monotonic time (a test injection)?  | The shaper works exclusively with the passed `NowUsec`; the real time is not requested by any function of the module, including `QuicBandwidthShaperRegisterSend` (§14) — the time is always injected by the calling code.                                     |
+| 4 | Is a separate "BandwidthLimiter" type with feedback needed?                                                                 | No, not in this iteration.                                                                                                                                                                                                                                     |
+| 5 | Does adding `Pacer` to `QUIC_CONGESTION_CONTROL` break the ABI of kernel-mode plugins?                                      | Yes. Decision: the refactoring is done in one commit, synchronized with the msquic release, which already requires the plugins to be rebuilt. The alternative — an extension structure — was rejected: extra indirection without benefit.                      |
+| 6 | Parent lock contention with a large number of connections on one parent?                                                    | The risk is accepted: the critical sections are O(1) (three copies / one §10 formula), the uncontended cost is tens of ns; the parent limit `BandwidthBitsPerSecond` itself bounds the debit rate. Lock-free/sharded variants are out of scope (§16.3, §16.7). |
+| 7 | Visibility of repeated SETs: should live connections be rebound?                                                            | No (§15.4, §16.6): binding is a snapshot at creation; updating an already-bound level is atomic under the parent lock; rebinding would require serializing each connection's workers — rejected as disproportionate.                                           |
 
-## §40 План реализации
+## §40 Implementation plan
 
-> Статус: все фазы (1–5) реализованы в этой же работе (ветка
-> `issue-bandwidth-shaper`); план сохранён как карта выполненных шагов.
+> Status: all phases (1–5) are implemented in this same work (the
+> branch `issue-bandwidth-shaper`); the plan is kept as a map of the
+> completed steps.
 
-### §40.1 Фаза 1 — самостоятельный модуль (выполнена)
+### §40.1 Phase 1 — a standalone module (completed)
 
-1. Создать файлы `src/core/bandwidth_shaper.h`, `src/core/bandwidth_shaper.c`
-   с пустыми реализациями API §3.6, §6–§10 (включая
-   `QuicBandwidthShaperValidateConfig`).
-2. Завести `src/core/unittest/BandwidthShaperTest.cpp` с тестами
-   §32 (кейсы 1–20) и §33 (кейсы 21–24), используя инъекцию времени
-   (`NowUsec` параметром).
-3. Реализовать математику (§3) и convenience-helpers §13, §14.
-4. Прогнать тесты, довести покрытие до 100 %.
+1. Create the files `src/core/bandwidth_shaper.h`,
+   `src/core/bandwidth_shaper.c` with empty implementations of the API
+   of §3.6, §6–§10 (including `QuicBandwidthShaperValidateConfig`).
+2. Start `src/core/unittest/BandwidthShaperTest.cpp` with the tests of
+   §32 (cases 1–20) and §33 (cases 21–24), using time injection
+   (`NowUsec` as a parameter).
+3. Implement the math (§3) and the convenience helpers of §13, §14.
+4. Run the tests, bring the coverage to 100 %.
 
-### §40.2 Фаза 2 — embedding в `QUIC_CONGESTION_CONTROL` (выполнена)
+### §40.2 Phase 2 — embedding into `QUIC_CONGESTION_CONTROL` (completed)
 
-5. Добавить поле `QUIC_BANDWIDTH_SHAPER Pacer;` в
-   `QUIC_CONGESTION_CONTROL`. Добавить `#define QUIC_DEFAULT_PACING_BURST_WINDOW_USEC`
-   в `quicdef.h`.
-6. Инициализировать/сбрасывать `Pacer` в
-   `QuicCongestionControlInitialize`/`Reset` согласно §17, §24.
-7. Дополнить `QuicCongestionControlOnDataSent` inline-wrapper-ом вызовом
-   `QuicBandwidthShaperRegisterSend(&Cc->Pacer, ..., NowUsec)`.
-8. Добавить unit-тесты §34 (25–29).
+5. Add the field `QUIC_BANDWIDTH_SHAPER Pacer;` to
+   `QUIC_CONGESTION_CONTROL`. Add `#define QUIC_DEFAULT_PACING_BURST_WINDOW_USEC`
+   to `quicdef.h`.
+6. Initialize/reset the `Pacer` in
+   `QuicCongestionControlInitialize`/`Reset` according to §17, §24.
+7. Extend `QuicCongestionControlOnDataSent` with an inline wrapper of
+   the `QuicBandwidthShaperRegisterSend(&Cc->Pacer, ..., NowUsec)`
+   call.
+8. Add the unit tests of §34 (25–29).
 
-### §40.3 Фаза 3 — миграция Cubic и BBR (выполнена)
+### §40.3 Phase 3 — the Cubic and BBR migration (completed)
 
-9. Рефакторинг `cubic.c::CubicCongestionControlGetSendAllowance`
-   в терминах `QuicBandwidthShaperComputeSendAllowance` (§27.1).
-   Удалить `QUIC_CONGESTION_CONTROL_CUBIC::LastSendAllowance`.
-10. Переписать `CubicTest.cpp::Pacing_*` в терминах `Cc->Pacer`.
-11. Рефакторинг `bbr.c::BbrCongestionControlGetSendAllowance` (§27.2).
-12. Переписать `BbrTest.cpp::GetSendAllowance_*` и `SetSendQuantum_*`.
-13. Добавить тесты §35 (30–31).
+9. Refactor `cubic.c::CubicCongestionControlGetSendAllowance` in terms
+   of `QuicBandwidthShaperComputeSendAllowance` (§27.1). Remove
+   `QUIC_CONGESTION_CONTROL_CUBIC::LastSendAllowance`.
+10. Rewrite `CubicTest.cpp::Pacing_*` in terms of `Cc->Pacer`.
+11. Refactor `bbr.c::BbrCongestionControlGetSendAllowance` (§27.2).
+12. Rewrite `BbrTest.cpp::GetSendAllowance_*` and `SetSendQuantum_*`.
+13. Add the tests of §35 (30–31).
 
-### §40.4 Фаза 4 — внешняя интеграция (выполнена в этой работе)
+### §40.4 Phase 4 — external integration (completed in this work)
 
-14. Подключение шейпера в путь отправки (§21) — выполнено: per-path
-    `QUIC_PATH.PacerShaper`, лимит батча в `QuicPacketBuilderInitialize`
-    (через `QuicPathPacerLimitSendAllowance`), backoff pacing-таймера
-    в `QuicSendFlush`, дебит в `QuicLossDetectionOnPacketSent`
+14. Wiring the shaper into the send path (§21) — done: the per-path
+    `QUIC_PATH.PacerShaper`, the batch limit in
+    `QuicPacketBuilderInitialize` (via
+    `QuicPathPacerLimitSendAllowance`), the pacing timer backoff in
+    `QuicSendFlush`, the debit in `QuicLossDetectionOnPacketSent`
     (§20–§21, §16.3–§16.4).
-15. Ввод `QUIC_PARAM_CONN_BANDWIDTH_SHAPER` (`0x05000021`) для
-    пользовательского API — выполнено (§22).
+15. Introduction of `QUIC_PARAM_CONN_BANDWIDTH_SHAPER` (`0x05000021`)
+    for the user-facing API — done (§22).
 
-### §40.5 Фаза 5 — application-level родительская иерархия (выполнена в этой работе)
+### §40.5 Phase 5 — the application-level parent hierarchy (completed in this work)
 
-16. Добавить в `msquic.h` структуру `QUIC_BANDWIDTH_SHAPER_CONFIG` и
-    параметры `QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER` (`0x0100000F`) /
-    `QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER` (`0x03000004`) (§15.1–§15.2);
-    реализовать обработчики GET/SET в library/configuration-слоях с
-    чтением `CxPlatTimeUs64()` на границе SetParam (§15.3).
-17. Ввести `QUIC_BANDWIDTH_SHAPER_PARENT` в `MsQuicLib` и
-    `QUIC_CONFIGURATION` (инициализация с `(0, 0)`, §16.1); добавить
+16. Add to `msquic.h` the structure `QUIC_BANDWIDTH_SHAPER_CONFIG` and
+    the parameters `QUIC_PARAM_GLOBAL_BANDWIDTH_SHAPER` (`0x0100000F`)
+    / `QUIC_PARAM_CONFIGURATION_BANDWIDTH_SHAPER` (`0x03000004`)
+    (§15.1–§15.2); implement the GET/SET handlers in the
+    library/configuration layers with the `CxPlatTimeUs64()` read at
+    the SetParam boundary (§15.3).
+17. Introduce `QUIC_BANDWIDTH_SHAPER_PARENT` in `MsQuicLib` and
+    `QUIC_CONFIGURATION` (initialization with `(0, 0)`, §16.1); add
     `QUIC_CONNECTION::LibraryBandwidthShaperParent` /
-    `QUIC_CONNECTION::ConfigBandwidthShaperParent` и однократное
-    разрешение иерархии при привязке конфигурации (§16.2) — оба
-    установленных уровня сохраняются независимыми указателями
-    (стекование, без fallback).
-18. Реализовать copy-out чтение родителя с allowance и retry-delay из
-    одного снапшота (`QuicBandwidthShaperParentGetAllowedBytesAndDelay`,
-    `bandwidth_shaper_parent.h`; §16.3); минимум родителей — на уровне
-    кредита в `QuicPacketBuilderInitialize` через
-    `QuicConnBandwidthShaperGetParentsAllowance` (`connection.h`) до
-    MTU-округления; общий дебит родителей — в точке отправки loss
-    detection через `QuicConnBandwidthShaperDebitParents` (§16.4);
-    backoff pacing-таймера — max(child delay, parent delay) в
-    `QuicSendFlush` (§16.3). Выполнено; CC-внутренний `Cc->Pacer`
-    остаётся пейсером rate-плагинов (§25, §27).
-19. Добавить тесты §36 (кейсы 32–51), включая конкурентный кейс 47,
-    и довести покрытие ветвей иерархии до 100 % (§30).
+    `QUIC_CONNECTION::ConfigBandwidthShaperParent` and the one-time
+    hierarchy resolution at configuration binding (§16.2) — both
+    installed levels are kept as independent pointers (stacking, no
+    fallback).
+18. Implement the parent copy-out read with the allowance and the
+    retry delay from a single snapshot
+    (`QuicBandwidthShaperParentGetAllowedBytesAndDelay`,
+    `bandwidth_shaper_parent.h`; §16.3); the parents' minimum — at the
+    credit level in `QuicPacketBuilderInitialize` via
+    `QuicConnBandwidthShaperGetParentsAllowance` (`connection.h`),
+    before the MTU rounding; the parents' shared debit — at the loss
+    detection send point via `QuicConnBandwidthShaperDebitParents`
+    (§16.4); the pacing timer backoff — max(child delay, parent delay)
+    in `QuicSendFlush` (§16.3). Done; the CC-internal `Cc->Pacer`
+    remains the pacer of the rate plugins (§25, §27).
+19. Add the tests of §36 (cases 32–51), including the concurrent case
+    47, and bring the coverage of the hierarchy branches to 100 %
+    (§30).
+
+## §41 Used by
+
+- ingress-rate (R2, R3, R5, R9–R11; Configuration) — the remote
+  ingress limit is applied to the connection's outgress throttler
+  (this component) entirely through the contract of this
+  specification: pair validation §3.6,
+  application with the SetConfig semantics §7, modes §3.2 (the terms
+  `bandwidth/burst-window`, `bandwidth/strict-mode`,
+  `bandwidth/continuous-mode`), GET/SET echo semantics §15.1–§15.2,
+  connection-level scope §22. ingress-rate introduces no shaper math
+  of its own. Its alternative — ingress-window — makes no use of the
+  shaper state (creates no dependency).
